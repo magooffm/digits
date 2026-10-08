@@ -1,0 +1,11 @@
+menu "Digits development configuration"
+    config DIGITS_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+    config DIGITS_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+    config DIGITS_SERVER_URL
+        string "Digits WebSocket URL (ws://host:port/ws)"
+        default ""
+endmenu
