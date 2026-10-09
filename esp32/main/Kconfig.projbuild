@@ -8,4 +8,55 @@ menu "Digits development configuration"
     config DIGITS_SERVER_URL
         string "Digits WebSocket URL (ws://host:port/ws)"
         default ""
+    menu "Onboard microphone"
+        choice DIGITS_MIC_RECORD_MODE
+            prompt "Microphone record/playback diagnostic"
+            depends on SPIRAM && SPIRAM_MODE_OCT && (SPIRAM_USE_CAPS_ALLOC || SPIRAM_USE_MALLOC)
+            default DIGITS_MIC_RECORD_DISABLED
+        config DIGITS_MIC_RECORD_DISABLED
+            bool "Disabled"
+        config DIGITS_MIC_RECORD_PLAYBACK
+            bool "Run a 2-second record-then-playback test once after boot"
+            help
+                Records two seconds five seconds after boot, mutes microphone
+                capture, then plays saved audio with bounded digital gain.
+                Output PCM peaks stay within the Ring Test's 8192 ceiling.
+                Requires Octal PSRAM enabled under Component config -> ESP
+                PSRAM. Reboot to repeat. No continuous loopback is enabled.
+        config DIGITS_MIC_BUTTON_RECORD_PLAYBACK
+            bool "Hold KEY1 to record; release to play (maximum 10 seconds)"
+            help
+                Uses the onboard KEY1 button through TCA9555 P11. Records
+                signed 16-bit mono PCM in Octal PSRAM while held, then mutes
+                ADC input and plays the saved recording with bounded digital
+                gain. Output PCM peaks stay within the Ring Test's 8192 ceiling.
+                At ten seconds recording stops and waits for release. Requires
+                a fresh press each time; keys held at boot are ignored until
+                released. BOOT and RESET retain their hardware functions.
+        endchoice
+        config DIGITS_MIC_DIAGNOSTIC
+            bool "Enable microphone level diagnostic at boot"
+            default n
+            help
+                Log RMS, peak and level meters for both onboard microphones and
+                mono output about once per second. No raw PCM is printed.
+                This changes logging only; capture and signaling keep running.
+        config DIGITS_MIC_GAIN_DB
+            int "ES7210 microphone gain (dB)"
+            range 0 36
+            default 24
+            help
+                Prefer multiples of 3 dB (the ADC gain step). 24 dB is a
+                conservative starting point. Reduce if clipping is reported.
+        choice DIGITS_MIC_MONO_SLOT
+            prompt "Microphone channel for mono PCM"
+            default DIGITS_MIC_MONO_LEFT
+            config DIGITS_MIC_MONO_LEFT
+                bool "MIC1 (left I2S slot)"
+            config DIGITS_MIC_MONO_RIGHT
+                bool "MIC2 (right I2S slot)"
+            config DIGITS_MIC_MONO_AVERAGE
+                bool "Average MIC1 and MIC2"
+        endchoice
+    endmenu
 endmenu

@@ -1,5 +1,8 @@
 #include "credentials.h"
 #include "ring_test.h"
+#include "audio_board.h"
+#include "microphone.h"
+#include "record_playback_test.h"
 #include "signaling.h"
 #include "wifi.h"
 #include "esp_log.h"
@@ -14,8 +17,21 @@ void app_main(void)
     ESP_ERROR_CHECK(credentials_load(&credentials));
     ESP_LOGI("digits", "Boot hardware_id=%s number=%s", credentials.hardware_id,
              credentials.device_token[0] ? credentials.number : "unpaired");
-    esp_err_t err = digits_ring_test_init();
+    esp_err_t err = digits_audio_board_init();
     if (err != ESP_OK)
         ESP_LOGE("digits", "Speaker initialization failed: %s; signaling continues", esp_err_to_name(err));
+    else {
+        err = digits_ring_test_init();
+        if (err != ESP_OK)
+            ESP_LOGE("digits", "Ring Test initialization failed: %s; signaling continues", esp_err_to_name(err));
+        err = digits_microphone_init();
+        if (err != ESP_OK)
+            ESP_LOGE("digits", "Microphone initialization failed: %s; speaker and signaling continue", esp_err_to_name(err));
+        else {
+            err = digits_record_playback_test_start();
+            if (err != ESP_OK)
+                ESP_LOGE("digits", "Record/playback test initialization failed: %s; signaling continues", esp_err_to_name(err));
+        }
+    }
     digits_signaling_run(&credentials);
 }

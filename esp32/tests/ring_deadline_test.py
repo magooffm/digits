@@ -16,6 +16,8 @@ expect_bug = args.expect_bug
 source = source_path.read_text()
 bodies = source[source.index('static bool silence_output(void)'):source.index('static void release_audio(void)')]
 defines = '\n'.join(re.findall(r'^#define .+$', source, re.M))
+board = (repo / 'esp32/main/audio_board.c').read_text()
+silence = board[board.index('bool digits_audio_speaker_silence(void)'):]
 prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -25,6 +27,7 @@ prefix = r'''
 #include <setjmp.h>
 #include <stdarg.h>
 #include "ring_tone.h"
+#include "audio_format.h"
 typedef int esp_err_t;
 typedef unsigned TickType_t;
 #define ESP_OK 0
@@ -40,6 +43,10 @@ typedef unsigned TickType_t;
 #define ESP_LOGE(tag, fmt, ...) log_error(fmt)
 static const char *esp_err_to_name(int err) {return "fake";}
 static struct {void *device; void *tx; void *requests;} audio;
+static struct {void *device; void *tx;} board = {(void *)1, (void *)1};
+static bool digits_audio_speaker_silence(void);
+static bool digits_audio_speaker_acquire(unsigned timeout) { assert(timeout == 0); return true; }
+static void digits_audio_speaker_release(void) {}
 static int64_t now_us, requested[3], starts[3], stops[3], playing_at[3];
 static int64_t dma_next_us, dma_phase_us, rtos_phase_us, last_error_us;
 static int request_count, next_request, starts_count, stops_count, playing_count;
@@ -91,7 +98,7 @@ static int i2s_channel_write(void *tx, const void *data, size_t size,
                              size_t *written, unsigned timeout_ms)
 {
     assert(timeout_ms > 0 && timeout_ms <= 50);
-    assert(size == 640); /* Exactly one 10 ms stereo DMA buffer. */
+    assert(size == DIGITS_AUDIO_DMA_FRAMES * 2 * sizeof(int16_t)); /* 10 ms stereo. */
     unsigned ticks = pdMS_TO_TICKS(timeout_ms);
     if (!ticks) zero_tick_writes++;
     *written = 0;
@@ -124,6 +131,12 @@ static int i2s_channel_write(void *tx, const void *data, size_t size,
     if (tone) tone_writes++; else silence_writes++;
     *written = size;
     return ESP_OK;
+}
+static int digits_audio_speaker_start(void) {return amplifier_set(true);}
+static int digits_audio_speaker_write(const int16_t *pcm, size_t size,
+                                      size_t *written, unsigned timeout_ms)
+{
+    return i2s_channel_write(board.tx, pcm, size, written, timeout_ms);
 }
 '''
 suffix = r'''
@@ -189,7 +202,7 @@ int main(int argc, char **argv)
 '''
 with tempfile.TemporaryDirectory(prefix='digits-ring-deadline-') as directory:
     test = Path(directory) / 'ring_deadline_test.c'
-    test.write_text(prefix + '\n' + defines + '\n' + bodies + suffix)
+    test.write_text(prefix + '\n' + defines + '\n' + silence + '\n' + bodies + suffix)
     binary = test.with_suffix('')
     subprocess.run(['cc', '-std=c11', '-I', str(repo / 'esp32/main'),
                     str(test), str(repo / 'esp32/main/ring_tone.c'),
