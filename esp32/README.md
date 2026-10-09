@@ -213,6 +213,25 @@ one-second stop. With the default 100 Hz tick this margin is 20 ms. This avoids
 I2S waits rounding down to zero ticks and reporting a spurious final-block
 timeout. Timeouts earlier in playback remain errors and stop the test.
 
+Ring Test caches one 25 ms common period of its 440+480 Hz tone during
+initialization, before the playback task starts. At 48 kHz this is 1,200 mono
+samples (2,400 bytes of internal RAM). Streaming copies the table into stereo
+buffers and applies integer fades; it performs no sine calculations or
+allocations. Frequencies, volume, peak ceiling and the one-second stop remain
+the same.
+
+This addresses a likely cause of irregular gaps after adding microphone
+capture: the old renderer calculated two sine functions per sample. Moving
+from 16 to 48 kHz tripled that workload to 96,000 calls per second while native
+capture also runs. Late buffer refills can produce silent DMA blocks even
+when subsequent writes succeed. After each test, `Stream timing` reports
+queued frames, maximum render time and the longest producer gap between
+writes, against the 10,000 us block duration. These are timing measurements,
+not a hardware underrun counter. The cached renderer still requires an
+audible Ring Test on the board to confirm the reported crackles are resolved.
+A regular flutter is part of the chosen dual tone's 40 Hz amplitude beating;
+uneven crackles or gaps are not.
+
 Official hardware/software references:
 
 - [Waveshare v1.1 schematic](https://files.waveshare.com/wiki/ESP32-S3-AUDIO-Board/ESP32-S3-AUDIO-Board_1.1.pdf)

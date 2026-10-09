@@ -44,27 +44,36 @@ static void ring_worker(void *arg)
         }
         int64_t deadline = esp_timer_get_time() + TEST_DURATION_US;
         previous_deadline = deadline;
+        int64_t max_render_us = 0, max_feed_gap_us = 0, previous_write_at = 0;
+        size_t frames_queued = 0;
         esp_err_t err = digits_audio_speaker_start();
         if (err == ESP_OK) {
             ESP_LOGI("ring_test", "Playing 1s speaker test (440+480 Hz, volume=%d)", TEST_VOLUME);
             for (size_t frame = 0; frame < RING_TONE_FRAMES; frame += PCM_BLOCK_FRAMES) {
+                int64_t render_at = esp_timer_get_time();
                 ring_tone_render(pcm, frame, PCM_BLOCK_FRAMES);
+                int64_t ready_at = esp_timer_get_time();
+                if (ready_at - render_at > max_render_us) max_render_us = ready_at - render_at;
                 // Recheck after rendering. Near the stop deadline, let DMA
                 // drain instead of polling for another buffer with zero ticks.
-                int64_t remaining = deadline - esp_timer_get_time();
+                int64_t remaining = deadline - ready_at;
                 if (remaining < (int64_t)min_write_ms * 1000) break;
                 size_t written = 0;
                 // Direct bounded I2S writes, rather than codec's long default
                 // wait. The WebSocket task never performs audio work.
                 uint32_t timeout_ms = (uint32_t)(remaining / 1000);
                 if (timeout_ms > max_write_ms) timeout_ms = max_write_ms;
+                if (previous_write_at && ready_at - previous_write_at > max_feed_gap_us)
+                    max_feed_gap_us = ready_at - previous_write_at;
                 err = digits_audio_speaker_write(pcm, sizeof(pcm), &written, timeout_ms);
+                previous_write_at = esp_timer_get_time();
                 if (err != ESP_OK || written != sizeof(pcm)) {
                     ESP_LOGE("ring_test", "Playback write failed: %s (%u bytes)",
                              esp_err_to_name(err), (unsigned)written);
                     err = ESP_FAIL;
                     break;
                 }
+                frames_queued += PCM_BLOCK_FRAMES;
             }
             while (err == ESP_OK && esp_timer_get_time() < deadline)
                 vTaskDelay(1);
@@ -75,6 +84,13 @@ static void ring_worker(void *arg)
             ESP_LOGI("ring_test", "Speaker test stopped; amplifier disabled");
         else
             ESP_LOGE("ring_test", "Speaker test finished; amplifier gate failed, DAC mute and PCM silence requested");
+        // Log after hardware silence, never spend serial time feeding DMA.
+        const uint32_t block_us = PCM_BLOCK_FRAMES * 1000000U / RING_TONE_SAMPLE_RATE;
+        ESP_LOGI("ring_test", "Stream timing: frames=%u max_render=%u us max_feed_gap=%u us (block=%u us)",
+                 (unsigned)frames_queued, (unsigned)max_render_us, (unsigned)max_feed_gap_us,
+                 (unsigned)block_us);
+        if (max_render_us >= block_us || max_feed_gap_us >= block_us)
+            ESP_LOGW("ring_test", "PCM producer exceeded one audio block; DMA gaps are possible");
         digits_audio_speaker_release();
     }
 }
@@ -89,6 +105,9 @@ esp_err_t digits_ring_test_init(void)
 {
     if (audio.requests) return ESP_ERR_INVALID_STATE;
     if (!digits_audio_rx_channel()) return ESP_ERR_INVALID_STATE;
+    // Generate the common waveform once, before creating the playback task.
+    // The real-time renderer then performs only bounded integer table copies.
+    ring_tone_init();
     audio.requests = xQueueCreate(1, sizeof(int64_t));
     if (!audio.requests || xTaskCreate(ring_worker, "digits_ring", 4096, NULL, 4, NULL) != pdPASS) {
         release_audio();
