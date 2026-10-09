@@ -1,5 +1,7 @@
 #include "signaling.h"
 #include "ring_test.h"
+#include "webrtc.h"
+#include "webrtc_console.h"
 #include "wifi.h"
 #include <stdlib.h>
 #include <string.h>
@@ -9,13 +11,15 @@
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "sdkconfig.h"
 
 #define RETRY BIT0
 #define CREDENTIALS_CHANGED BIT1
 #define STORAGE_FAILED BIT2
 #define START_RETURNED BIT3
-#define MAX_MESSAGE 4096
+#define MAX_MESSAGE DIGITS_WEBRTC_MAX_SIGNALING_MESSAGE
+#define TX_QUEUE_LENGTH 8
 
 typedef struct {
     digits_credentials_t *credentials;
@@ -25,7 +29,89 @@ typedef struct {
     size_t used;
     bool text_active;
     int64_t connected_at;
+    uint32_t session;
 } signaling_t;
+
+typedef struct {
+    char *wire;
+    uint32_t session;
+} tx_message_t;
+
+// Boot-lifetime mailbox: the peer task never retains the WebSocket owner's
+// context or client handle. This also stays safe after a fatal NVS error.
+static struct {
+    QueueHandle_t queue;
+    uint32_t session;
+    bool registered;
+} outbound;
+static portMUX_TYPE outbound_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void outbound_set(uint32_t session, bool registered)
+{
+    portENTER_CRITICAL(&outbound_lock);
+    outbound.session = session;
+    outbound.registered = registered;
+    portEXIT_CRITICAL(&outbound_lock);
+}
+
+static esp_err_t enqueue_peer_message(const cJSON *json, uint32_t session, void *ctx)
+{
+    (void)ctx;
+    char *wire = cJSON_PrintUnformatted(json);
+    if (!wire) return ESP_ERR_NO_MEM;
+    if (strlen(wire) > MAX_MESSAGE) {
+        cJSON_free(wire);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    tx_message_t message = {.wire = wire, .session = session};
+    portENTER_CRITICAL(&outbound_lock);
+    bool ready = outbound.registered && outbound.session == session;
+    // Zero wait, with no queue receiver waiting on this queue. The small
+    // critical section makes session invalidation atomic with publication.
+    bool queued = ready && xQueueSend(outbound.queue, &message, 0) == pdTRUE;
+    portEXIT_CRITICAL(&outbound_lock);
+    if (!queued) cJSON_free(wire);
+    return queued ? ESP_OK : ready ? ESP_ERR_NO_MEM : ESP_ERR_INVALID_STATE;
+}
+
+static void discard_outbound(void)
+{
+    tx_message_t message;
+    while (xQueueReceive(outbound.queue, &message, 0) == pdTRUE)
+        cJSON_free(message.wire);
+}
+
+static void transport_down(signaling_t *s)
+{
+    outbound_set(s->session, false);
+    digits_webrtc_transport(s->session, false, NULL, false);
+}
+
+static void drain_outbound(signaling_t *s)
+{
+    tx_message_t message;
+    for (unsigned i = 0; i < TX_QUEUE_LENGTH &&
+         xQueueReceive(outbound.queue, &message, 0) == pdTRUE; ++i) {
+        portENTER_CRITICAL(&outbound_lock);
+        bool ready = outbound.registered && outbound.session == message.session;
+        portEXIT_CRITICAL(&outbound_lock);
+        bool failed = false;
+        if (ready && message.session == s->session &&
+            !(xEventGroupGetBits(s->events) & (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED))) {
+            size_t length = strlen(message.wire);
+            int sent = esp_websocket_client_send_text(s->client, message.wire, length,
+                                                      pdMS_TO_TICKS(1000));
+            failed = sent != (int)length;
+            if (failed) ESP_LOGW("signaling", "Peer signaling write failed; reconnecting");
+        }
+        cJSON_free(message.wire);
+        if (failed) {
+            transport_down(s);
+            xEventGroupSetBits(s->events, RETRY);
+            break;
+        }
+    }
+}
 
 static const char *string_field(cJSON *json, const char *name)
 {
@@ -82,14 +168,15 @@ static void dispatch_message(signaling_t *s)
     } else if (strcmp(type, "error") == 0) {
         const char *error = string_field(json, "error");
         ESP_LOGE("signaling", "Server error: %s", error ? error : "<missing error field>");
+        digits_webrtc_receive(json, s->session);
     } else {
-        // Later phone/WebRTC dispatch belongs here. No milestone reply is needed.
-        ESP_LOGI("signaling", "Ignoring message type=%s", type);
+        if (!digits_webrtc_receive(json, s->session))
+            ESP_LOGI("signaling", "Ignoring message type=%s", type);
     }
     cJSON_Delete(json);
 }
 
-static void send_register(signaling_t *s)
+static bool send_register(signaling_t *s)
 {
     digits_credentials_t *c = s->credentials;
     cJSON *json = cJSON_CreateObject();
@@ -99,7 +186,8 @@ static void send_register(signaling_t *s)
     if (ok && c->device_token[0]) ok = cJSON_AddStringToObject(json, "device_token", c->device_token) != NULL;
     char *wire = ok ? cJSON_PrintUnformatted(json) : NULL;
     int sent = wire ? esp_websocket_client_send_text(s->client, wire, strlen(wire), pdMS_TO_TICKS(3000)) : -1;
-    if (!wire || sent != (int)strlen(wire)) {
+    bool registered = wire && sent == (int)strlen(wire);
+    if (!registered) {
         ESP_LOGE("signaling", "Failed to send register; reconnecting");
         xEventGroupSetBits(s->events, RETRY);
     } else {
@@ -109,6 +197,7 @@ static void send_register(signaling_t *s)
     }
     cJSON_free(wire);
     cJSON_Delete(json);
+    return registered;
 }
 
 static void websocket_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -124,9 +213,18 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t id, void *
         s->connected_at = esp_timer_get_time();
         ESP_LOGI("signaling", "WebSocket connected");
         // Synchronous CONNECTED callback: first application frame, before reads.
-        send_register(s);
+        if (send_register(s)) {
+            // Publish readiness only after the synchronous first frame. There
+            // is no server register acknowledgement in the Digits protocol.
+            // Pairing messages still arrive on the unpaired registration, but
+            // peer call traffic requires a registration with a stored token.
+            outbound_set(s->session, s->credentials->device_token[0] != 0);
+            digits_webrtc_transport(s->session, true, s->credentials->number,
+                                    s->credentials->device_token[0] != 0);
+        }
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED ||
                id == WEBSOCKET_EVENT_FINISH) {
+        transport_down(s);
         xEventGroupSetBits(s->events, RETRY);
     } else if (id == WEBSOCKET_EVENT_ERROR) {
         ESP_LOGW("signaling", "WebSocket error: type=%d HTTP=%d errno=%d",
@@ -172,6 +270,16 @@ void digits_signaling_run(digits_credentials_t *credentials)
     s->credentials = credentials;
     s->events = xEventGroupCreate();
     ESP_ERROR_CHECK(s->events ? ESP_OK : ESP_ERR_NO_MEM);
+    outbound.queue = xQueueCreate(TX_QUEUE_LENGTH, sizeof(tx_message_t));
+    ESP_ERROR_CHECK(outbound.queue ? ESP_OK : ESP_ERR_NO_MEM);
+    esp_err_t peer_err = digits_webrtc_init(enqueue_peer_message, NULL);
+    if (peer_err != ESP_OK)
+        ESP_LOGE("signaling", "WebRTC initialization failed: %s; signaling continues", esp_err_to_name(peer_err));
+    else {
+        peer_err = digits_webrtc_console_start();
+        if (peer_err != ESP_OK)
+            ESP_LOGE("signaling", "WebRTC development console unavailable: %s", esp_err_to_name(peer_err));
+    }
     unsigned delay_seconds = 0;
     for (;;) {
         if (delay_seconds) {
@@ -180,6 +288,9 @@ void digits_signaling_run(digits_credentials_t *credentials)
         }
         digits_wifi_wait_connected();
         s->connected_at = 0;
+        ++s->session;
+        transport_down(s);
+        discard_outbound();
         s->used = 0;
         s->text_active = false;
         xEventGroupClearBits(s->events, RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED | START_RETURNED);
@@ -195,12 +306,21 @@ void digits_signaling_run(digits_credentials_t *credentials)
         esp_err_t err = esp_websocket_client_start(s->client);
         xEventGroupSetBits(s->events, START_RETURNED);
         EventBits_t bits = RETRY;
-        if (err == ESP_OK) bits = xEventGroupWaitBits(s->events,
-            RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED, pdFALSE, pdFALSE, portMAX_DELAY);
+        if (err == ESP_OK) {
+            do {
+                bits = xEventGroupWaitBits(s->events,
+                    RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED, pdFALSE, pdFALSE,
+                    pdMS_TO_TICKS(10)) & (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED);
+                if (!bits) drain_outbound(s);
+                bits |= xEventGroupGetBits(s->events) & (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED);
+            } while (!bits);
+        }
         else ESP_LOGW("signaling", "WebSocket start failed: %s", esp_err_to_name(err));
         // Stop/destroy are forbidden inside the WebSocket callback. Owner only.
+        transport_down(s);
         if (err == ESP_OK) esp_websocket_client_stop(s->client);
         ESP_ERROR_CHECK(esp_websocket_client_destroy(s->client));
+        discard_outbound();
         // Stop joins the callback, so collect any credential update racing closure.
         bits |= xEventGroupGetBits(s->events);
         if (bits & STORAGE_FAILED) {

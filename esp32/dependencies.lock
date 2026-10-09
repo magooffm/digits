@@ -9,6 +9,24 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.6.2
+  espressif/esp_libsrtp:
+    component_hash: 131560184c73ec09f77d8904a2db709307803f0f9f111898921b6966776eac15
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.0
+  espressif/esp_peer:
+    component_hash: 92bc1b80772acf8a0e2dc36193ec24278e0793140eca2a4060d8ce7b45c47845
+    dependencies:
+    - name: espressif/esp_libsrtp
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.0.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.5.7
   espressif/esp_websocket_client:
     component_hash: c5a067a9fddea370c478017e66fac302f4b79c3d4027e9bdd42a019786cceb92
     dependencies:
@@ -25,8 +43,10 @@ dependencies:
     version: 5.5.3
 direct_dependencies:
 - espressif/esp_codec_dev
+- espressif/esp_libsrtp
+- espressif/esp_peer
 - espressif/esp_websocket_client
 - idf
-manifest_hash: 15531388dbc4d9e648cc653b9a6d2638cc2dfd47803a1f720f8ab700fff1ee89
+manifest_hash: 1d8b92126b1720eb739533756c77a366d6a09649efabbc22e5caa7ba1e67aae5
 target: esp32s3
 version: 2.0.0

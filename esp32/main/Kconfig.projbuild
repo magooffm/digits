@@ -8,6 +8,40 @@ menu "Digits development configuration"
     config DIGITS_SERVER_URL
         string "Digits WebSocket URL (ws://host:port/ws)"
         default ""
+    menu "WebRTC interoperability"
+        config DIGITS_WEBRTC
+            bool "Enable one-to-one WebRTC interoperability"
+            depends on MBEDTLS_TLS_ENABLED
+            default y
+            select MBEDTLS_SSL_PROTO_TLS1_2
+            select MBEDTLS_SSL_PROTO_DTLS
+            select MBEDTLS_SSL_DTLS_SRTP
+            help
+                Development milestone for the unchanged Digits protocol and an
+                existing Pion client. One IPv4 UDP host/STUN peer is supported;
+                TURN, group calls and ICE restart are not implemented. Media
+                sends encoded Opus silence and reports received packet counts.
+                It does not consume onboard microphone PCM or play received
+                audio, so Ring Test and recording diagnostics remain separate.
+        config DIGITS_WEBRTC_CONSOLE
+            bool "Enable development WebRTC commands on USB Serial/JTAG"
+            depends on DIGITS_WEBRTC && ESP_CONSOLE_USB_SERIAL_JTAG
+            default y
+            help
+                Enable the commands webrtc call NUMBER, webrtc answer,
+                webrtc hangup and webrtc status in idf.py monitor. Commands
+                enqueue operations without blocking signaling. Only eight
+                commands are kept in RAM history; no credentials are exposed.
+        config DIGITS_WEBRTC_AUTO_ANSWER
+            bool "Automatically accept incoming one-to-one calls for testing"
+            depends on DIGITS_WEBRTC
+            default n
+            help
+                Lab-only shortcut for interoperability testing. Otherwise an
+                incoming call waits for webrtc answer or webrtc hangup. This
+                milestone sends Opus silence and never enables microphone
+                transmission or decoded speaker playback.
+    endmenu
     menu "Onboard microphone"
         choice DIGITS_MIC_RECORD_MODE
             prompt "Microphone record/playback diagnostic"

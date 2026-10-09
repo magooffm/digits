@@ -1,4 +1,4 @@
-# Digits ESP32 signaling and audio
+# Digits ESP32 signaling, audio and WebRTC
 
 ESP-IDF **v5.5.3**, target **esp32s3**, Waveshare ESP32-S3-AUDIO-Board
 (ESP32-S3R8, 16 MB flash). This firmware connects Wi-Fi, registers with
@@ -8,7 +8,10 @@ the ES7210 ADC. Capture supplies reusable 48 kHz signed 16-bit mono PCM;
 an optional development diagnostic reports levels over serial. Optional saved
 audio tests either record two seconds after boot or record while KEY1 is held
 (up to ten seconds), then play the recording after release.
-WebRTC, Opus, calls, call buttons, hook handling and handset wiring are unused.
+The first WebRTC interoperability mode supports one incoming or outgoing call
+with serial development controls, encoded Opus silence and received-packet
+diagnostics. Microphone encoding and received-audio playback are not connected
+to the peer yet. Call buttons, hook handling and handset wiring remain unused.
 The console defaults to the ESP32-S3's native USB Serial/JTAG port.
 
 ## Configure, build, flash and monitor
@@ -88,9 +91,9 @@ Paired registration (example number and 64-character original token):
 ```
 
 The synchronous WebSocket CONNECTED handler sends `register` immediately
-with a 3-second send timeout. It is the only application message this
-milestone sends. No register-success acknowledgement exists, so a successful
-send log does not claim authentication success.
+with a 3-second send timeout, before allowing queued peer signaling. No
+register-success acknowledgement exists, so a successful send log does not
+claim authentication success. Peer commands require stored pairing credentials.
 
 `pairing_code` is retained as a JSON string, preserving leading zeros.
 `paired` commits number and token before requesting a reconnect outside the
@@ -98,7 +101,8 @@ WebSocket event callback. `line_renumber` commits the changed number while
 retaining the token; an unchanged number does not cause a reconnect loop.
 `error` logs the server's exact error string without changing credentials.
 `ring_test` queues a one-second speaker test without replying to the server.
-Other message types are logged and ignored; this firmware cannot answer calls.
+The peer dispatcher handles one-to-one call, SDP, ICE and ICE-server messages.
+Other message types are logged and ignored.
 
 Espressif `esp_websocket_client` **1.6.1** is pinned in the manifest. Its receive
 path automatically echoes incoming PING payloads as PONG control frames.
@@ -107,7 +111,9 @@ The 1024-byte receive buffer exceeds the RFC maximum control payload of 125
 bytes. Outbound heartbeat uses 30-second pings and a 15-second pong timeout.
 Server heartbeats use 30-second pings and a 45-second read deadline.
 Text messages are assembled across receive-buffer chunks and continuation
-frames up to 4096 bytes; control frames can interrupt assembly.
+frames up to 16,384 bytes; control frames can interrupt assembly. Raw SDP is
+separately limited to 12,288 bytes. Peer output uses an eight-item queue tagged
+with the WebSocket session; old work cannot be replayed after reconnect.
 
 Deliberate credential reconnects are immediate. Failed/short-lived connections
 use delays of 6, 12, 24, 48, then 60 seconds maximum. A connection surviving
@@ -130,6 +136,162 @@ Reference definitions:
 - `pi/digitsd/cmd/digitsd/dispatch.go`: pairing and renumber handling.
 - `pi/digitsd/cmd/digitsd/main.go`: `reconnectLoop`, `nextReconnectBackoff`.
 - Pinned client implementation: https://github.com/espressif/esp-protocols/blob/websocket-v1.6.1/components/esp_websocket_client/esp_websocket_client.c
+
+## WebRTC interoperability milestone
+
+The [integration design](../docs/esp32-webrtc-interoperability.md) records the
+exact upstream protocol and compatibility review completed before coding.
+The implementation uses `esp_peer` directly; it does not initialize Espressif's
+capture/render framework or reopen the existing I²S/I²C peripherals.
+
+The manifest and lock file pin:
+
+| Component | Version | Purpose |
+| --- | --- | --- |
+| ESP-IDF | 5.5.3 | Target SDK; includes mbedTLS 3.6.5 |
+| `espressif/esp_peer` | 1.5.7 | ICE, DTLS and encoded RTP peer API |
+| `espressif/esp_libsrtp` | 1.0.0 | Bundled libSRTP 3.0.0 |
+| `espressif/esp_websocket_client` | 1.6.1 | Existing Digits transport |
+| `espressif/esp_codec_dev` | 1.6.2 | Existing ES8311/ES7210 drivers |
+
+No Opus encoder or decoder is linked for this step. The payload `f8 ff fe`
+was independently decoded with official Xiph libopus 1.5.2: each packet is a
+20 ms mono frame, 960 zero samples at 48 kHz, including when decoded by a stereo
+decoder. It is submitted at most once per 20 ms slot after the peer reports
+`CONNECTED`. PTS uses milliseconds; late slots are dropped rather than sent
+in a burst. The peer's receive loop can delay submission, so counters expose
+skipped slots. Received encoded packets are counted and discarded. The SDP
+advertises `opus/48000/2`, as required even for mono audio; the source and the
+ESP32-S3 library binary were checked against the locked 1.5.7 component.
+
+Under **Digits development configuration → WebRTC interoperability**, enable
+the peer and USB console. Auto-answer is disabled by default. The commands in
+`idf.py monitor` are:
+
+```text
+webrtc status
+webrtc call 3140002
+webrtc answer
+webrtc hangup
+```
+
+Use an actual online Pion device number in the same authorized Digits family.
+No calls are made automatically at boot. An incoming `ring` retains the caller
+and offer until `webrtc answer`; answering before the offer arrives records
+the intent. Outgoing order is `call`, then `sdp` containing the offer; incoming
+acceptance sends `answer` containing the answer. SDP remains a JSON string with
+its original CRLF. Pion's `ice.candidate` is a bare `candidate:...` string, with
+no JSON candidate object, MID, m-line index or added `a=` prefix. Espressif's
+local candidates are included in its SDP; any early remote trickle candidates
+are buffered until remote SDP is applied. The local ringing bound is 60 seconds;
+the post-answer transport deadline is 10 seconds, matching the Pi client.
+
+Each peer, retained SDP, candidate list and per-call configuration is released
+on hangup, failed setup, timeout or signaling loss. Signaling reconnects preserve
+pairing and start without a peer. Foreign-peer, conference and stale-session
+messages cannot start a second peer. The server's ordinary `hangup` ignores
+`to` and ends the authenticated origin's active calls, so unrelated rings or
+conference messages must not cause a speculative hangup.
+
+### Configuration and memory
+
+New configurations use the board's Octal PSRAM at 40 MHz through `malloc`,
+a 4,096-byte internal-allocation threshold, a 65,536-byte internal reserve,
+and the supported 240 MHz CPU setting. DTLS and DTLS-SRTP are enabled. Existing
+`sdkconfig` values take precedence over defaults: when updating an older
+checkout, select these settings in menuconfig rather than assuming the new
+defaults replace existing selections. In particular select **Custom partition
+table CSV → partitions.csv**, **Octal PSRAM → 40 MHz → malloc integration**,
+and **CPU frequency → 240 MHz**. These changes leave Wi-Fi/server settings alone.
+
+The 4 MiB factory app begins at `0x10000`. NVS remains at `0x9000`, size `0x6000`,
+and PHY remains at `0xf000`, size `0x1000`. Regular flashing writes the new
+partition table and app without erasing the saved identity/token. No OTA
+partition or procedure is added.
+
+The peer worker uses a 20 KiB internal stack on core 1 at priority 3, below
+microphone capture (5) and Ring Test/recorded playback (4). Its inbound queue
+holds eight copied events; limits are 32 remote candidates of up to 512 bytes,
+eight STUN URLs of up to 255 bytes, 12 KiB raw SDP and 16 KiB signaling JSON.
+The peer's transmit pool and audio jitter buffer are explicitly 8 KiB each,
+with 16 transmit entries and eight gathered candidates. The development console
+adds a 4 KiB stack at priority 3 and eight RAM-only history entries. Queue
+exhaustion aborts affected setup rather than silently losing control messages.
+Per-call configuration, URLs and applied SDP remain valid until peer closure.
+
+`Before peer creation`, `Peer created`, `Connected`, `Peer released` and status
+logs report internal free/minimum/largest-block memory, PSRAM free space and
+worker stack high-water space in bytes. These are the measurements needed to
+determine real handshake peaks and retained memory. Linker/image size alone
+does not establish runtime memory use; `idf.py size` reports the static footprint.
+
+### Verification and remaining limits
+
+All three configurations build with ESP-IDF 5.5.3 and the locked components:
+
+| Configuration | Application binary |
+| --- | --- |
+| Microphone diagnostics, recording disabled | 1,179,936 bytes |
+| KEY1 press-to-record | 1,185,328 bytes |
+| Two-second boot recording | 1,183,088 bytes |
+
+Each fits the 4 MiB application partition with 72% remaining. The default
+linker report uses 138,711 bytes of DIRAM, leaving 203,049 bytes in that linker
+region, plus 16,384 bytes of dedicated IRAM. These figures describe static
+sections, not free heap after Wi-Fi, task creation or a DTLS handshake.
+
+The worker and WebSocket tests compile the complete production sources against
+real cJSON and the installed peer headers, with deterministic peer/RTOS/transport
+mocks. From the repository root after exporting ESP-IDF:
+
+```sh
+python3 esp32/tests/webrtc_interop_test.py --idf-path "$IDF_PATH"
+python3 esp32/tests/webrtc_interop_test.py --idf-path "$IDF_PATH" --sanitize
+python3 esp32/tests/signaling_webrtc_test.py --idf-path "$IDF_PATH"
+python3 esp32/tests/signaling_webrtc_test.py --idf-path "$IDF_PATH" --sanitize
+```
+
+The 41 peer lifecycle cases and 12 WebSocket transport cases pass both normal
+and AddressSanitizer/UndefinedBehaviorSanitizer runs. Existing Ring Test deadline,
+microphone capture, recorded playback and KEY1 worker regression checks also
+pass. Host tests verify sequencing and resource ownership; the peer mock does
+not perform ICE, DTLS or SRTP negotiation.
+
+When an existing Digits/Pion handset is available, put both devices on the same
+LAN in an authorized Digits family, with working registration:
+
+1. Boot the ESP32 and enter `webrtc status`. Confirm signaling is online,
+   paired is yes and the peer is idle.
+2. Enter `webrtc call PION_NUMBER` and answer on the existing handset. Confirm
+   `PAIRING`, `PAIRED`, `CONNECTING` and `CONNECTED`, then increasing transmit
+   and receive counters and the Pi's connected state.
+3. End the call with `webrtc hangup`. Dial the ESP32's saved number from the
+   existing handset, then enter `webrtc answer` after the incoming-call log.
+   Repeat the connection and packet checks, then hang up from the Pi side.
+4. Repeat both directions and compare `Peer released` memory. Exercise Ring
+   Test, KEY1 recording if enabled, WebSocket PING/PONG and Wi-Fi loss/recovery.
+   Signaling loss should release the call and reconnect with the saved identity.
+
+An SDP answer or `PAIRED` alone is insufficient. `First remote encoded audio
+packet received after SRTP processing` is the media reception check; no speech
+playback is expected yet. Record both endpoints' logs and the resource reports
+to establish interoperability and the runtime memory budget.
+
+Only IPv4 UDP host/STUN connections are enabled in this milestone. Unsupported
+TURN/TURNS, TCP and IPv6 server URLs are diagnosed and skipped; there is no
+claim of relay or general Internet/NAT coverage. Video, data channels, group
+calls, ICE restart and surviving signaling loss are outside this step.
+
+The peer core is prebuilt. Its visible DTLS code uses optional certificate
+verification; comparison of the remote certificate to the signaled fingerprint
+could not be established. Do not treat this milestone as verified peer identity
+authentication or production readiness. No server or peer-library workaround
+was introduced.
+
+**Physical WebRTC interoperability is not yet verified.** No Pion endpoint is
+currently available. Successful builds and host lifecycle tests do not establish
+an ICE, DTLS/SRTP or media connection on the Waveshare board, nor concurrent
+audio quality or runtime heap/stack limits.
 
 ## Ring Test contract
 
@@ -418,7 +580,7 @@ idf.py menuconfig
 #   SPI RAM config -> Type of SPIRAM chip in use: Auto-detect
 #   SPI RAM config -> Set RAM clock speed: 40Mhz clock speed
 #   SPI RAM config -> SPI RAM access method:
-#     Make RAM allocatable using heap_caps_malloc(..., MALLOC_CAP_SPIRAM)
+#     Make RAM allocatable using malloc() as well
 #   SPI RAM config -> Ignore PSRAM when not found: enabled
 # Digits development configuration -> Onboard microphone:
 #   Microphone record/playback diagnostic:
@@ -429,15 +591,16 @@ idf.py build
 idf.py -p /dev/cu.usbmodem21122101 flash monitor
 ```
 
-Use the currently connected port if its name changes. The PSRAM access option
-above keeps ordinary allocations in internal memory; the recording explicitly
-uses `heap_caps_malloc` with `MALLOC_CAP_SPIRAM`. The alternative "Make RAM
-allocatable using malloc() as well" also satisfies the test's dependency.
+Use the currently connected port if its name changes. Retain the WebRTC
+configuration's malloc integration so large peer allocations can use PSRAM.
+The recording itself explicitly uses `heap_caps_malloc` with
+`MALLOC_CAP_SPIRAM`, independently of the ordinary allocation threshold.
 "Ignore PSRAM when not found" allows signaling and normal capture to boot
 even if PSRAM initialization fails; the recording test then logs a missing
 buffer and skips playback. Configuration and a regular flash preserve the
-paired UUID, number and original device token. No partition change or erase
-is required.
+paired UUID, number and original device token. After installing this
+milestone's 4 MiB app partition table, changing recording modes needs no
+further partition change. No flash erase is required.
 
 Keep the monitor open immediately after reboot. Expected application messages
 for a successful test (illustrative until tested on the board):
@@ -479,7 +642,7 @@ Digits message. Playback of speech on physical hardware remains to be verified.
 
 Select `Hold KEY1 to record; release to play (maximum 10 seconds)` in the
 same menuconfig choice to enable `CONFIG_DIGITS_MIC_BUTTON_RECORD_PLAYBACK`.
-Reuse the Octal PSRAM, 40 MHz and `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)`
+Reuse the Octal PSRAM, 40 MHz and malloc integration
 configuration [above](#optional-two-second-record-then-playback-test); this
 mode has the same PSRAM dependency and leaves the boot test disabled.
 From the repository root:
@@ -490,7 +653,7 @@ export IDF_TOOLS_PATH=/private/tmp/digits-idf-tools
 cd esp32
 idf.py menuconfig
 # Component config -> ESP PSRAM:
-#   Reuse the Octal / 40 MHz / heap_caps_malloc configuration above.
+#   Reuse the Octal / 40 MHz / malloc integration configuration above.
 # Digits development configuration -> Onboard microphone:
 #   Microphone record/playback diagnostic:
 #     Hold KEY1 to record; release to play (maximum 10 seconds)

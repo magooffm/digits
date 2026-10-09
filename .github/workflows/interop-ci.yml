@@ -1,0 +1,77 @@
+name: Pion Interoperability CI
+
+on:
+  push:
+    paths:
+      - 'tools/interop/**'
+      - 'pi/digitsd/internal/signal/**'
+      - 'pi/digitsd/internal/webrtc/**'
+      - 'pi/digitsd/internal/codec/**'
+      - 'pi/digitsd/go.mod'
+      - 'pi/digitsd/go.sum'
+      - '.github/workflows/interop-ci.yml'
+  pull_request:
+    paths:
+      - 'tools/interop/**'
+      - 'pi/digitsd/internal/signal/**'
+      - 'pi/digitsd/internal/webrtc/**'
+      - 'pi/digitsd/internal/codec/**'
+      - 'pi/digitsd/go.mod'
+      - 'pi/digitsd/go.sum'
+      - '.github/workflows/interop-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fedora:
+    name: Fedora ${{ matrix.release }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['43', '44']
+    container: registry.fedoraproject.org/fedora:${{ matrix.release }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: tools/interop
+    env:
+      CGO_ENABLED: '1'
+      # The module requires Go 1.26.1; older Fedora packages can select it.
+      GOTOOLCHAIN: auto
+    steps:
+      - name: Install native dependencies
+        working-directory: /
+        run: dnf install -y golang gcc make pkgconf-pkg-config opus-devel ca-certificates git
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Report toolchain and Opus versions
+        run: |
+          go version
+          go env GOOS GOARCH CGO_ENABLED
+          pkg-config --modversion opus
+
+      - name: Build
+        run: make build
+
+      - name: Test real Pion transports and credential persistence
+        run: make test
+
+      - name: Test with race detector
+        run: make race
+
+      - name: Vet
+        run: make vet
+
+      - name: CLI smoke test
+        run: ./bin/digits-pion --help
