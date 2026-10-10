@@ -20,9 +20,10 @@ menu "Digits development configuration"
                 Development milestone for the unchanged Digits protocol and an
                 existing Pion client. One IPv4 UDP host/STUN peer is supported;
                 TURN, group calls and ICE restart are not implemented. Media
-                sends encoded Opus silence and reports received packet counts.
-                It does not consume onboard microphone PCM or play received
-                audio, so Ring Test and recording diagnostics remain separate.
+                uses live 48 kHz mono microphone Opus and bounded decoded
+                speaker playback. Dedicated audio tasks keep I2S and codec
+                work out of signaling and peer callbacks. Full-duplex calls
+                reserve audio devices against Ring Test and recording tests.
         config DIGITS_WEBRTC_CONSOLE
             bool "Enable development WebRTC commands on USB Serial/JTAG"
             depends on DIGITS_WEBRTC && ESP_CONSOLE_USB_SERIAL_JTAG
@@ -39,8 +40,8 @@ menu "Digits development configuration"
             help
                 Lab-only shortcut for interoperability testing. Otherwise an
                 incoming call waits for webrtc answer or webrtc hangup. This
-                milestone sends Opus silence and never enables microphone
-                transmission or decoded speaker playback.
+                call can transmit live microphone audio and play received
+                audio through the integrated speaker.
     endmenu
     menu "Onboard microphone"
         choice DIGITS_MIC_RECORD_MODE

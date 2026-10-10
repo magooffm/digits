@@ -14,16 +14,17 @@ static esp_console_repl_t *console;
 static int webrtc_command(int argc, char **argv)
 {
     bool call = argc >= 2 && strcmp(argv[1], "call") == 0;
+    bool audio = argc >= 2 && strcmp(argv[1], "audio") == 0;
     bool action = argc >= 2 &&
         (strcmp(argv[1], "answer") == 0 || strcmp(argv[1], "hangup") == 0 ||
          strcmp(argv[1], "status") == 0);
-    if ((call && argc != 3) || (action && argc != 2) || (!call && !action)) {
-        printf("Usage: webrtc call NUMBER | webrtc answer | webrtc hangup | webrtc status\n");
+    if (((call || audio) && argc != 3) || (action && argc != 2) || (!call && !action && !audio)) {
+        printf("Usage: webrtc call NUMBER | webrtc answer | webrtc hangup | webrtc status | webrtc audio tx|rx|full\n");
         return 1;
     }
     // The worker validates the number and call state. Never wait for ICE/DTLS
     // or write to the WebSocket from this low-priority console callback.
-    esp_err_t err = digits_webrtc_command(argv[1], call ? argv[2] : NULL);
+    esp_err_t err = digits_webrtc_command(argv[1], call || audio ? argv[2] : NULL);
     if (err != ESP_OK) {
         printf("WebRTC command rejected: %s\n", esp_err_to_name(err));
         return 1;
@@ -41,8 +42,8 @@ esp_err_t digits_webrtc_console_start(void)
     // The REPL helper initializes esp_console and installs its help command.
     const esp_console_cmd_t command = {
         .command = "webrtc",
-        .help = "Development WebRTC commands: call NUMBER, answer, hangup, status. Sends Opus silence; received media is counted.",
-        .hint = "call NUMBER | answer | hangup | status",
+        .help = "WebRTC call NUMBER, answer, hangup, status; audio tx|rx|full selects the next call's audio.",
+        .hint = "call NUMBER | answer | hangup | status | audio tx|rx|full",
         .func = webrtc_command,
     };
     esp_err_t err = esp_console_cmd_register(&command);

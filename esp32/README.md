@@ -8,10 +8,19 @@ the ES7210 ADC. Capture supplies reusable 48 kHz signed 16-bit mono PCM;
 an optional development diagnostic reports levels over serial. Optional saved
 audio tests either record two seconds after boot or record while KEY1 is held
 (up to ten seconds), then play the recording after release.
-The first WebRTC interoperability mode supports one incoming or outgoing call
-with serial development controls, encoded Opus silence and received-packet
-diagnostics. Microphone encoding and received-audio playback are not connected
-to the peer yet. Call buttons, hook handling and handset wiring remain unused.
+WebRTC supports one incoming or outgoing call with serial development controls,
+live microphone Opus encoding and decoded speaker playback. Full duplex is the
+default; transmit-only and receive-only modes support separate hardware checks.
+Full-duplex tests confirmed clear Pion-to-ESP32 speech while capture continued.
+Recorded ESP32 microphone words were also confirmed clear after offline
+gain/filter preparation and replay through Pion. Initial repeat cycles and
+post-call diagnostic recovery passed. A clean acoustic-loop probe estimated
+about 170 ms round trip; occasional playback delays and calibrated one-way
+latency remain under assessment. The
+nine-call baseline established encoded transport, and the earlier audible
+Ring Tests checked the local speaker.
+See the [call audio implementation and validation guide](../docs/esp32-call-audio.md).
+Call buttons, hook handling and handset wiring remain unused.
 The console defaults to the ESP32-S3's native USB Serial/JTAG port.
 
 ## Configure, build, flash and monitor
@@ -153,16 +162,22 @@ The manifest and lock file pin:
 | `espressif/esp_libsrtp` | 1.0.0 | Bundled libSRTP 3.0.0 |
 | `espressif/esp_websocket_client` | 1.6.1 | Existing Digits transport |
 | `espressif/esp_codec_dev` | 1.6.2 | Existing ES8311/ES7210 drivers |
+| `espressif/esp_audio_codec` | 2.6.2 | Direct Opus encode/decode APIs |
 
-No Opus encoder or decoder is linked for this step. The payload `f8 ff fe`
-was independently decoded with official Xiph libopus 1.5.2: each packet is a
-20 ms mono frame, 960 zero samples at 48 kHz, including when decoded by a stereo
-decoder. It is submitted at most once per 20 ms slot after the peer reports
-`CONNECTED`. PTS uses milliseconds; late slots are dropped rather than sent
-in a burst. The peer's receive loop can delay submission, so counters expose
-skipped slots. Received encoded packets are counted and discarded. The SDP
-advertises `opus/48000/2`, as required even for mono audio; the source and the
-ESP32-S3 library binary were checked against the locked 1.5.7 component.
+The initial transport milestone sent validated `f8 ff fe` Opus silence and
+counted received packets. The call audio implementation replaces that source
+with ES7210 PCM: 960 signed 16-bit mono samples at 48 kHz per 20 ms frame.
+Dedicated workers encode Opus and decode incoming audio for ES8311 playback;
+the peer worker alone submits encoded packets. Capture sequence determines
+PTS, and stale/backlogged frames are discarded without a catch-up burst.
+The SDP still advertises `opus/48000/2`; local PCM remains mono.
+
+The ESP32 encoder uses 32 kbit/s CBR, VOIP mode, complexity 0 and no FEC/DTX.
+The original Pi/Pion 24 kbit/s FEC/DTX encoder remains unchanged. Playback uses
+a bounded 60 ms initial jitter target, eight slots and half-amplitude PCM.
+Missing frames use Opus PLC; a sustained outage mutes output and waits for a
+new playout window. These implementation settings do not establish measured
+latency or speech intelligibility; use the [three-phase audio checks](../docs/esp32-call-audio.md#physical-validation-procedure).
 
 Under **Digits development configuration → WebRTC interoperability**, enable
 the peer and USB console. Auto-answer is disabled by default. The commands in
@@ -173,7 +188,16 @@ webrtc status
 webrtc call 3140002
 webrtc answer
 webrtc hangup
+webrtc audio tx
+webrtc audio rx
+webrtc audio full
 ```
+
+Audio mode applies only while idle after cleanup; full duplex is the default.
+The mode command also works while signaling is offline. Calls still require
+online pairing. Audio startup is asynchronous after `CONNECTED`, and hangup
+waits to free its context until both codec workers stop. New calls and mode
+changes are rejected while `cleanup_pending=yes`.
 
 Use an actual online Pion device number in the same authorized Digits family.
 No calls are made automatically at boot. An incoming `ring` retains the caller
@@ -202,15 +226,20 @@ and the supported 240 MHz CPU setting. DTLS and DTLS-SRTP are enabled. Existing
 checkout, select these settings in menuconfig rather than assuming the new
 defaults replace existing selections. In particular select **Custom partition
 table CSV → partitions.csv**, **Octal PSRAM → 40 MHz → malloc integration**,
-and **CPU frequency → 240 MHz**. These changes leave Wi-Fi/server settings alone.
+and **CPU frequency → 240 MHz**. Call audio also needs **FreeRTOS tick rate →
+1,000 Hz**; older configurations may retain 100 Hz despite the new default.
+These changes leave Wi-Fi/server settings alone.
 
 The 4 MiB factory app begins at `0x10000`. NVS remains at `0x9000`, size `0x6000`,
 and PHY remains at `0xf000`, size `0x1000`. Regular flashing writes the new
 partition table and app without erasing the saved identity/token. No OTA
 partition or procedure is added.
 
-The peer worker uses a 20 KiB internal stack on core 1 at priority 3, below
-microphone capture (5) and Ring Test/recorded playback (4). Its inbound queue
+The peer worker uses a 20 KiB internal stack on core 1 at priority 6, above
+microphone capture and codec workers (5) and Ring Test/recorded playback (4).
+This priority was raised from 3 after the first full-duplex continuity failure;
+the corrected build completed clear full-duplex calls with both endpoints as
+caller and four additional cleanup cycles. Its inbound queue
 holds eight copied events; limits are 32 remote candidates of up to 512 bytes,
 eight STUN URLs of up to 255 bytes, 12 KiB raw SDP and 16 KiB signaling JSON.
 The peer's transmit pool and audio jitter buffer are explicitly 8 KiB each,
@@ -218,6 +247,14 @@ with 16 transmit entries and eight gathered candidates. The development console
 adds a 4 KiB stack at priority 3 and eight RAM-only history entries. Queue
 exhaustion aborts affected setup rather than silently losing control messages.
 Per-call configuration, URLs and applied SDP remain valid until peer closure.
+The call encoder uses a 48 KiB internal stack and the decoder uses 24 KiB,
+both at priority 5;
+bounded PCM, packet queues and jitter storage prefer PSRAM. The microphone
+single-consumer reservation excludes recording diagnostics from call capture,
+and the shared speaker mutex excludes overlapping playback. The peer receive
+timeout is 5 ms and its active wait is one tick, removing the previous extra
+10 ms delay. Connected-loop duration, source PTS gaps and stage ages are
+reported separately from Pion's RTP sequence-gap diagnostics.
 
 `Before peer creation`, `Peer created`, `Connected`, `Peer released` and status
 logs report internal free/minimum/largest-block memory, PSRAM free space and
@@ -256,17 +293,100 @@ python3 esp32/tests/webrtc_interop_test.py --idf-path "$IDF_PATH"
 python3 esp32/tests/webrtc_interop_test.py --idf-path "$IDF_PATH" --sanitize
 python3 esp32/tests/signaling_webrtc_test.py --idf-path "$IDF_PATH"
 python3 esp32/tests/signaling_webrtc_test.py --idf-path "$IDF_PATH" --sanitize
+python3 esp32/tests/call_audio_worker_test.py
+python3 esp32/tests/call_audio_worker_test.py --sanitize
 ```
 
-The 45 peer lifecycle cases and 12 WebSocket transport cases pass both normal
+The 53 peer lifecycle cases and 12 WebSocket transport cases pass both normal
 and AddressSanitizer/UndefinedBehaviorSanitizer runs. Existing Ring Test deadline,
 microphone capture, recorded playback and KEY1 worker regression checks also
-pass. Host tests verify sequencing and resource ownership; the peer mock does
-not perform ICE, DTLS or SRTP negotiation.
+pass. The actual call-audio workers also pass normal and sanitized host runs,
+including 1,000 fixed-clock capture frames with 6 ms peer polls, 100 modeled
+two-descriptor playback cycles, injected stalls and cleanup/failure paths.
+Pure jitter/render checks pass for reorder, missing/late packets, timestamp
+wrap and conservative PCM gain. See the [audio guide](../docs/esp32-call-audio.md#validation-status)
+for commands and model limits. Host tests verify sequencing and resource
+ownership; peer/codec/I²S mocks do not establish transport or acoustic results.
 
-The added teardown regressions fail against the original implementation. They
-verify that transport failures after connection send ordinary `hangup`, while
-setup failures retain `connect_timeout`.
+The teardown regressions verify that transport failures after connection send
+ordinary `hangup`, while setup failures retain `connect_timeout`. Audio adapter
+checks cover queued encoded frames, preserved PTS, asynchronous startup and
+shutdown, new-call exclusion during cleanup, idle-only audio modes and the
+short scheduling wait. The revised ESP-IDF 5.5.3 call-audio build passes compilation:
+its image is 1,369,904 bytes (`0x14e730`), leaving 67% of the 4 MiB partition
+free, with ELF SHA-256 prefix `808a295d05`, and has been flashed.
+The private hardware configuration selects a
+1,000 Hz tick, while the supplied `sdkconfig` stays unchanged. Its microphone
+and full-duplex physical results follow; initial repeat-cycle cleanup is verified.
+Historical image sizes above refer to the earlier silence milestone.
+
+The first physical TX-only call on the initial audio image `559ad7bda5`
+failed immediately with a `digits_call_tx` stack overflow before audio
+transmission. The correction
+increases the initial 16 KiB codec stacks to 48 KiB for TX and 24 KiB for RX,
+following the pinned codec's stack guidance. The revised firmware's TX-only
+transport retest sent/decoded Opus and measured 27,136 bytes minimum free TX
+stack without the immediate overflow.
+The host codec mocks do not
+measure the real Opus library's stack use. See the
+[audio failure and retest record](../docs/esp32-webrtc-interoperability.md#first-physical-audio-failure-and-corrected-tx-transport-retest).
+
+A Pion-originated TX-only call ran about 267.7 seconds and sent/received
+13,372 Opus packets. Nine local source skips were about 0.0673% of source
+slots; Pion saw no missing RTP sequences or recording errors. Nine timestamp
+gaps matched those locally unsent frames. The finalized 267.44-second mono
+WAV is quiet (peak 1,805, RMS 21.05); the user spoke for 10–15 seconds, but
+recorded speech intelligibility remains unverified. An ESP32-originated RX-only
+call then looped a known 7.842-second synthesized speech WAV, and the user
+confirmed **“Speech is clear.”** RX minimum free stack was 16,000 bytes of
+24 KiB; decode/write errors were zero. Its PLC, late-timestamp and producer-gap
+observations remain separate continuity diagnostics, detailed in the
+[physical audio results](../docs/esp32-call-audio.md#microphone-to-pion-transport-and-recording).
+Neither call measured end-to-end latency or established long-duration stability.
+
+The first full-duplex call on the priority-3 image lasted about 222 seconds;
+the user described it as **“not so clear.”** ESP32's TX queue/pop drops totaled
+718, about 6.46% of 11,116 encoded frames. Pion separately inferred 413 missing
+RTP sequences, and ESP32 used 799 PLC frames with 90 inferred producer feed
+gaps. These stage counters do not identify radio loss. The priority-6 correction
+keeps core assignment and Wi-Fi power-save settings unchanged for its first
+comparison and adds RSSI, power-save mode and capture-timeout diagnostics.
+Its completed 121-second ESP32-originated full call prompted **“speech is
+fine”** from the user. ESP32 sent 6,031 packets and Pion received all of them;
+25 local pop drops were about 0.413% source skips. RX counted zero PLC,
+late/missing timestamps, arrival drops or producer feed gaps. TX/RX minimum
+free stacks were 27,136/16,012 bytes and internal minimum free was 39,915 bytes.
+An amplified/filtered private copy of this call's microphone recording was
+then looped in a 193-second Pion-originated full call, and the user confirmed
+**“My words are clear.”** Pion received all 9,587 submitted packets, while
+50 source PTS skips matched its timestamp gaps. RX used three PLC frames
+and counted one inferred producer gap, with zero decode/write errors or
+arrival-queue drops. TX/RX stack minima remained 27,136/16,012 bytes; internal
+minimum free was 37,955 bytes, and idle internal/PSRAM free returned to
+158,735/8,362,080 bytes. Two concurrent KEY1 requests declined with `Speaker
+busy` while speech continued; concurrent Ring Test could not be dispatched
+because the WebUI disabled its button. After hangup, the user confirmed Ring
+Test and KEY1 recording/playback worked as usual; logs show 48,000 ring frames,
+98,880 recorded samples and resumed capture. Four additional calls completed
+cleanup with stable PSRAM free, a 63,488-byte largest internal block and idle
+internal free of 158,467–158,499 bytes. The first two had local playback
+skips/feed gaps despite zero inferred missing RTP sequences at Pion; occasional
+local scheduling delays remain. Of five acoustic-loop probes, one had no RTP
+or source timestamp gaps and estimated about 170 ms for Pion → speaker →
+microphone → Pion. It is a single observation with uncalibrated software
+origins and uncertainty that can exceed a 20 ms frame; it establishes neither
+one-way delay nor jitter or a proven timing bound. See the
+[latency qualifications](../docs/esp32-call-audio.md#single-acoustic-round-trip-estimate).
+The final console check showed online pairing, idle/full mode and
+`cleanup_pending=no`, with internal free/minimum/largest block
+158,475/37,955/63,488 bytes and PSRAM free 8,362,080 bytes. The current boot
+logged no capture I²S read faults or RX DMA overruns. Pion and serial tools
+stopped normally, and the board stayed running. Actual playback DMA underruns,
+raw speech level and long-duration stability remain separate limitations.
+Originals and firmware transmit gain were preserved. The pinned encoder hides
+underlying UDP callback errors, so
+successful application submission does not prove wire delivery. See the
+[first full-duplex result](../docs/esp32-call-audio.md#first-full-duplex-continuity-failure).
 
 For subsequent hardware checks, use an existing Digits/Pion handset or the
 [Pion test helper](../tools/interop/README.md), with both endpoints on the same
@@ -285,9 +405,11 @@ LAN in an authorized Digits family and working registration:
    Signaling loss should release the call and reconnect with the saved identity.
 
 An SDP answer or `PAIRED` alone is insufficient. `First remote encoded audio
-packet received after SRTP processing` is the media reception check; no speech
-playback is expected yet. Record both endpoints' logs and the resource reports
-to establish interoperability and the runtime memory budget.
+packet received after SRTP processing` is a transport reception check. For
+audible interoperability, additionally follow the separate microphone-WAV,
+speaker speech and full-duplex checks in the
+[audio validation guide](../docs/esp32-call-audio.md#physical-validation-procedure).
+Record both endpoints' logs and resource reports.
 
 Only IPv4 UDP host/STUN connections are enabled in this milestone. Unsupported
 TURN/TURNS, TCP and IPv6 server URLs are diagnosed and skipped; there is no
@@ -300,7 +422,7 @@ could not be established. Do not treat this milestone as verified peer identity
 authentication or production readiness. No server or peer-library workaround
 was introduced.
 
-**Nine LAN calls have verified hardware interoperability on 2026-10-11
+**Nine LAN calls verified encoded transport interoperability on 2026-10-11
 (Europe/Berlin): seven before the corrections and two afterward.**
 The initial board firmware (`7b94a10-dirty`, ESP-IDF 5.5.3, `esp_peer` 1.5.7)
 and the Fedora 44 Pion helper completed four Pion-to-ESP32 and three
@@ -370,7 +492,9 @@ peer-worker stack headroom matched the post-call values above.
 **The repeated Ring Test hardware check passed:** the user confirmed a
 consistently audible tone on every WebUI button press. These 15 completed
 playbacks are a bounded short retest, not a long-duration firmware stability result.
-Live microphone encoding and received-audio playback remain unfinished.
+Live microphone encoding and received-audio playback are now implemented.
+The newer RX-only call confirmed clear speech; its TX recording and remaining
+full-duplex checks are separate from this historical silence/Ring Test baseline.
 
 ## Ring Test contract
 
@@ -440,8 +564,10 @@ registration/pairing continue; a test then logs that audio is unavailable.
 
 `digits_ring_test_request` only overwrites a one-element queue without waiting.
 A separate FreeRTOS task performs codec/amp control and finite-timeout I2S
-writes while holding the shared speaker reservation. The optional microphone
-record/playback worker uses that same reservation to keep playback exclusive.
+writes while holding the shared speaker reservation. Call playback and the
+optional microphone record/playback worker use that same reservation to keep
+playback exclusive. Ring Test requests during a receive/full call are skipped
+while the call owns the speaker; retry after hangup and completed cleanup.
 It disables PA after one second regardless of the WebSocket's state. Pending
 overlapping requests are coalesced without extending the first deadline;
 unlike the Pi they do not restart the waveform. The normal WebUI disables
@@ -707,15 +833,18 @@ Test audio from being recorded or overlapping playback. A Ring Test arriving
 during this short interval logs that the speaker is reserved and is skipped;
 retry it after the completion message. The WebUI's HTTP success still means
 dispatch, not playback. Outside this optional test, Ring Test operates as
-before. The diagnostic is the sole PCM consumer while it runs; a future Opus
-consumer should run with this development test disabled.
+before. The diagnostic holds the microphone consumer reservation throughout
+recording and playback. Call capture uses the same reservation, so they cannot
+consume PCM or pause/resume the ADC concurrently. Busy requests fail cleanly;
+keep diagnostics idle while validating call audio.
 
 Recording gaps, read failures, a failed ADC mute or speaker write failure abort
 the test. An incomplete recording is not played. Cleanup gates off the
 amplifier and requests capture resume after any attempted pause, including a
 pause timeout. Treat `Capture resume failed` as a failed test and investigate
 before relying on capture. The diagnostic never modifies NVS or sends a new
-Digits message. Playback of speech on physical hardware remains to be verified.
+Digits message. Playback of saved speech through this recording diagnostic
+remains to be verified on physical hardware.
 
 ### Optional KEY1 hold-to-record, release-to-play test
 
@@ -811,8 +940,10 @@ but heard no saved audio. The same firmware's Ring Test remained audible.
 The gain adjustment builds successfully in all three configurations. Numeric
 rendering tests pass under ASan/UBSan, and boot/button workflow regressions
 verify quiet PCM with a DC offset receives about 10x gain, correct output
-metrics and safe cleanup. The revised firmware requires flashing and acoustic
-acceptance; no audible saved-speech result is claimed for it yet. For board acceptance, check
+metrics and safe cleanup. On the current `808a295d05` call-audio firmware,
+the post-call hardware check recorded 98,880 samples over 2,060 ms and resumed
+capture after playback; the user confirmed KEY1 recording/playback worked as
+usual. Additional board acceptance checks include
 startup-held handling, a short phrase, repeated recordings, the ten-second
 cap, a Ring Test while waiting at the cap, and normal capture/signaling after
 playback. [Microphone acceptance checks](#enable-the-development-diagnostic)
@@ -833,7 +964,7 @@ actual output RMS lower than the target.
 This changes only rendering of the completed saved buffer. Microphone ADC
 gain stays at its configured value, speaker DAC volume stays at 50/100, and
 Ring Test rendering is unchanged. Capture frames remain raw signed 16-bit
-mono PCM; no automatic gain control is added to capture or the future Opus
+mono PCM; no automatic gain control is added to capture or the call Opus
 input. Speaker reservation, ADC mute, RX draining and capture resume keep
 the same behavior in both playback modes.
 
@@ -882,17 +1013,19 @@ checks debounce, startup holds, fresh presses and read failures. These checks
 complement the microphone/Ring Test host regressions; they do not verify
 PSRAM, ADC audio, the physical button or speaker acoustics on the board.
 
-### Feeding a future Opus encoder
+### Feeding the call Opus encoder
 
-`microphone.h` exposes a reusable single-consumer API:
+`microphone.h` exposes a reserved single-consumer API used by the call encoder
+and recording diagnostics:
 
 ```c
-digits_microphone_frame_t frame;
-esp_err_t err = digits_microphone_read(&frame, 100);
-if (err == ESP_OK) {
-    // frame.pcm contains 960 signed 16-bit mono samples: 20 ms at 48 kHz.
-    // Check frame.sequence and DIGITS_MIC_FRAME_DISCONTINUITY before encoding.
-    // Feed a future 48 kHz mono Opus encoder here, in its own task.
+if (digits_microphone_acquire(0)) {
+    digits_microphone_frame_t frame;
+    if (digits_microphone_read(&frame, 100) == ESP_OK) {
+        // 960 signed 16-bit mono samples: 20 ms at 48 kHz.
+        // Check sequence, discontinuity flags and freshness before encoding.
+    }
+    digits_microphone_release(); // Same task that acquired the reservation.
 }
 ```
 
@@ -901,12 +1034,12 @@ timeout polls; waits are limited to 1,000 ms. Consumers never own or retain a
 DMA pointer. Every frame contains `sequence`, `flags`, `captured_at_us` and
 1,920 bytes of PCM. The timestamp is RX read-completion time, not a calibrated
 ADC timestamp. The first published sequence is 1; sequence gaps and
-`DIGITS_MIC_FRAME_DISCONTINUITY` identify dropped/lost audio. A future encoder
-must handle those gaps explicitly instead of joining samples across them as
-continuous audio. The queue is intentionally finite even when no consumer
-exists yet. Saved-recording diagnostic playback gain does not alter this PCM
-API or add capture AGC. No encoding, RTP, WebRTC or server protocol change is
-implemented.
+`DIGITS_MIC_FRAME_DISCONTINUITY` identify dropped/lost capture audio. The call
+encoder checks freshness and sequence gaps, preserving known missing frame
+time in outgoing PTS. The queue remains finite when no consumer is active.
+Saved-recording diagnostic playback gain does not alter this PCM API or add
+capture AGC. The [call audio guide](../docs/esp32-call-audio.md) describes encode,
+send, jitter, decode and output diagnostics; server protocol behavior is unchanged.
 
 Host microphone PCM/statistics checks, from the repository root:
 
@@ -1036,7 +1169,9 @@ overflows and resets after seven successful WebRTC calls, as recorded in the
 audible tests do not establish current Ring Test reliability. Repeat Ring Test
 and heartbeat checks on the corrected firmware now flashed. Fifteen subsequent
 Ring Tests completed without a stack panic, and the user confirmed consistent
-audible tones. The saved-speech acoustic result remains pending.
+audible tones. A subsequent post-call check on `808a295d05` also confirmed
+Ring Test and KEY1 recording/playback worked as usual, with normal capture
+resume, as recorded in the [call-audio recovery results](../docs/esp32-call-audio.md#pion-originated-full-duplex-and-diagnostic-exclusion).
 
 Host PCM checks (no ESP-IDF needed), from the repo root:
 

@@ -37,6 +37,12 @@ static esp_err_t run_button_recording(const digits_record_button_state_t *press)
         return ESP_ERR_TIMEOUT;
     }
     bool speaker_owned = true, pause_requested = false;
+    if (!digits_microphone_acquire(0)) {
+        ESP_LOGW("record_test", "Microphone busy with a call; release KEY1 and try again");
+        digits_audio_speaker_release();
+        heap_caps_free(recording);
+        return ESP_ERR_TIMEOUT;
+    }
     esp_err_t err = ESP_OK;
     size_t frames = 0;
     uint32_t sequence = 0;
@@ -154,6 +160,7 @@ finish:
         }
     }
     if (speaker_owned) digits_audio_speaker_release();
+    digits_microphone_release();
     heap_caps_free(recording);
     if (err == ESP_OK && frames)
         ESP_LOGI("record_test", "KEY1 playback finished; amplifier disabled, capture resumed");

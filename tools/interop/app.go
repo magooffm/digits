@@ -462,7 +462,7 @@ func (a *application) command(ctx context.Context, line string) {
 func (a *application) createPeer(ctx context.Context) error {
 	call := a.call
 	session, id := a.session, call.id
-	peer, err := newCallPeer(ctx, a.servers, a.options.audio, func(event peerEvent) {
+	peer, err := newCallPeerWithMedia(ctx, a.servers, a.options, func(event peerEvent) {
 		value := callEvent{session: session, callID: id, event: event}
 		select {
 		case a.events <- value:
@@ -623,7 +623,18 @@ func (a *application) reportStatus() {
 		slog.Info("Peer transport evidence", "stage", "ICE/DTLS/SRTP", "connection", s.Connection, "ice", s.ICE, "dtls", s.DTLS, "srtp", s.SRTP, "candidate_pair", s.CandidatePair)
 		slog.Info("Peer media counters", "stage", "media", "codec", s.Codec, "clock_rate", s.ClockRate, "channels", s.Channels,
 			"tx_frames", s.TXFrames, "rx_packets", s.RXPackets, "decoded_samples", s.DecodedSamples,
-			"encode_errors", s.EncodeErrors, "decode_errors", s.DecodeErrors, "write_errors", s.WriteErrors)
+			"encode_errors", s.EncodeErrors, "decode_errors", s.DecodeErrors, "write_errors", s.WriteErrors,
+			"receive_wav", s.ReceiveWAV, "recorded_samples", s.RecordedSamples,
+			"recording_dropped_packets", s.RecordingDroppedPackets, "recording_dropped_samples", s.RecordingDroppedSamples,
+			"recording_errors", s.RecordingErrors, "recording_finalized", s.RecordingFinalized,
+			"recording_pcm_peak", s.RecordingPCMPeak, "recording_pcm_rms", s.RecordingPCMRMS,
+			"source_first_sent_at", s.SourceFirstSentAt, "recording_first_decoded_at", s.RecordingFirstDecodedAt,
+			"source_first_sample_offset", 0, "recording_first_sample_offset", 0,
+			"recording_first_rtp_sequence", s.RecordingFirstRTPSequence, "recording_first_rtp_timestamp", s.RecordingFirstRTPTimestamp,
+			"rtp_sequence_missing", s.RTPSequenceMissing, "rtp_sequence_gap_events", s.RTPSequenceGapEvents,
+			"rtp_reordered_packets", s.RTPReorderedPackets, "rtp_duplicate_packets", s.RTPDuplicatePackets,
+			"rtp_timestamp_gap_samples", s.RTPTimestampGapSamples, "rtp_timestamp_gap_events", s.RTPTimestampGapEvents,
+			"rtp_timestamp_discontinuities", s.RTPTimestampDiscontinuities)
 	}
 }
 

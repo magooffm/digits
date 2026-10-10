@@ -29,7 +29,7 @@ prefix = r'''
 #define ESP_LOGE(tag, ...) log_message(__VA_ARGS__)
 
 typedef enum {
-    NORMAL, LOW_LEVEL, WRAP_SEQUENCE, ALLOC_FAIL, ACQUIRE_FAIL, RECORD_TIMEOUT,
+    NORMAL, LOW_LEVEL, WRAP_SEQUENCE, ALLOC_FAIL, ACQUIRE_FAIL, MICROPHONE_BUSY, RECORD_TIMEOUT,
     RECORD_DEADLINE, RECORD_GAP, RECORD_DISCONTINUITY, PAUSE_FAIL,
     PAUSE_TIMEOUT, SPEAKER_START_FAIL, WRITE_TIMEOUT, WRITE_PARTIAL,
     PLAYBACK_DEADLINE, SILENCE_FAIL, RESUME_FAIL,
@@ -40,7 +40,8 @@ static int64_t now_us, capture_start_us, speaker_start_us, gate_off_us;
 static unsigned allocations, frees, acquisitions, releases, reads, live_frames;
 static unsigned pause_calls, resume_calls, starts, writes, silences, drains;
 static unsigned discontinuity_logs, resume_failure_logs, success_logs;
-static bool locked, muted, amplifier;
+static bool locked, microphone_owned, muted, amplifier;
+static unsigned microphone_acquisitions, microphone_releases;
 static unsigned char *allocation;
 static int16_t *recorded;
 static int16_t expected[RECORD_PLAYBACK_SAMPLES];
@@ -90,7 +91,7 @@ static void *heap_caps_malloc(size_t bytes, unsigned caps)
 
 static void heap_caps_free(void *memory)
 {
-    assert(memory == recorded && !locked && !frees++);
+    assert(memory == recorded && !locked && !microphone_owned && !frees++);
     for (unsigned i = 0; i < 16; ++i) {
         assert(allocation[i] == 0xa5);
         assert(allocation[16 + RECORD_PLAYBACK_SAMPLES * sizeof(int16_t) + i] == 0xa5);
@@ -117,6 +118,23 @@ static void digits_audio_speaker_release(void)
     locked = false;
 }
 
+bool digits_microphone_acquire(uint32_t timeout_ms)
+{
+    assert(locked && !microphone_owned && timeout_ms == 0);
+    ++microphone_acquisitions;
+    if (scenario == MICROPHONE_BUSY) return false;
+    microphone_owned = true;
+    return true;
+}
+
+void digits_microphone_release(void)
+{
+    assert(microphone_owned && !locked && !amplifier);
+    assert(resume_calls == pause_calls);
+    microphone_owned = false;
+    ++microphone_releases;
+}
+
 static int16_t sample_value(uint32_t sequence, size_t sample)
 {
     if (scenario == LOW_LEVEL) return (int16_t)(140 + (sample % 2 ? 200 : -200));
@@ -127,7 +145,7 @@ static int16_t sample_value(uint32_t sequence, size_t sample)
 esp_err_t digits_microphone_read(digits_microphone_frame_t *frame,
                                uint32_t timeout_ms)
 {
-    assert(locked && !muted && !amplifier && timeout_ms == 100);
+    assert(locked && microphone_owned && !muted && !amplifier && timeout_ms == 100);
     assert(++reads < 200); // A bad/stale input cannot make the worker loop forever.
     if (scenario == RECORD_TIMEOUT && reads == 8) {
         now_us += 100000;
@@ -161,7 +179,7 @@ esp_err_t digits_microphone_read(digits_microphone_frame_t *frame,
 
 esp_err_t digits_microphone_pause(bool paused, uint32_t timeout_ms)
 {
-    assert(locked && !amplifier && timeout_ms == 1000);
+    assert(locked && microphone_owned && !amplifier && timeout_ms == 1000);
     if (paused) {
         assert(!pause_calls++ && expected_samples == RECORD_PLAYBACK_SAMPLES);
         assert(!memcmp(recorded, expected, sizeof(expected)));
@@ -253,7 +271,8 @@ static void reset(scenario_t next)
     allocations = frees = acquisitions = releases = reads = live_frames = 0;
     pause_calls = resume_calls = starts = writes = silences = drains = 0;
     discontinuity_logs = resume_failure_logs = success_logs = 0;
-    locked = muted = amplifier = false;
+    locked = microphone_owned = muted = amplifier = false;
+    microphone_acquisitions = microphone_releases = 0;
     allocation = NULL;
     recorded = NULL;
     expected_samples = 0;
@@ -265,7 +284,7 @@ static void check(scenario_t next, esp_err_t expected_error)
 {
     reset(next);
     assert(run_record_playback() == expected_error);
-    assert(!locked && !amplifier && !recorded && !allocation);
+    assert(!locked && !microphone_owned && !amplifier && !recorded && !allocation);
     assert(allocations == 1);
     if (next == ALLOC_FAIL) {
         assert(!frees && !acquisitions && !releases && !silences && !reads);
@@ -273,9 +292,15 @@ static void check(scenario_t next, esp_err_t expected_error)
     }
     assert(frees == 1 && acquisitions == 1);
     if (next == ACQUIRE_FAIL) {
-        assert(!releases && !silences && !reads);
+        assert(!releases && !silences && !reads && !microphone_acquisitions);
         return;
     }
+    assert(microphone_acquisitions == 1);
+    if (next == MICROPHONE_BUSY) {
+        assert(releases == 1 && !silences && !reads && !pause_calls && !microphone_releases);
+        return;
+    }
+    assert(microphone_releases == 1);
     assert(releases == 1 && silences == 1);
     if (next == RECORD_TIMEOUT || next == RECORD_DEADLINE ||
         next == RECORD_GAP || next == RECORD_DISCONTINUITY) {
@@ -313,6 +338,7 @@ int main(void)
     check(WRAP_SEQUENCE, ESP_OK);
     check(ALLOC_FAIL, ESP_ERR_NO_MEM);
     check(ACQUIRE_FAIL, ESP_ERR_TIMEOUT);
+    check(MICROPHONE_BUSY, ESP_ERR_TIMEOUT);
     check(RECORD_TIMEOUT, ESP_ERR_TIMEOUT);
     check(RECORD_DEADLINE, ESP_ERR_TIMEOUT);
     check(RECORD_GAP, ESP_ERR_INVALID_STATE);

@@ -39,7 +39,7 @@ prefix = r'''
 typedef enum {
     RELEASE, LOW_LEVEL, PRE_RESERVATION_FRAME, WARMUP_RELEASE, SHORT_TAP, WARMUP_TAP, WRAP_SEQUENCE,
     MAXIMUM_WAIT_RELEASE, MAXIMUM_DEBOUNCE_TRIM, REACQUIRE_BUSY,
-    WAIT_BUTTON_ERROR, ALLOC_FAIL, ACQUIRE_FAIL, INITIAL_TIMEOUT,
+    WAIT_BUTTON_ERROR, ALLOC_FAIL, ACQUIRE_FAIL, MICROPHONE_BUSY, INITIAL_TIMEOUT,
     BUTTON_ERROR, PRESS_CHANGED, READ_ERROR, RECORD_GAP, RECORD_FLAG,
     PAUSE_FAIL, PAUSE_TIMEOUT, START_FAIL, WRITE_TIMEOUT, WRITE_PARTIAL,
     PLAYBACK_DEADLINE, SILENCE_FAIL, RESUME_FAIL,
@@ -51,7 +51,8 @@ static unsigned allocations, frees, acquisitions, releases, snapshots, reads, li
 static unsigned pauses, resumes, starts, writes, silences, drains, wait_ticks;
 static unsigned candidate_frames, selected_frames, warmup_timeouts;
 static unsigned short_logs, limit_logs, complete_logs, external_ring_tests;
-static bool locked, muted, amplifier, external_busy;
+static bool locked, microphone_owned, muted, amplifier, external_busy;
+static unsigned microphone_acquisitions, microphone_releases;
 static unsigned char *allocation;
 static int16_t *recorded;
 static int16_t expected[MAX_SAMPLES];
@@ -110,7 +111,7 @@ static void *heap_caps_aligned_alloc(size_t alignment, size_t bytes, unsigned ca
 
 static void heap_caps_free(void *memory)
 {
-    assert(memory == recorded && !locked && !frees++);
+    assert(memory == recorded && !locked && !microphone_owned && !frees++);
     const size_t bytes = MAX_SAMPLES * sizeof(int16_t) + MAX_FRAMES * sizeof(int64_t);
     for (unsigned i = 0; i < 16; ++i) {
         assert(allocation[i] == 0xa5);
@@ -142,6 +143,23 @@ static void digits_audio_speaker_release(void)
     locked = false;
 }
 
+bool digits_microphone_acquire(uint32_t timeout_ms)
+{
+    assert(locked && !microphone_owned && timeout_ms == 0);
+    ++microphone_acquisitions;
+    if (scenario == MICROPHONE_BUSY) return false;
+    microphone_owned = true;
+    return true;
+}
+
+void digits_microphone_release(void)
+{
+    assert(microphone_owned && !locked && !amplifier);
+    assert(resumes == pauses);
+    microphone_owned = false;
+    ++microphone_releases;
+}
+
 void digits_record_button_snapshot(digits_record_button_state_t *button)
 {
     assert(++snapshots < 1500);
@@ -169,7 +187,7 @@ static int16_t sample_value(uint32_t sequence, size_t index)
 
 esp_err_t digits_microphone_read(digits_microphone_frame_t *frame, uint32_t timeout_ms)
 {
-    assert(locked && !muted && !amplifier && timeout_ms == 100);
+    assert(locked && microphone_owned && !muted && !amplifier && timeout_ms == 100);
     assert(++reads < 550);
     if (scenario == INITIAL_TIMEOUT ||
         ((scenario == WARMUP_RELEASE || scenario == WARMUP_TAP) && warmup_timeouts < 4)) {
@@ -212,7 +230,7 @@ esp_err_t digits_microphone_read(digits_microphone_frame_t *frame, uint32_t time
 
 esp_err_t digits_microphone_pause(bool paused, uint32_t timeout_ms)
 {
-    assert(!amplifier && timeout_ms == 1000);
+    assert(microphone_owned && !amplifier && timeout_ms == 1000);
     if (paused) {
         assert(locked && !pauses++ && candidate_frames);
         muted = true;
@@ -340,7 +358,8 @@ static void reset(scenario_t next)
     pauses = resumes = starts = writes = silences = drains = wait_ticks = 0;
     candidate_frames = selected_frames = warmup_timeouts = 0;
     short_logs = limit_logs = complete_logs = external_ring_tests = 0;
-    locked = muted = amplifier = external_busy = false;
+    locked = microphone_owned = muted = amplifier = external_busy = false;
+    microphone_acquisitions = microphone_releases = 0;
     allocation = NULL;
     recorded = NULL;
     memset(expected, 0, sizeof(expected));
@@ -356,16 +375,22 @@ static void check(scenario_t next, esp_err_t expected_error)
 {
     reset(next);
     assert(run_button_recording(&press) == expected_error);
-    assert(!locked && !amplifier && !recorded && !allocation && allocations == 1);
+    assert(!locked && !microphone_owned && !amplifier && !recorded && !allocation && allocations == 1);
     if (next == ALLOC_FAIL) {
         assert(!frees && !acquisitions && !releases && !silences && !reads);
         return;
     }
     assert(frees == 1);
     if (next == ACQUIRE_FAIL) {
-        assert(acquisitions == 1 && external_busy && !releases && !silences && !reads);
+        assert(acquisitions == 1 && external_busy && !releases && !silences && !reads && !microphone_acquisitions);
         return;
     }
+    assert(microphone_acquisitions == 1);
+    if (next == MICROPHONE_BUSY) {
+        assert(acquisitions == 1 && releases == 1 && !silences && !reads && !pauses && !microphone_releases);
+        return;
+    }
+    assert(microphone_releases == 1);
     assert(releases == acquisitions - (next == REACQUIRE_BUSY ? 1U : 0U));
     assert(silences == releases);
     if (next == SHORT_TAP || next == WARMUP_TAP) {
@@ -422,6 +447,7 @@ int main(void)
     check(WAIT_BUTTON_ERROR, ESP_ERR_INVALID_STATE);
     check(ALLOC_FAIL, ESP_ERR_NO_MEM);
     check(ACQUIRE_FAIL, ESP_ERR_TIMEOUT);
+    check(MICROPHONE_BUSY, ESP_ERR_TIMEOUT);
     check(INITIAL_TIMEOUT, ESP_ERR_TIMEOUT);
     check(BUTTON_ERROR, ESP_ERR_INVALID_STATE);
     check(PRESS_CHANGED, ESP_ERR_INVALID_STATE);

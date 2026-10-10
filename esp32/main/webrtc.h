@@ -25,6 +25,8 @@ void digits_webrtc_transport(uint32_t session, bool online,
 // WebSocket calls run here. Returns false for messages handled elsewhere.
 bool digits_webrtc_receive(const cJSON *message, uint32_t session);
 
-// Development commands: call NUMBER, answer, hangup, status. Queue acceptance
+// Development commands: call NUMBER, answer, hangup, status, audio tx|rx|full.
+// Audio mode changes are allowed only while idle with completed cleanup.
+// Queue acceptance
 // is reported immediately; the owner task logs the actual result.
 esp_err_t digits_webrtc_command(const char *verb, const char *number);

@@ -1,7 +1,7 @@
 """Exercise the real Digits peer worker with finite host peer/RTOS mocks.
 
-This verifies adapter ordering, ownership and cleanup. It does not simulate
-ICE, DTLS, SRTP, packet loss, physical audio, or ESP32 scheduling/memory use.
+This verifies adapter ordering, media queue ownership and cleanup. It does not
+simulate ICE, DTLS, SRTP, packet loss, physical audio, or ESP32 scheduling use.
 Requires an ESP-IDF checkout and the installed esp_peer public headers.
 """
 
@@ -63,6 +63,21 @@ void host_log(const char *tag, const char *format, ...);
 #define ESP_LOGE(...) host_log(__VA_ARGS__)
 ''',
     "esp_timer.h": "#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n",
+    "esp_wifi.h": r'''
+#pragma once
+#include <stdint.h>
+#include "esp_err.h"
+typedef struct { int8_t rssi; } wifi_ap_record_t;
+typedef enum { WIFI_PS_NONE, WIFI_PS_MIN_MODEM, WIFI_PS_MAX_MODEM } wifi_ps_type_t;
+static inline esp_err_t esp_wifi_sta_get_ap_info(wifi_ap_record_t *info) {
+    info->rssi = -86;
+    return ESP_OK;
+}
+static inline esp_err_t esp_wifi_get_ps(wifi_ps_type_t *mode) {
+    *mode = WIFI_PS_MIN_MODEM;
+    return ESP_OK;
+}
+''',
     "freertos/FreeRTOS.h": r'''
 #pragma once
 #include <stdbool.h>
@@ -75,7 +90,9 @@ typedef int portMUX_TYPE;
 #define pdTRUE 1
 #define pdFALSE 0
 #define pdPASS 1
-#define pdMS_TO_TICKS(ms) ((TickType_t)(ms) / 10)
+#define configTICK_RATE_HZ 1000
+#define portTICK_PERIOD_MS 1
+#define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
 ''',
     "freertos/queue.h": r'''
 #pragma once
@@ -111,6 +128,7 @@ prefix = r'''
 #include <stdbool.h>
 #include "esp_peer_default.h"
 #include "webrtc.h"
+#include "call_audio.h"
 
 static int64_t host_now;
 static jmp_buf worker_boundary;
@@ -134,6 +152,23 @@ static unsigned open_calls, new_calls, close_calls, loop_calls, candidate_calls,
 static unsigned audio_calls, query_calls;
 static unsigned audio_pts[WIRE_LIMIT];
 static int64_t audio_times[WIRE_LIMIT];
+static unsigned last_worker_wait, largest_connected_wait;
+static unsigned media_start_calls, media_stop_calls, media_destroy_calls;
+static unsigned media_receive_calls, media_pop_calls, media_record_calls;
+static esp_err_t media_start_result;
+static digits_call_audio_state_t media_initial_state;
+static bool media_stop_completes;
+static int64_t main_loop_delay_us;
+struct digits_call_audio {
+    bool live;
+    digits_call_audio_mode_t mode;
+    digits_call_audio_stats_t stats;
+    call_audio_packet_t encoded[16];
+    unsigned encoded_count;
+    call_audio_packet_t last_popped;
+    call_audio_packet_t received;
+};
+static struct digits_call_audio media;
 static esp_peer_cfg_t peer_config;
 static bool peer_opened, peer_new, mock_remote_sdp, local_sdp_emitted;
 static bool emit_local_on_new, connect_next_loop, disconnect_during_loop;
@@ -248,7 +283,7 @@ int xTaskCreatePinnedToCore(void (*entry)(void *), const char *name,
                            TaskHandle_t *task, unsigned core)
 {
     assert(entry && name && stack >= 10240 && arg == NULL);
-    assert(priority == 3 && core == 1); // Ring Test/recording workers retain priority 4.
+    assert(priority == 6 && core == 1); // Network progress precedes priority-5 codec/capture work.
     if (task_create_failure) return pdFALSE;
     task_entry = entry;
     *task = (void *)1;
@@ -263,7 +298,12 @@ unsigned xTaskNotifyGive(TaskHandle_t task)
 
 unsigned ulTaskNotifyTake(bool clear, unsigned wait)
 {
-    assert(in_worker && clear && wait > 0);
+    assert(in_worker && clear);
+    last_worker_wait = wait;
+    if (rtc.call.phase == CALL_CONNECTED) {
+        assert(wait <= 1); // The peer owner must not add another 10 ms delay.
+        if (wait > largest_connected_wait) largest_connected_wait = wait;
+    }
     if (++worker_iterations == requested_iterations) longjmp(worker_boundary, 1);
     return 0;
 }
@@ -336,6 +376,7 @@ int esp_peer_open(esp_peer_cfg_t *config, const esp_peer_ops_t *ops,
     assert(config->video_dir == ESP_PEER_MEDIA_DIR_NONE && !config->enable_data_channel);
     assert(config->no_auto_reconnect && config->extra_cfg);
     const esp_peer_default_cfg_t *defaults = config->extra_cfg;
+    assert(defaults->agent_recv_timeout == 5); // Nonzero: zero selects the long default.
     assert(defaults->rtp_cfg.send_pool_size > 0 && defaults->rtp_cfg.send_pool_size <= 16384);
     assert(defaults->rtp_cfg.audio_recv_jitter.cache_size > 0 &&
            defaults->rtp_cfg.audio_recv_jitter.cache_size <= 16384);
@@ -393,6 +434,7 @@ int esp_peer_main_loop(esp_peer_handle_t peer)
     assert(in_worker && peer == (void *)0x1234 && peer_opened && peer_new);
     if (peer_config.role == ESP_PEER_ROLE_CONTROLLED) assert(mock_remote_sdp);
     ++loop_calls;
+    host_now += main_loop_delay_us;
     add_trace("peer:loop");
     if (disconnect_during_loop) {
         digits_webrtc_transport(peer_session, false, "1001", true);
@@ -411,11 +453,12 @@ int esp_peer_main_loop(esp_peer_handle_t peer)
 
 int esp_peer_send_audio(esp_peer_handle_t peer, esp_peer_audio_frame_t *frame)
 {
-    static const unsigned char expected[] = {0xf8, 0xff, 0xfe};
     assert(in_worker && peer == (void *)0x1234 && peer_opened);
     assert(rtc.call.phase == CALL_CONNECTED && mock_remote_sdp);
-    assert(frame && frame->size == (int)sizeof(expected));
-    assert(!memcmp(frame->data, expected, sizeof(expected)));
+    assert(media.live && (media.mode & DIGITS_CALL_AUDIO_TX));
+    assert(frame && frame->size == media.last_popped.size && frame->size == 5);
+    assert(!memcmp(frame->data, media.last_popped.data, (size_t)frame->size));
+    assert(frame->pts == media.last_popped.pts_ms);
     assert(audio_calls < WIRE_LIMIT);
     audio_pts[audio_calls] = frame->pts;
     audio_times[audio_calls++] = host_now;
@@ -439,6 +482,109 @@ int esp_peer_close(esp_peer_handle_t peer)
     peer_opened = false;
     peer_new = false;
     return ESP_PEER_ERR_NONE;
+}
+
+esp_err_t digits_call_audio_start(digits_call_audio_mode_t mode, digits_call_audio_t **out)
+{
+    assert(in_worker && out && !media.live);
+    assert(mode >= DIGITS_CALL_AUDIO_TX && mode <= DIGITS_CALL_AUDIO_FULL);
+    ++media_start_calls;
+    add_trace("media:start");
+    *out = NULL;
+    if (media_start_result) return media_start_result;
+    memset(&media, 0, sizeof(media));
+    media.live = true;
+    media.mode = mode;
+    media.stats.state = media_initial_state;
+    *out = &media;
+    return ESP_OK;
+}
+
+void digits_call_audio_get_stats(digits_call_audio_t *audio, digits_call_audio_stats_t *stats)
+{
+    assert(in_worker && audio == &media && media.live && stats);
+    *stats = media.stats;
+}
+
+bool digits_call_audio_pop_encoded(digits_call_audio_t *audio, call_audio_packet_t *packet)
+{
+    assert(in_worker && audio == &media && media.live && packet);
+    ++media_pop_calls;
+    if (!media.encoded_count) return false;
+    // Model the engine's published-frame contract, not the ADC/codec internals:
+    // one fresh latest encoded frame is available after a producer backlog.
+    *packet = media.encoded[media.encoded_count - 1];
+    media.stats.tx_pop_drops += media.encoded_count - 1;
+    media.encoded_count = 0;
+    if (host_now - packet->captured_at_us > 60000) {
+        ++media.stats.tx_pop_drops;
+        return false;
+    }
+    media.last_popped = *packet;
+    return true;
+}
+
+void digits_call_audio_record_send(digits_call_audio_t *audio, const call_audio_packet_t *packet,
+                                   bool success, bool blocked)
+{
+    assert(in_worker && audio == &media && media.live && packet);
+    assert(!(success && blocked));
+    ++media_record_calls;
+    if (success) ++media.stats.sent_frames;
+    else if (blocked) ++media.stats.send_blocked;
+    else ++media.stats.send_errors;
+}
+
+bool digits_call_audio_receive(digits_call_audio_t *audio, uint32_t pts_ms,
+                               const uint8_t *data, size_t size)
+{
+    assert(in_worker && audio == &media && media.live && data && size);
+    assert(rtc.call.phase == CALL_CONNECTED && size <= sizeof(media.received.data));
+    ++media_receive_calls;
+    media.received.pts_ms = pts_ms;
+    media.received.size = (uint16_t)size;
+    memcpy(media.received.data, data, size); // The real engine owns this copy boundary.
+    return true;
+}
+
+void digits_call_audio_request_stop(digits_call_audio_t *audio)
+{
+    assert(in_worker && audio == &media && media.live);
+    ++media_stop_calls;
+    add_trace("media:stop");
+    media.stats.state = media_stop_completes ? DIGITS_CALL_AUDIO_STOPPED : DIGITS_CALL_AUDIO_STOPPING;
+}
+
+bool digits_call_audio_is_stopped(digits_call_audio_t *audio)
+{
+    assert(in_worker && audio == &media && media.live);
+    return media.stats.state == DIGITS_CALL_AUDIO_STOPPED;
+}
+
+esp_err_t digits_call_audio_destroy(digits_call_audio_t *audio)
+{
+    assert(in_worker && audio == &media && media.live && media.stats.state == DIGITS_CALL_AUDIO_STOPPED);
+    assert(!peer_opened); // No peer callback may retain an audio-engine handle.
+    ++media_destroy_calls;
+    add_trace("media:destroy");
+    media.live = false;
+    return ESP_OK;
+}
+
+static void queue_microphone_packet(uint32_t pts_ms, int64_t captured_at_us)
+{
+    assert(!in_worker && media.live && (media.mode & DIGITS_CALL_AUDIO_TX));
+    assert(media.encoded_count < sizeof(media.encoded) / sizeof(media.encoded[0]));
+    call_audio_packet_t *packet = &media.encoded[media.encoded_count++];
+    memset(packet, 0, sizeof(*packet));
+    packet->pts_ms = pts_ms;
+    packet->captured_at_us = captured_at_us;
+    packet->size = 5;
+    packet->data[0] = 0x71;
+    packet->data[1] = 0x82;
+    packet->data[2] = (uint8_t)pts_ms;
+    packet->data[3] = (uint8_t)(pts_ms >> 8);
+    packet->data[4] = 0xa9; // Distinct encoded media; never the old canned silence.
 }
 
 static void pump(unsigned iterations)
@@ -504,6 +650,7 @@ static void command(const char *verb, const char *number)
 static void setup(void)
 {
     assert(!peer_opened);
+    assert(!media.live);
     assert(!live_queues);
     clear_wire();
     memset(&rtc, 0, sizeof(rtc));
@@ -511,6 +658,14 @@ static void setup(void)
     memset(&peer_config, 0, sizeof(peer_config));
     open_calls = new_calls = close_calls = loop_calls = candidate_calls = sdp_calls = 0;
     audio_calls = query_calls = logs = 0;
+    media_start_calls = media_stop_calls = media_destroy_calls = 0;
+    media_receive_calls = media_pop_calls = media_record_calls = 0;
+    media_start_result = ESP_OK;
+    media_initial_state = DIGITS_CALL_AUDIO_READY;
+    media_stop_completes = true;
+    main_loop_delay_us = 0;
+    last_worker_wait = largest_connected_wait = 0;
+    memset(&media, 0, sizeof(media));
     open_result = new_result = loop_result = sdp_result = candidate_result = audio_result = 0;
     transmit_result = ESP_OK;
     allocation_fail_after = -1;
@@ -542,6 +697,7 @@ static void finish(void)
     digits_webrtc_transport(peer_session, false, "1001", true);
     pump(1);
     assert(!peer_opened && rtc.call.phase == CALL_IDLE && rtc.call.peer == NULL);
+    assert(!media.live && !rtc.stopping_audio);
     assert(!rtc.call.offer && !rtc.call.candidate_count);
     assert(!rtc.call.remote_sdp_text && !rtc.call.server_count);
     assert(rtc.ice_count == 0 && rtc.queue->count == 0);
@@ -567,15 +723,18 @@ static void start_outgoing(void)
     assert(!strcmp(json_text(offer, "sdp"), local_sdp_text));
     cJSON_Delete(offer);
     assert(audio_calls == 0 && close_calls == 0);
+    assert(media_start_calls == 0); // Signaling and SDP alone cannot open physical media.
 }
 
 static void apply_answer(void)
 {
+    unsigned before_audio = audio_calls, before_start = media_start_calls;
     receive("answer", "1002", "sdp", local_sdp_text, NULL);
     pump(1);
     assert(rtc.call.phase == CALL_CONNECTING && rtc.call.remote_sdp);
     assert(!strcmp(remote_sdp, local_sdp_text));
-    assert(audio_calls == 0); // An SDP answer is not ICE/DTLS/SRTP success.
+    assert(audio_calls == before_audio); // An SDP answer is not ICE/DTLS/SRTP success.
+    assert(media_start_calls == before_start);
 }
 
 static void connect_peer(void)
@@ -583,6 +742,13 @@ static void connect_peer(void)
     connect_next_loop = true;
     pump(1);
     assert(rtc.call.phase == CALL_CONNECTED && rtc.call.deadline_us == 0);
+    assert(media_start_calls == 1 && media.live && rtc.call.audio == &media);
+    assert(audio_calls == 0); // START is asynchronous; no manufactured silence is sent.
+    if (media.mode & DIGITS_CALL_AUDIO_TX) {
+        queue_microphone_packet(0, host_now);
+        pump(1);
+    }
+    if (!(media.mode & DIGITS_CALL_AUDIO_TX)) return;
     assert(audio_calls == 1 && audio_pts[0] == 0);
 }
 
@@ -628,18 +794,27 @@ static void test_outgoing_and_media(void)
     pump(1);
     assert(audio_calls == 1);
     ++host_now;
+    queue_microphone_packet(20, host_now);
     pump(1);
     assert(audio_calls == 2 && audio_pts[1] == 20);
     host_now += 100000;
+    queue_microphone_packet(40, host_now - 80000);
+    queue_microphone_packet(60, host_now - 60000);
+    queue_microphone_packet(80, host_now - 40000);
+    queue_microphone_packet(100, host_now - 20000);
+    queue_microphone_packet(120, host_now);
     pump(1);
     assert(audio_calls == 3 && audio_pts[2] == 120 && rtc.call.skipped_audio == 4);
     pump(5);
     assert(audio_calls == 3); // Never catch up by flooding late RTP frames.
     audio_result = ESP_PEER_ERR_WOULD_BLOCK;
     host_now += 20000;
+    queue_microphone_packet(140, host_now);
     pump(1);
     assert(rtc.call.phase == CALL_CONNECTED && rtc.call.blocked_audio == 1);
     assert(rtc.call.tx_packets == 3);
+    assert(media.stats.sent_frames == 3 && media.stats.send_blocked == 1);
+    assert(media_record_calls == 4 && media.stats.tx_pop_drops == 4);
     unsigned before_rx = rtc.call.rx_packets;
     unsigned char payload[] = {0xf8, 0xff, 0xfe};
     esp_peer_audio_frame_t frame = {.data = payload, .size = 3, .pts = 20};
@@ -648,6 +823,9 @@ static void test_outgoing_and_media(void)
     in_worker = false;
     memset(payload, 0, sizeof(payload));
     assert(rtc.call.rx_packets == before_rx + 1 && rtc.call.rx_bytes == 3);
+    assert(media_receive_calls == 1 && media.received.pts_ms == 20 && media.received.size == 3);
+    static const unsigned char expected_received[] = {0xf8, 0xff, 0xfe};
+    assert(!memcmp(media.received.data, expected_received, sizeof(expected_received)));
     command("status", NULL);
     pump(1);
     assert(query_calls == 1);
@@ -915,6 +1093,8 @@ static void test_library_and_transmit_failures(void)
             apply_answer();
             audio_result = ESP_PEER_ERR_FAIL;
             connect_next_loop = true;
+            pump(1);
+            queue_microphone_packet(0, host_now);
             pump(2);
         }
         assert(!peer_opened && rtc.call.phase == CALL_IDLE);
@@ -1160,6 +1340,182 @@ static void test_disconnect_or_transmit_failure_in_local_sdp(void)
     }
 }
 
+static void test_audio_startup_and_published_frames(void)
+{
+    setup();
+    start_outgoing();
+    apply_answer();
+    media_initial_state = DIGITS_CALL_AUDIO_STARTING;
+    connect_next_loop = true;
+    pump(1);
+    assert(rtc.call.phase == CALL_CONNECTED && media_start_calls == 1 && audio_calls == 0);
+    queue_microphone_packet(1000, host_now);
+    pump(5);
+    assert(audio_calls == 0 && media_pop_calls == 0); // No sends during hardware/codec startup.
+    media.stats.state = DIGITS_CALL_AUDIO_READY;
+    pump(1);
+    assert(audio_calls == 1 && audio_pts[0] == 1000); // Preserve producer time, including nonzero origin.
+    host_now += 100000;
+    queue_microphone_packet(1020, host_now - 61000);
+    pump(1);
+    assert(audio_calls == 1 && media.stats.tx_pop_drops == 1); // Engine withheld stale media.
+    queue_microphone_packet(1100, host_now);
+    pump(8);
+    assert(audio_calls == 2 && audio_pts[1] == 1100 && rtc.call.skipped_audio == 4);
+    assert(media_record_calls == 2); // Empty/stale publication never becomes synthetic RTP.
+    finish();
+    ++cases;
+}
+
+static void test_audio_start_and_worker_failures(void)
+{
+    for (unsigned failure = 0; failure < 2; ++failure) {
+        setup();
+        start_outgoing();
+        apply_answer();
+        if (failure == 0) media_start_result = ESP_ERR_NO_MEM;
+        else media_initial_state = DIGITS_CALL_AUDIO_STARTING;
+        connect_next_loop = true;
+        pump(1);
+        assert(media_start_calls == 1 && audio_calls == 0);
+        if (failure == 1) {
+            assert(media.live && rtc.call.phase == CALL_CONNECTED);
+            media.stats.state = DIGITS_CALL_AUDIO_FAILED;
+            media.stats.error = ESP_FAIL;
+        }
+        pump(3);
+        assert(rtc.call.phase == CALL_IDLE && !peer_opened && !media.live);
+        assert(close_calls == 1 && wires_of_type("hangup") == 1);
+        cJSON *hangup = wire_message(wire_count - 1, "hangup");
+        assert(json_text(hangup, "reason") == NULL); // Physical media failure follows a connected transport.
+        cJSON_Delete(hangup);
+        media_start_result = ESP_OK;
+        media_initial_state = DIGITS_CALL_AUDIO_READY;
+        command("call", "1002");
+        pump(1);
+        assert(open_calls == 2 && peer_opened && rtc.call.phase == CALL_CALLING);
+        finish();
+        ++cases;
+    }
+}
+
+static void test_audio_modes_and_offline_control(void)
+{
+    static const char *names[] = {"tx", "rx", "full"};
+    static const digits_call_audio_mode_t modes[] = {
+        DIGITS_CALL_AUDIO_TX, DIGITS_CALL_AUDIO_RX, DIGITS_CALL_AUDIO_FULL,
+    };
+    for (unsigned i = 0; i < 3; ++i) {
+        setup();
+        assert(rtc.audio_mode == DIGITS_CALL_AUDIO_FULL);
+        assert(digits_webrtc_command("audio", NULL) == ESP_ERR_INVALID_ARG);
+        assert(digits_webrtc_command("audio", "invalid") == ESP_ERR_INVALID_ARG);
+        command("audio", names[i]);
+        assert(rtc.audio_mode == DIGITS_CALL_AUDIO_FULL); // Command dispatch is queued.
+        pump(1);
+        assert(rtc.audio_mode == modes[i] && media_start_calls == 0);
+        start_outgoing();
+        command("audio", names[(i + 1) % 3]);
+        pump(1);
+        assert(rtc.audio_mode == modes[i]); // A live call's codec/ownership mode is immutable.
+        apply_answer();
+        connect_peer();
+        assert(media.mode == modes[i]);
+        uint8_t encoded[] = {0xf8, 0xff, 0xfe};
+        esp_peer_audio_frame_t packet = {.pts = 9180, .data = encoded, .size = 3};
+        in_worker = true;
+        assert(on_audio_data(&packet, NULL) == ESP_PEER_ERR_NONE);
+        in_worker = false;
+        assert(media_receive_calls == ((modes[i] & DIGITS_CALL_AUDIO_RX) ? 1U : 0U));
+        assert(audio_calls == ((modes[i] & DIGITS_CALL_AUDIO_TX) ? 1U : 0U));
+        command("audio", names[(i + 1) % 3]);
+        pump(1);
+        assert(rtc.audio_mode == modes[i] && media.mode == modes[i]);
+        digits_webrtc_transport(peer_session, false, "1001", true);
+        pump(2);
+        assert(!peer_opened && !media.live && !rtc.stopping_audio);
+        command("audio", names[(i + 1) % 3]);
+        pump(1);
+        assert(rtc.audio_mode == modes[(i + 1) % 3]); // Development mode selection works offline.
+        finish();
+        ++cases;
+    }
+}
+
+static void test_async_audio_stop_and_repeated_calls(void)
+{
+    setup();
+    start_outgoing();
+    apply_answer();
+    connect_peer();
+    media_stop_completes = false;
+    command("hangup", NULL);
+    pump(1);
+    assert(!peer_opened && rtc.call.phase == CALL_IDLE && rtc.stopping_audio == &media);
+    assert(media.live && media.stats.state == DIGITS_CALL_AUDIO_STOPPING);
+    assert(media_stop_calls == 1 && media_destroy_calls == 0);
+    assert(trace_index("media:stop", 0) < trace_index("peer:close", 0));
+    command("call", "1002");
+    command("audio", "tx");
+    pump(2);
+    assert(open_calls == 1 && rtc.call.phase == CALL_IDLE && !peer_opened);
+    assert(rtc.audio_mode == DIGITS_CALL_AUDIO_FULL && media_destroy_calls == 0);
+    receive("ring", "1002", NULL, NULL, NULL);
+    pump(1);
+    assert(open_calls == 1 && rtc.call.phase == CALL_IDLE && media_start_calls == 1);
+    uint8_t encoded[] = {0xf8, 0xff, 0xfe};
+    esp_peer_audio_frame_t packet = {.pts = 20, .data = encoded, .size = 3};
+    in_worker = true;
+    assert(on_audio_data(&packet, NULL) == ESP_PEER_ERR_NONE);
+    in_worker = false;
+    assert(media_receive_calls == 0); // No stale callback may write into the retiring engine.
+    media.stats.state = DIGITS_CALL_AUDIO_STOPPED;
+    pump(1);
+    assert(!media.live && !rtc.stopping_audio && media_destroy_calls == 1);
+    assert(trace_index("peer:close", 0) < trace_index("media:destroy", 0));
+    command("call", "1002");
+    pump(1);
+    assert(open_calls == 2 && peer_opened && rtc.call.phase == CALL_CALLING);
+    assert(trace_index("media:destroy", 0) < trace_index("peer:open", trace_index("peer:open", 0) + 1));
+    apply_answer();
+    connect_next_loop = true;
+    pump(1);
+    assert(media_start_calls == 2 && media.live);
+    queue_microphone_packet(0, host_now);
+    pump(1);
+    assert(audio_calls == 2 && audio_pts[1] == 0); // New call owns a new timing origin.
+    media_stop_completes = true;
+    finish();
+    assert(media_stop_calls == 2 && media_destroy_calls == 2);
+    ++cases;
+}
+
+static void test_peer_loop_timing_diagnostics(void)
+{
+    setup();
+    start_outgoing();
+    apply_answer();
+    main_loop_delay_us = 50000;
+    connect_next_loop = true;
+    pump(1);
+    assert(rtc.call.phase == CALL_CONNECTED && rtc.call.max_peer_loop_us == 0);
+    assert(rtc.call.slow_peer_loops == 0); // DTLS/transition duration is excluded from connected scheduling.
+    main_loop_delay_us = 6000;
+    pump(1);
+    assert(rtc.call.max_peer_loop_us == 6000 && rtc.call.slow_peer_loops == 0);
+    main_loop_delay_us = 20001;
+    pump(1);
+    assert(rtc.call.max_peer_loop_us == 20001 && rtc.call.slow_peer_loops == 1);
+    assert(largest_connected_wait == 1 && last_worker_wait == 1);
+    main_loop_delay_us = 1000;
+    pump(3);
+    assert(rtc.call.max_peer_loop_us == 20001 && rtc.call.slow_peer_loops == 1);
+    assert(audio_calls == 0); // Delays do not turn an empty encoder queue into invented media.
+    main_loop_delay_us = 0;
+    finish();
+    ++cases;
+}
+
 int main(void)
 {
     test_initialization_failures();
@@ -1182,6 +1538,11 @@ int main(void)
     test_codec_callbacks_and_duplicate_connected();
     test_stale_callbacks_after_close();
     test_disconnect_or_transmit_failure_in_local_sdp();
+    test_audio_startup_and_published_frames();
+    test_audio_start_and_worker_failures();
+    test_audio_modes_and_offline_control();
+    test_async_audio_stop_and_repeated_calls();
+    test_peer_loop_timing_diagnostics();
     printf("WebRTC adapter: %u real-worker lifecycle cases passed (mock peer; physical interoperability unverified)\n", cases);
     return 0;
 }

@@ -17,8 +17,8 @@ import (
 const upstreamRevision = "a4edaaa557c06b3b687be9e92a869fb0cbcf68fc"
 
 type options struct {
-	server, audio, traceDir string
-	hostOnly                bool
+	server, audio, audioFile, traceDir, recordDir string
+	hostOnly                                      bool
 }
 
 func validateServer(raw string) error {
@@ -48,9 +48,11 @@ func execute() error {
 	number := flag.String("number", "", "import paired number into a new state file")
 	// Keep the bearer token out of flag defaults: --help prints defaults.
 	token := flag.String("device-token", "", "import original device token (also DIGITS_DEVICE_TOKEN)")
-	audio := flag.String("audio", "tone", "generated audio: tone or silence")
+	audio := flag.String("audio", "tone", "audio source: tone, silence or wav (repeated per call)")
+	audioFile := flag.String("audio-file", "", "48 kHz mono PCM16 WAV input for --audio wav")
 	hostOnly := flag.Bool("host-only", false, "ignore server STUN/TURN settings for a same-LAN host-candidate test")
 	traceDir := flag.String("trace-dir", "", "optional private directory for per-call SDP and ICE traces")
+	recordDir := flag.String("record-dir", "", "optional private directory for per-call decoded receive WAV files")
 	flag.Parse()
 	if *token == "" {
 		*token = os.Getenv("DIGITS_DEVICE_TOKEN")
@@ -61,8 +63,12 @@ func execute() error {
 	if err := validateServer(*server); err != nil {
 		return err
 	}
-	if *audio != "tone" && *audio != "silence" {
-		return fmt.Errorf("audio must be tone or silence")
+	source, err := newPCMSource(*audio, *audioFile)
+	if err != nil {
+		return err
+	}
+	if err := source.Close(); err != nil {
+		return err
 	}
 	// Preserve user-selected Pion verbosity; make upstream ICE/DTLS warnings
 	// visible by default so a generic failed state is not the only evidence.
@@ -75,6 +81,9 @@ func execute() error {
 	if err := prepareTraceDir(*traceDir); err != nil {
 		return err
 	}
+	if err := prepareRecordingDir(*recordDir); err != nil {
+		return err
+	}
 	store, err := openState(*statePath, *hardware, *number, *token)
 	if err != nil {
 		return err
@@ -82,13 +91,14 @@ func execute() error {
 	defer store.Close()
 	slog.Info("Headless Digits/Pion client", "upstream", upstreamRevision, "pion", "4.2.20",
 		"hardware_id", store.State.HardwareID, "number", store.State.Number, "state", *statePath,
-		"audio", *audio, "host_only", *hostOnly)
+		"audio", *audio, "audio_file", *audioFile, "record_dir", *recordDir, "host_only", *hostOnly)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	commands := make(chan string, 16)
 	go readCommands(ctx, commands)
 	printHelp()
-	return newApplication(store, options{server: *server, audio: *audio, hostOnly: *hostOnly, traceDir: *traceDir}).run(ctx, commands)
+	return newApplication(store, options{server: *server, audio: *audio, audioFile: *audioFile,
+		hostOnly: *hostOnly, traceDir: *traceDir, recordDir: *recordDir}).run(ctx, commands)
 }
 
 func printHelp() {

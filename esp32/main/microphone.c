@@ -43,6 +43,7 @@ static struct {
     QueueHandle_t reports;
     TaskHandle_t report_task;
     SemaphoreHandle_t control_lock;
+    SemaphoreHandle_t consumer_lock;
     int16_t stereo[DIGITS_MIC_FRAME_SAMPLES * 2];
     digits_microphone_frame_t frame;
     microphone_pcm_stats_t levels;
@@ -279,6 +280,7 @@ static void release_microphone(void)
     if (mic.frames) vQueueDelete(mic.frames);
     if (mic.reports) vQueueDelete(mic.reports);
     if (mic.control_lock) vSemaphoreDelete(mic.control_lock);
+    if (mic.consumer_lock) vSemaphoreDelete(mic.consumer_lock);
     portENTER_CRITICAL(&mic_mux);
     memset(&mic, 0, sizeof(mic));
     portEXIT_CRITICAL(&mic_mux);
@@ -330,7 +332,11 @@ esp_err_t digits_microphone_init(void)
     mic.frames = xQueueCreate(FRAME_QUEUE_LENGTH, sizeof(digits_microphone_frame_t));
     mic.reports = xQueueCreate(1, sizeof(microphone_report_t));
     mic.control_lock = xSemaphoreCreateMutex();
-    if (!mic.frames || !mic.reports || !mic.control_lock) { err = ESP_ERR_NO_MEM; goto fail; }
+    mic.consumer_lock = xSemaphoreCreateMutex();
+    if (!mic.frames || !mic.reports || !mic.control_lock || !mic.consumer_lock) {
+        err = ESP_ERR_NO_MEM;
+        goto fail;
+    }
     if (xTaskCreate(report_worker, "digits_mic_log", 4096, NULL, 3, &mic.report_task) != pdPASS) {
         err = ESP_ERR_NO_MEM;
         goto fail;
@@ -355,6 +361,19 @@ esp_err_t digits_microphone_init(void)
 fail:
     release_microphone();
     return err;
+}
+
+bool digits_microphone_acquire(uint32_t timeout_ms)
+{
+    if (!mic.consumer_lock || timeout_ms > 1000) return false;
+    TickType_t ticks = pdMS_TO_TICKS(timeout_ms);
+    if (timeout_ms && !ticks) ticks = 1;
+    return xSemaphoreTake(mic.consumer_lock, ticks) == pdTRUE;
+}
+
+void digits_microphone_release(void)
+{
+    xSemaphoreGive(mic.consumer_lock);
 }
 
 esp_err_t digits_microphone_read(digits_microphone_frame_t *frame, uint32_t timeout_ms)

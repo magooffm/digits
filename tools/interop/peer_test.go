@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,7 +16,7 @@ import (
 // This test uses real Pion ICE/DTLS/SRTP and the original Digits libopus codec.
 // It validates two host peers, never an ESP32 or physical interoperability.
 func TestCallPeerLocalBidirectional(t *testing.T) {
-	for _, callerAudio := range []string{"silence", "tone"} {
+	for _, callerAudio := range []string{"silence", "tone", "wav"} {
 		t.Run("caller-"+callerAudio, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 			defer cancel()
@@ -33,7 +36,15 @@ func TestCallPeerLocalBidirectional(t *testing.T) {
 					}
 				}
 			}
-			caller, err := newCallPeer(ctx, nil, callerAudio, callback(0))
+			callerOptions := options{audio: callerAudio, recordDir: filepath.Join(t.TempDir(), "recordings")}
+			if callerAudio == "wav" {
+				pcm := make([]int16, 1937) // Loop boundary is deliberately not aligned to 20 ms.
+				for i := range pcm {
+					pcm[i] = int16(2048 * math.Sin(2*math.Pi*440*float64(i)/48000))
+				}
+				callerOptions.audioFile = writeTestWAV(t, pcm)
+			}
+			caller, err := newCallPeerWithMedia(ctx, nil, callerOptions, callback(0))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -41,7 +52,7 @@ func TestCallPeerLocalBidirectional(t *testing.T) {
 			if callerAudio == "tone" {
 				calleeAudio = "silence"
 			}
-			callee, err := newCallPeer(ctx, nil, calleeAudio, callback(1))
+			callee, err := newCallPeerWithMedia(ctx, nil, options{audio: calleeAudio, recordDir: filepath.Join(t.TempDir(), "recordings")}, callback(1))
 			if err != nil {
 				caller.Close()
 				t.Fatal(err)
@@ -117,6 +128,12 @@ func TestCallPeerLocalBidirectional(t *testing.T) {
 						if snapshot.EncodeErrors != 0 || snapshot.DecodeErrors != 0 || snapshot.WriteErrors != 0 || snapshot.TXFrames < 12 || candidates[i] == 0 {
 							t.Fatalf("peer %d media errors or missing transmit/candidates: %+v", i, snapshot)
 						}
+						if _, err := time.Parse(time.RFC3339Nano, snapshot.SourceFirstSentAt); err != nil {
+							t.Fatalf("missing source origin: %+v", snapshot)
+						}
+						if _, err := time.Parse(time.RFC3339Nano, snapshot.RecordingFirstDecodedAt); err != nil {
+							t.Fatalf("missing decode origin: %+v", snapshot)
+						}
 					}
 					if overflow.Load() {
 						t.Fatal("peer callbacks overflowed bounded host event queue")
@@ -136,6 +153,16 @@ func TestCallPeerLocalBidirectional(t *testing.T) {
 					case <-closed:
 					case <-time.After(2 * time.Second):
 						t.Fatal("host peer media workers did not close within 2s")
+					}
+					for _, peer := range peers {
+						s := peer.Snapshot()
+						if !s.RecordingFinalized || s.RecordingErrors != 0 || s.RecordingDroppedSamples != 0 || s.RecordedSamples != s.DecodedSamples {
+							t.Fatalf("peer capture lifecycle failed: %+v", s)
+						}
+						data, err := os.ReadFile(s.ReceiveWAV)
+						if err != nil || len(data) != 44+int(s.RecordedSamples)*2 {
+							t.Fatalf("peer capture missing decoded PCM: bytes=%d err=%v", len(data), err)
+						}
 					}
 					return
 				}

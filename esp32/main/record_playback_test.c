@@ -26,6 +26,12 @@ static esp_err_t run_record_playback(void)
         heap_caps_free(recording);
         return ESP_ERR_TIMEOUT;
     }
+    if (!digits_microphone_acquire(0)) {
+        ESP_LOGW("record_test", "Microphone busy with a call; recording test skipped");
+        digits_audio_speaker_release();
+        heap_caps_free(recording);
+        return ESP_ERR_TIMEOUT;
+    }
     bool pause_requested = false;
     esp_err_t err = ESP_OK;
     digits_microphone_frame_t frame;
@@ -99,6 +105,7 @@ finish:
         }
     }
     digits_audio_speaker_release();
+    digits_microphone_release();
     heap_caps_free(recording);
     if (err == ESP_OK) ESP_LOGI("record_test", "Playback finished; amplifier disabled, microphone capture resumed");
     else ESP_LOGE("record_test", "Test stopped: %s (recorded %u samples)", esp_err_to_name(err), (unsigned)samples);

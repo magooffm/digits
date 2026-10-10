@@ -10,6 +10,8 @@
 #include "esp_log.h"
 #include "esp_peer_default.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
+#include "call_audio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -20,6 +22,7 @@
 #define ICE_URL_CAPACITY 256
 #define MAX_PENDING_CANDIDATES 32
 #define WORKER_STACK_BYTES (20 * 1024)
+#define WORKER_PRIORITY 6
 #define RING_TIMEOUT_US (60LL * 1000000)
 #define CONNECT_TIMEOUT_US (10LL * 1000000) // Pi connectTimeout, v1.99.0.
 #define AUDIO_FRAME_US 20000
@@ -29,7 +32,7 @@ static const char *TAG = "webrtc";
 typedef enum {
     EVENT_RING, EVENT_SDP, EVENT_ANSWER, EVENT_ICE, EVENT_HANGUP,
     EVENT_BUSY, EVENT_ERROR, EVENT_ICE_SERVERS, EVENT_ICE_RESTART,
-    COMMAND_CALL, COMMAND_ANSWER, COMMAND_HANGUP, COMMAND_STATUS,
+    COMMAND_CALL, COMMAND_ANSWER, COMMAND_HANGUP, COMMAND_STATUS, COMMAND_AUDIO,
 } event_kind_t;
 
 typedef struct {
@@ -65,6 +68,9 @@ static struct {
     char *ice_urls[MAX_ICE_SERVERS];
     unsigned ice_count;
     bool ice_received;
+    digits_call_audio_mode_t audio_mode;
+    digits_call_audio_t *stopping_audio;
+    call_audio_packet_t send_packet;
     struct {
         esp_peer_handle_t peer;
         call_phase_t phase;
@@ -94,6 +100,11 @@ static struct {
         uint32_t skipped_audio;
         uint32_t blocked_audio;
         bool audio_info;
+        digits_call_audio_t *audio;
+        bool sent_audio;
+        uint32_t last_audio_pts;
+        uint32_t max_peer_loop_us;
+        uint32_t slow_peer_loops;
     } call;
 } rtc;
 
@@ -110,6 +121,46 @@ static const char *phase_name(call_phase_t phase)
     case CALL_CONNECTED: return "connected";
     }
     return "unknown";
+}
+
+static const char *audio_mode_name(digits_call_audio_mode_t mode)
+{
+    return mode == DIGITS_CALL_AUDIO_TX ? "tx" : mode == DIGITS_CALL_AUDIO_RX ? "rx" : "full";
+}
+
+static void report_resources(const char *where);
+
+static void report_call_audio(digits_call_audio_t *audio)
+{
+    if (!audio) return;
+    digits_call_audio_stats_t s;
+    digits_call_audio_get_stats(audio, &s);
+    ESP_LOGI(TAG, "Call audio state=%u error=%s capture=%" PRIu32 " gaps=%" PRIu32 " discontinuities=%" PRIu32 " stale=%" PRIu32 " timeouts=%" PRIu32 " encoded=%" PRIu32 " encode_errors=%" PRIu32,
+             (unsigned)s.state, esp_err_to_name(s.error), s.capture_frames, s.capture_gaps,
+             s.capture_discontinuities, s.capture_stale, s.capture_timeouts, s.encoded_frames, s.encode_errors);
+    ESP_LOGI(TAG, "Audio TX sent=%" PRIu32 " queue_drops=%" PRIu32 " pop_drops=%" PRIu32 " blocked=%" PRIu32 " errors=%" PRIu32 " max_encode_us=%" PRIu32 " max_capture_age_us=%" PRIu32 " max_send_age_us=%" PRIu32 " stack_min=%" PRIu32,
+             s.sent_frames, s.tx_queue_drops, s.tx_pop_drops, s.send_blocked, s.send_errors,
+             s.max_encode_us, s.max_capture_age_us, s.max_send_age_us, s.tx_stack_min_bytes);
+    ESP_LOGI(TAG, "Audio RX received=%" PRIu32 " queue_drops=%" PRIu32 " queue_stale=%" PRIu32 " jitter_overruns=%" PRIu32 " late=%" PRIu32 " duplicate=%" PRIu32 " missing_pts=%" PRIu32 " rebases=%" PRIu32 " local_skips=%" PRIu32,
+             s.received_frames, s.rx_queue_drops, s.rx_queue_stale, s.rx_jitter_overruns,
+             s.rx_late, s.rx_duplicate, s.rx_missing,
+             s.rx_discontinuities, s.rx_local_skips);
+    ESP_LOGI(TAG, "Audio playback decoded=%" PRIu32 " decode_errors=%" PRIu32 " plc=%" PRIu32 " silence=%" PRIu32 " played=%" PRIu32 " write_errors=%" PRIu32 " producer_gaps=%" PRIu32 " max_decode_us=%" PRIu32 " max_receive_age_us=%" PRIu32 " max_write_us=%" PRIu32 " stack_min=%" PRIu32,
+             s.decoded_frames, s.decode_errors, s.plc_frames, s.silence_frames, s.played_frames,
+             s.playback_errors, s.playback_feed_gaps, s.max_decode_us, s.max_receive_age_us,
+             s.max_write_us, s.rx_stack_min_bytes);
+}
+
+static void reap_audio(void)
+{
+    if (rtc.stopping_audio && digits_call_audio_is_stopped(rtc.stopping_audio)) {
+        report_call_audio(rtc.stopping_audio);
+        if (digits_call_audio_destroy(rtc.stopping_audio) == ESP_OK) {
+            rtc.stopping_audio = NULL;
+            ESP_LOGI(TAG, "Call audio workers released; microphone and speaker available");
+            report_resources("Audio released");
+        }
+    }
 }
 
 static const char *peer_state_name(esp_peer_state_t state)
@@ -269,6 +320,11 @@ static void report_resources(const char *where)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    wifi_ap_record_t access_point;
+    wifi_ps_type_t power_save;
+    if (esp_wifi_sta_get_ap_info(&access_point) == ESP_OK &&
+        esp_wifi_get_ps(&power_save) == ESP_OK)
+        ESP_LOGI(TAG, "Wi-Fi RSSI=%d dBm power_save=%u", access_point.rssi, (unsigned)power_save);
 }
 
 static void end_call(bool notify, const char *reason)
@@ -280,6 +336,11 @@ static void end_call(bool notify, const char *reason)
         send_wire("hangup", rtc.call.remote, NULL, NULL,
                   reason && strcmp(reason, "connect_timeout") == 0 ? reason : NULL);
     rtc.call.closing = true; // Close callbacks must never recursively close.
+    if (rtc.call.audio) {
+        digits_call_audio_request_stop(rtc.call.audio);
+        rtc.stopping_audio = rtc.call.audio;
+        rtc.call.audio = NULL;
+    }
     if (rtc.call.peer) {
         int ret = esp_peer_close(rtc.call.peer);
         if (ret != ESP_PEER_ERR_NONE) ESP_LOGW(TAG, "esp_peer_close failed: %d", ret);
@@ -408,9 +469,11 @@ static int on_audio_data(esp_peer_audio_frame_t *frame, void *context)
     ++rtc.call.rx_packets;
     rtc.call.rx_bytes += frame->size;
     if (rtc.call.rx_packets == 1)
-        ESP_LOGI(TAG, "First remote encoded audio packet received after SRTP processing (%d bytes); playback/decoding is not enabled",
+        ESP_LOGI(TAG, "First remote encoded audio packet received after SRTP processing (%d bytes)",
                  frame->size);
     // Encoded frames are owned by esp_peer and valid only during this callback.
+    if (rtc.call.audio && (rtc.audio_mode & DIGITS_CALL_AUDIO_RX))
+        digits_call_audio_receive(rtc.call.audio, frame->pts, frame->data, frame->size);
     return 0;
 }
 
@@ -425,7 +488,7 @@ static esp_err_t create_peer(bool caller)
         rtc.call.servers[i].stun_url = rtc.call.server_urls[i];
     }
     rtc.call.defaults = (esp_peer_default_cfg_t){
-        .agent_recv_timeout = 100,
+        .agent_recv_timeout = 5,
         .keep_role = true,
         .max_candidates = 8,
         .rtp_cfg = {
@@ -569,7 +632,21 @@ static void process_event(event_t *event)
                  rtc.owner_transport.paired ? "yes" : "no", phase_name(rtc.call.phase),
                  rtc.call.audio_info ? "received" : "pending", rtc.call.tx_packets, rtc.call.rx_packets);
         report_resources("Status");
+        ESP_LOGI(TAG, "Audio mode=%s cleanup_pending=%s peer_loop_max_us=%" PRIu32 " peer_loops_over_20ms=%" PRIu32,
+                 audio_mode_name(rtc.audio_mode), rtc.stopping_audio ? "yes" : "no",
+                 rtc.call.max_peer_loop_us, rtc.call.slow_peer_loops);
+        report_call_audio(rtc.call.audio ? rtc.call.audio : rtc.stopping_audio);
         if (rtc.call.peer) esp_peer_query(rtc.call.peer);
+        return;
+    }
+    if (event->kind == COMMAND_AUDIO) {
+        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio) {
+            ESP_LOGW(TAG, "Audio mode change requires idle with completed cleanup");
+            return;
+        }
+        rtc.audio_mode = !strcmp(event->from, "tx") ? DIGITS_CALL_AUDIO_TX :
+                         !strcmp(event->from, "rx") ? DIGITS_CALL_AUDIO_RX : DIGITS_CALL_AUDIO_FULL;
+        ESP_LOGI(TAG, "Next call audio mode=%s", audio_mode_name(rtc.audio_mode));
         return;
     }
     if (!current_transport()) return;
@@ -594,7 +671,7 @@ static void process_event(event_t *event)
         return;
     }
     if (event->kind == COMMAND_CALL) {
-        if (rtc.call.phase != CALL_IDLE || strcmp(event->from, rtc.owner_transport.number) == 0) {
+        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio || strcmp(event->from, rtc.owner_transport.number) == 0) {
             ESP_LOGW(TAG, "Call requires an idle device and a different destination");
             return;
         }
@@ -612,7 +689,7 @@ static void process_event(event_t *event)
     if (event->kind == COMMAND_HANGUP) { end_call(true, "local hangup"); return; }
     if (event->kind == EVENT_RING) {
         if (!event->from[0]) return;
-        if (rtc.call.phase != CALL_IDLE) {
+        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio) {
             // Upstream ordinary hangup ends every call for this line; To does
             // not scope it. Never reject a foreign ring by hanging up this call.
             if (strcmp(event->from, rtc.call.remote) != 0)
@@ -671,26 +748,47 @@ static void process_event(event_t *event)
     }
 }
 
-static void send_silence(int64_t now)
+static void service_audio(int64_t now)
 {
-    if (rtc.call.phase != CALL_CONNECTED || now < rtc.call.next_audio_us || !current_transport()) return;
-    // Official libopus verification: one 20 ms mono frame, 960 zero samples at
-    // 48 kHz. This is an encoded payload, never PCM passed to esp_peer_send_audio.
-    static const uint8_t silence[] = {0xf8, 0xff, 0xfe};
-    int64_t slot = (now - rtc.call.connected_at_us) / AUDIO_FRAME_US;
-    uint32_t pts = (uint32_t)(slot * 20);
-    if (now >= rtc.call.next_audio_us + AUDIO_FRAME_US)
-        rtc.call.skipped_audio += (now - rtc.call.next_audio_us) / AUDIO_FRAME_US;
-    rtc.call.next_audio_us = rtc.call.connected_at_us + (slot + 1) * AUDIO_FRAME_US;
-    esp_peer_audio_frame_t frame = {.pts = pts, .data = (uint8_t *)silence, .size = sizeof(silence)};
+    (void)now;
+    if (rtc.call.phase != CALL_CONNECTED || !current_transport()) return;
+    if (!rtc.call.audio) {
+        esp_err_t err = digits_call_audio_start(rtc.audio_mode, &rtc.call.audio);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Call audio start failed: %s", esp_err_to_name(err));
+            rtc.call.failure = "call audio start failed";
+            return;
+        }
+    }
+    digits_call_audio_stats_t stats;
+    digits_call_audio_get_stats(rtc.call.audio, &stats);
+    if (stats.state == DIGITS_CALL_AUDIO_FAILED) {
+        ESP_LOGE(TAG, "Call audio worker failed: %s", esp_err_to_name(stats.error));
+        rtc.call.failure = "call audio worker failed";
+        return;
+    }
+    if (stats.state != DIGITS_CALL_AUDIO_READY || !(rtc.audio_mode & DIGITS_CALL_AUDIO_TX) ||
+        !digits_call_audio_pop_encoded(rtc.call.audio, &rtc.send_packet)) return;
+    call_audio_packet_t *packet = &rtc.send_packet;
+    esp_peer_audio_frame_t frame = {.pts = packet->pts_ms, .data = packet->data, .size = packet->size};
     int ret = esp_peer_send_audio(rtc.call.peer, &frame);
-    if (ret == ESP_PEER_ERR_NONE) ++rtc.call.tx_packets;
+    digits_call_audio_record_send(rtc.call.audio, packet, ret == ESP_PEER_ERR_NONE,
+                                 ret == ESP_PEER_ERR_WOULD_BLOCK);
+    if (ret == ESP_PEER_ERR_NONE) {
+        if (rtc.call.sent_audio) {
+            uint32_t step_ms = packet->pts_ms - rtc.call.last_audio_pts;
+            if (step_ms > 20 && step_ms < 60000) rtc.call.skipped_audio += step_ms / 20 - 1;
+        }
+        rtc.call.last_audio_pts = packet->pts_ms;
+        rtc.call.sent_audio = true;
+        ++rtc.call.tx_packets;
+    }
     else if (ret == ESP_PEER_ERR_WOULD_BLOCK) ++rtc.call.blocked_audio;
     else {
         ESP_LOGW(TAG, "Encoded audio send failed: %d", ret);
         rtc.call.failure = "encoded audio send failed";
     }
-    // Never send a catch-up burst or retry indefinitely if the send pool is full.
+    // PTS follows capture slots, including skipped PCM; no catch-up or retry burst.
 }
 
 static void refresh_transport(void)
@@ -728,6 +826,7 @@ static void peer_task(void *context)
 {
     (void)context;
     for (;;) {
+        reap_audio();
         refresh_transport();
         event_t *event;
         for (unsigned i = 0; i < MESSAGE_QUEUE_LENGTH && xQueueReceive(rtc.queue, &event, 0) == pdTRUE; ++i) {
@@ -737,7 +836,14 @@ static void peer_task(void *context)
             if (rtc.call.failure) end_failed_call();
         }
         if (rtc.call.peer && current_transport()) {
+            int64_t before = esp_timer_get_time();
+            bool connected = rtc.call.phase == CALL_CONNECTED;
             int ret = esp_peer_main_loop(rtc.call.peer);
+            if (connected && rtc.call.phase == CALL_CONNECTED) {
+                uint32_t elapsed = (uint32_t)(esp_timer_get_time() - before);
+                if (elapsed > rtc.call.max_peer_loop_us) rtc.call.max_peer_loop_us = elapsed;
+                if (elapsed > AUDIO_FRAME_US) ++rtc.call.slow_peer_loops;
+            }
             if (ret != ESP_PEER_ERR_NONE) rtc.call.failure = "peer main loop failed";
         }
         refresh_transport(); // A disconnect during DTLS must invalidate its result.
@@ -748,17 +854,20 @@ static void peer_task(void *context)
         } else if (rtc.call.deadline_us && now >= rtc.call.deadline_us) {
             end_call(true, rtc.call.phase == CALL_CONNECTING ? "connect_timeout" : "ringing timeout");
         } else {
-            send_silence(now);
+            service_audio(now);
             if (rtc.call.phase == CALL_CONNECTED && now >= rtc.call.next_report_us) {
                 rtc.call.next_report_us = now + 5000000;
-                ESP_LOGI(TAG, "Encoded media: tx=%" PRIu32 " rx=%" PRIu32 " rx_bytes=%" PRIu32 " skipped_slots=%" PRIu32 " send_blocked=%" PRIu32,
+                ESP_LOGI(TAG, "Encoded media: tx=%" PRIu32 " rx=%" PRIu32 " rx_bytes=%" PRIu32 " tx_pts_skips=%" PRIu32 " send_blocked=%" PRIu32 " peer_loop_max_us=%" PRIu32 " loops_over_20ms=%" PRIu32,
                          rtc.call.tx_packets, rtc.call.rx_packets, rtc.call.rx_bytes,
-                         rtc.call.skipped_audio, rtc.call.blocked_audio);
+                         rtc.call.skipped_audio, rtc.call.blocked_audio, rtc.call.max_peer_loop_us,
+                         rtc.call.slow_peer_loops);
+                report_call_audio(rtc.call.audio);
                 report_resources("Connected");
             }
         }
-        // At most one packet per 20 ms slot. Wake for control/transport changes.
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+        // The short socket timeout already paces the owner. One tick permits
+        // codec tasks to run without adding the old unconditional 10 ms delay.
+        ulTaskNotifyTake(pdTRUE, rtc.call.peer || rtc.stopping_audio ? 1 : pdMS_TO_TICKS(10));
     }
 }
 
@@ -768,15 +877,18 @@ esp_err_t digits_webrtc_init(digits_webrtc_send_fn send, void *context)
     if (rtc.queue) return ESP_ERR_INVALID_STATE;
     rtc.send = send;
     rtc.send_context = context;
+    rtc.audio_mode = DIGITS_CALL_AUDIO_FULL;
     rtc.queue = xQueueCreate(MESSAGE_QUEUE_LENGTH, sizeof(event_t *));
     if (!rtc.queue) return ESP_ERR_NO_MEM;
+    // Keep the bounded network owner ahead of the priority-5 audio workers.
+    // Its socket wait and one-tick yield leave the codec/capture tasks runnable.
     if (xTaskCreatePinnedToCore(peer_task, "digits_peer", WORKER_STACK_BYTES, NULL,
-                                3, &rtc.task, 1) != pdPASS) {
+                                WORKER_PRIORITY, &rtc.task, 1) != pdPASS) {
         vQueueDelete(rtc.queue);
         rtc.queue = NULL;
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "Ready: esp_peer 1.5.7, Opus silence interoperability source; worker stack=%u bytes, core=1",
+    ESP_LOGI(TAG, "Ready: esp_peer 1.5.7, live Opus call audio; worker stack=%u bytes, core=1",
              WORKER_STACK_BYTES);
     return ESP_OK;
 }
@@ -893,9 +1005,11 @@ esp_err_t digits_webrtc_command(const char *verb, const char *number)
     else if (!strcmp(verb, "answer")) kind = COMMAND_ANSWER;
     else if (!strcmp(verb, "hangup")) kind = COMMAND_HANGUP;
     else if (!strcmp(verb, "status")) kind = COMMAND_STATUS;
+    else if (!strcmp(verb, "audio")) kind = COMMAND_AUDIO;
     else return ESP_ERR_INVALID_ARG;
     transport_t snapshot = transport_snapshot();
-    if (kind != COMMAND_STATUS && (!snapshot.online || !snapshot.paired)) return ESP_ERR_INVALID_STATE;
+    if (kind != COMMAND_STATUS && kind != COMMAND_AUDIO &&
+        (!snapshot.online || !snapshot.paired)) return ESP_ERR_INVALID_STATE;
     event_t *event = audio_heap_alloc(sizeof(*event));
     if (!event) return ESP_ERR_NO_MEM;
     memset(event, 0, sizeof(*event));
@@ -905,6 +1019,13 @@ esp_err_t digits_webrtc_command(const char *verb, const char *number)
     if (kind == COMMAND_CALL && !copy_number(event->from, number)) {
         free_event(event);
         return ESP_ERR_INVALID_ARG;
+    }
+    if (kind == COMMAND_AUDIO) {
+        if (!number || (strcmp(number, "tx") && strcmp(number, "rx") && strcmp(number, "full"))) {
+            free_event(event);
+            return ESP_ERR_INVALID_ARG;
+        }
+        strcpy(event->from, number);
     }
     return enqueue(event);
 }

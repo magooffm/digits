@@ -19,9 +19,15 @@ typedef struct {
 // the speaker/signaling running. A dedicated task continuously drains RX.
 esp_err_t digits_microphone_init(void);
 
-// Copy the next frame from a four-frame queue. Single consumer; 0 = poll.
+// Reserve the single PCM consumer for a call or a complete recording/playback
+// diagnostic (including ADC pause/resume). Never acquire from a WS callback.
+// The acquiring task must release it; a busy microphone rejects another user.
+bool digits_microphone_acquire(uint32_t timeout_ms);
+void digits_microphone_release(void);
+
+// Copy the next frame from a four-frame queue. Reservation holder only; 0 = poll.
 // timeout_ms is bounded to 1000. Oldest frames are dropped when no consumer
-// keeps up. Sequence gaps/flags identify discontinuities for a future encoder.
+// keeps up. Sequence gaps/flags identify discontinuities for the encoder.
 esp_err_t digits_microphone_read(digits_microphone_frame_t *frame, uint32_t timeout_ms);
 
 // Changes only diagnostics, never transport clocks, capture or signaling.

@@ -3,8 +3,9 @@
 This Fedora/macOS command-line handset uses the unchanged Digits `server/v1.99.0`
 protocol at **`a4edaaa557c06b3b687be9e92a869fb0cbcf68fc`**. It pairs as an
 independent device, makes or manually answers one-to-one calls, generates Opus
-audio and decodes received RTP audio without microphones, speakers, ALSA or Pico
-hardware. Existing server, Pi client and ESP32 sources are unchanged by this tool.
+audio or sends a speech WAV, and optionally saves decoded receive audio as WAV.
+It opens no microphone, speaker, ALSA or Pico hardware. Existing server, Pi
+client and ESP32 sources are unchanged by this tool.
 
 The local module imports the original
 [signaling Client](../../pi/digitsd/internal/signal/client.go),
@@ -181,9 +182,11 @@ Flags:
 | --- | --- |
 | `--server URL` | WebSocket endpoint; also `DIGITS_SERVER_URL` |
 | `--state PATH` | Persistent independent device identity |
-| `--audio tone\|silence` | Quiet 440 Hz tone by default, or Opus-encoded silence |
+| `--audio tone\|silence\|wav` | Quiet 440 Hz tone by default, silence, or repeatedly streamed WAV input |
+| `--audio-file PATH` | Required with `--audio wav`: uncompressed 48 kHz mono signed PCM16 WAV |
 | `--host-only` | Ignore server ICE servers for same-LAN tests |
 | `--trace-dir DIR` | Private per-call SDP and bare ICE files; disabled by default |
+| `--record-dir DIR` | Private per-call decoded receive WAV files; disabled by default |
 | `--hardware-id UUID --number NUMBER --device-token TOKEN` | Import this client's existing paired identity into a **new** state file |
 
 `DIGITS_DEVICE_TOKEN` may supply the import token. Existing state accepts explicit
@@ -227,7 +230,96 @@ RTCP draining. PCM is signed 16-bit, **48 kHz mono**, **960 samples/20 ms**;
 the original encoder uses VoIP mode, **24 kbit/s**, complexity **5**, FEC and
 DTX. Opus SDP advertises `opus/48000/2`, including for mono PCM. Tone peak is
 2048/32768 (approximately -24 dBFS). Received Opus is decoded and counted,
-then discarded; no system sound device is opened.
+then discarded unless `--record-dir` is enabled; no system sound device is opened.
+
+## Record receive audio and send a speech WAV
+
+For microphone validation, enable the ESP32 firmware's microphone-to-Opus
+path and capture its decoded speech on Pion. Keep recordings on a filesystem
+that enforces Unix permissions. On this Linux setup, use the native private
+directory `~/.config/digits-interop/audio`, outside the FUSE repository mount:
+
+```sh
+./bin/digits-pion --server ws://SERVER_HOST:8080/ws \
+  --state "$HOME/.config/digits-interop/device.json" --host-only \
+  --record-dir "$HOME/.config/digits-interop/audio"
+```
+
+Each created peer gets a unique `receive-*.wav` file. The helper creates the
+record directory with `0700` and files with `0600`, and rejects existing
+directories with broader permissions or a symlink as the selected directory.
+It never changes permissions on an existing directory. Creation verifies the
+file's `0600` permissions; unsupported permission semantics are an error.
+In a container, mount `~/.config/digits-interop` at `/state` and use
+`--state /state/device.json --record-dir /state/audio`. Mounting the private
+directory preserves the existing independent handset identity.
+
+Answer a call, speak a recognizable short phrase near the ESP32 microphone,
+then hang up. `Receive WAV closed` reports the filename, recorded samples,
+queue drops, errors and whether finalization succeeded. `pcm_peak` and `pcm_rms`
+describe saved samples in signed 16-bit units; they apply no normalization
+and do not establish intelligibility. Hangup, reconnect,
+quit and Ctrl+C all stop receiver workers, drain queued PCM and finalize the
+48 kHz mono PCM16 RIFF header. Abrupt process termination or power loss can
+leave an unfinished file. An unanswered/failed peer can produce a valid empty
+WAV, which is not usable as a speech source.
+
+Disk writes run in a separate worker. A fixed pool of 50 packet buffers
+accepts at most 5,760 decoded samples per packet, with 576,000 bytes of PCM
+storage: about one second of queued audio for ordinary 20 ms packets. A slow
+disk drops whole capture packets and never waits inside the RTP receive loop.
+`recording_dropped_packets`/`recording_dropped_samples` are local capture drops;
+`recording_errors` reports disk/finalization failures. Media continues after
+a runtime capture error. Finalization waits for the bounded queue to drain.
+RIFF's 32-bit size limit stops capture with an error before overflow.
+
+For speaker validation, reuse a finalized recording containing intelligible
+speech as deterministic Pion input:
+
+```sh
+./bin/digits-pion --server ws://SERVER_HOST:8080/ws \
+  --state "$HOME/.config/digits-interop/device.json" --host-only \
+  --audio wav --audio-file "$HOME/.config/digits-interop/audio/receive-EXAMPLE.wav" \
+  --record-dir "$HOME/.config/digits-interop/audio"
+```
+
+The input must contain uncompressed 48 kHz mono signed 16-bit PCM. Stereo,
+other sample rates, floating-point/compressed audio, empty or malformed WAV
+files are rejected before connecting. Metadata chunks and their padding are
+accepted. Input reads are bounded to one 960-sample frame; the file repeats
+continuously across frame boundaries and restarts from its first sample for
+each call. No resampling or gain adjustment is performed. Preserve the
+original recording when preparing a louder copy externally. Confirm speech
+is intelligible at the ESP32 speaker with its receive decoder/playback path
+enabled; a transmitted WAV or successful I2S write alone does not prove it.
+
+The receive file stores decoded packets in arrival order. It does not reorder,
+conceal missing packets or insert silence for RTP timestamp gaps, so its sample
+count and duration do not measure wall-clock or end-to-end audio latency.
+`rtp_sequence_missing` counts inferred sequence holes; late packets can repair
+holes within a 256-packet history. Older gaps remain inferred missing.
+`rtp_sequence_gap_events`, `rtp_reordered_packets` and `rtp_duplicate_packets`
+are reported separately. Missing sequence numbers suggest transport or
+receiver drops and do not prove radio loss. With contiguous transmitted
+sequence numbers, `rtp_timestamp_gap_samples`/`rtp_timestamp_gap_events`
+report source-timeline gaps, such as unsent local frames. Timestamp gaps across
+missing sequences are not attributed separately, and late packets do not
+advance the timestamp baseline. Backward/repeated timestamps on forward
+packets increment `rtp_timestamp_discontinuities`. Capture queue drops remain
+separate from these RTP observations. Any measured pipeline age or jitter hold
+must also remain distinct from unmeasured end-to-end delay.
+
+Final structured media logs include `source_first_sent_at` and
+`recording_first_decoded_at` as UTC RFC3339Nano timestamps, sample offsets
+of zero, and the first decoded packet's RTP sequence/timestamp. The source
+time is observed after the first successful `WriteSample` returns; the receive
+time is observed after the first successful Opus decode. These are local helper
+observations, not actual wire departure or physical speaker/microphone times.
+Together with matched sample positions in a source WAV and acoustic loopback
+recording, they can support an estimated roundtrip delay. Arrival-order audio,
+missing packets, capture drops, Opus delay and the 20 ms source ticker create
+uncertainty. Do not present this estimate as true one-way latency, or infer
+delay from file duration alone.
 
 ## Reproduce an ESP32 hardware test
 
@@ -289,9 +381,11 @@ Success requires transport and media evidence, not only SDP exchange:
   retained call state. Capture ESP32 memory diagnostics before/after repeated
   calls to check resource release.
 
-The ESP32 milestone currently counts received encoded audio and transmits
-silence; it does not render the Pion tone or stream its microphone. No audible
-call audio is expected, even when transport interoperability succeeds.
+The initial ESP32 transport milestone counted received encoded audio and
+transmitted silence. Speech validation requires firmware with microphone
+encoding and received-audio decoding/playback enabled; the WAV options provide
+its Pion counterpart. The historical transport result below does not establish
+those later acoustic results.
 
 ## Diagnose each stage separately
 
@@ -344,6 +438,17 @@ verification uncertainty remains documented in its
 
 ## Verification status
 
+The WAV additions pass `make build`, `make test`, `make race`, `make vet` and
+CLI help in the prepared Fedora 44 x86_64 container with Go 1.26.9 and libopus
+1.6. Real local Pion/libopus tests exercise tone, silence and a WAV source
+whose loop boundary falls between 20 ms frames, with private receive files
+finalized during active-peer shutdown. Regressions cover malformed/unsupported
+input, padded metadata, short-input looping, decoder-buffer copying, bounded
+queue overflow with a blocked disk, disk/sync failures, output permissions,
+RTP wraparound, late gap repair and source timestamp gaps. Source/decode
+origin timestamps are also verified. These checks do not establish speech
+intelligibility on the physical ESP32.
+
 On **2026-10-10**, a native **Fedora 44 ARM64 VM** passed `make build`,
 `make test`, `make race`, `make vet` and the binary's `--help` smoke test.
 Its distribution packages were Go **1.26.8**, GCC **16.2.1** and libopus
@@ -394,5 +499,6 @@ confirmed consistent audible playback.
 See the [hardware results and remaining issues](../../docs/esp32-webrtc-interoperability.md#live-hardware-verification)
 for counters, ESP32 memory observations, the corrected teardown reason and
 Ring Test stack regression, and the remaining skipped transmit slots. This
-verifies encoded media transport; microphone streaming and received-audio playback remain
-unfinished. Preserve both endpoint logs when repeating the procedure above.
+verifies encoded media transport; microphone speech audibility and remote
+speaker intelligibility require separate physical validation. Preserve both
+endpoint logs when repeating the procedure above.

@@ -1,6 +1,15 @@
-# ESP32 WebRTC interoperability: Phase 1 design
+# ESP32 WebRTC interoperability design and transport verification
 
 This note records the compatibility review before implementation. The server stays unchanged. Upstream `server/v1.99.0` is the lightweight tag pointing to `a4edaaa557c06b3b687be9e92a869fb0cbcf68fc`; `git diff a4edaaa HEAD -- server pi/digitsd` is empty, so the locally inspected server and Pi sources are the exact release sources.
+
+The nine-call hardware record below belongs to the encoded-silence transport
+milestone. Live microphone encoding and speaker decoding are now implemented.
+Pion-to-ESP32 speech has been confirmed clear on the integrated speaker during
+full duplex. Recorded ESP32 microphone words were also confirmed clear after
+offline gain/filter preparation and replay through Pion. Full calls completed
+with each endpoint as caller; repeat-cycle and diagnostic recovery checks also
+passed. See the
+[call audio implementation and validation guide](esp32-call-audio.md).
 
 ## Digits wire contract
 
@@ -12,11 +21,11 @@ Outgoing order is `{"type":"call","to":"NUMBER"}`, then `{"type":"sdp","to":"NUM
 
 ## Selected peer API and adapter
 
-Pin Espressif [`esp_peer` 1.5.7](https://components.espressif.com/components/espressif/esp_peer/versions/1.5.7/readme), reviewed at official ESP-WebRTC commit `33a863f1a6c57bdcb7821f6f7a8e159035a0acf6`, with `esp_libsrtp` 1.0.0 (SRTP 3.0.0) and existing ESP-IDF **5.5.3** (mbedTLS 3.6.5). Use the encoded-audio peer API directly, without the ESP-WebRTC capture/render framework. It does not own I²S; existing ES7210/ES8311 drivers, microphone diagnostics and Ring Test remain independent.
+Pin Espressif [`esp_peer` 1.5.7](https://components.espressif.com/components/espressif/esp_peer/versions/1.5.7/readme), reviewed at official ESP-WebRTC commit `33a863f1a6c57bdcb7821f6f7a8e159035a0acf6`, with `esp_libsrtp` 1.0.0 (SRTP 3.0.0) and existing ESP-IDF **5.5.3** (mbedTLS 3.6.5). Use the encoded-audio peer API directly, without the ESP-WebRTC capture/render framework. It does not own I²S; call audio reuses the existing ES7210/ES8311 drivers and coordinates with diagnostics through microphone and speaker reservations.
 
 Both roles start `esp_peer_new_connection`; the controlled/callee role receives the offer before `esp_peer_main_loop`. `on_msg` exposes local SDP containing bundled `a=candidate:` lines; it does not emit separate local trickle candidates. Feed remote SDP with `ESP_PEER_MSG_TYPE_SDP` and remote bare candidates with `ESP_PEER_MSG_TYPE_CANDIDATE`. Preserve CRLF via normal JSON escaping, without prefixing bare candidates with `a=`. Role determines whether local SDP becomes Digits `sdp` or `answer`.
 
-One worker owns peer operations. WebSocket callbacks copy bounded messages; the WebSocket owner drains generation-tagged transmit requests only after sending `register`. Bank up to 32 remote candidates until remote SDP is applied; discard stale peer/generation messages. Development serial commands are `webrtc call NUMBER`, `webrtc answer`, `webrtc hangup`, and `webrtc status`, with optional auto-answer disabled by default. A received answer changes negotiation state only; media-connected requires the peer's `CONNECTED` event after DTLS success. Send a validated 20 ms encoded Opus silence packet if needed; count received Opus packets rather than claiming microphone playback integration.
+One worker owns peer operations. WebSocket callbacks copy bounded messages; the WebSocket owner drains generation-tagged transmit requests only after sending `register`. Bank up to 32 remote candidates until remote SDP is applied; discard stale peer/generation messages. Development serial commands are `webrtc call NUMBER`, `webrtc answer`, `webrtc hangup`, and `webrtc status`, with optional auto-answer disabled by default. A received answer changes negotiation state only; media-connected requires the peer's `CONNECTED` event after DTLS success. The initial milestone sent validated 20 ms Opus silence and counted received packets. The new call-audio path instead encodes live microphone PCM and decodes speaker PCM in dedicated workers; `webrtc audio tx|rx|full` selects the next call's mode while idle, with full duplex as the default.
 
 ## Compatibility risks and resource plan
 
@@ -30,7 +39,7 @@ No fundamental API incompatibility was found in this review. Compilation and lif
 
 ## Adapter regression verification
 
-[`esp32/tests/webrtc_interop_test.py`](../esp32/tests/webrtc_interop_test.py) compiles the complete production peer worker with the installed public `esp_peer` headers and ESP-IDF's real cJSON parser/serializer. Only the peer operations, transport callback, heap reporting and FreeRTOS scheduling/queues are finite host mocks. These mocks check ownership and sequencing; they do not implement cryptographic handshakes or simulate network interoperability.
+[`esp32/tests/webrtc_interop_test.py`](../esp32/tests/webrtc_interop_test.py) compiles the complete production peer worker with the installed public `esp_peer` headers and ESP-IDF's real cJSON parser/serializer. Peer operations, call-audio publication, the transport callback, heap reporting and FreeRTOS scheduling/queues are finite host mocks. These mocks check ownership and sequencing; they do not implement cryptographic handshakes, codec hardware or network interoperability.
 
 After sourcing ESP-IDF and building once to install the pinned components:
 
@@ -39,7 +48,7 @@ python3 esp32/tests/webrtc_interop_test.py
 python3 esp32/tests/webrtc_interop_test.py --sanitize
 ```
 
-The 45 lifecycle cases pass normally and under AddressSanitizer/UndefinedBehaviorSanitizer. They verify offer/answer role mapping, `call` before SDP, controlled-peer initialization and remote offer before the main loop, JSON CRLF preservation, bare candidates and early-ICE buffering, manual answer before the offer arrives, callback buffer ownership, retained peer configuration across ICE-server refresh, and teardown on timeouts/errors/resource exhaustion. They check cleanup and successful retry after queue/task initialization failures, and that oversized/repeated unsupported group messages cannot exhaust the ordinary call's queue. They also check that SDP acceptance does not mark the call connected, no media is sent before the peer reports connection, late audio slots are skipped rather than burst, duplicate connection callbacks do not reset pacing, and signaling generation changes invalidate an apparent connection completed during disconnect. Foreign-ring rejection does not send `hangup`, because the upstream handler ends authenticated origin's active calls rather than using `to` to select one. The added teardown regressions fail against the original implementation and verify that a transport failure after connection sends ordinary `hangup`, while setup failures retain `connect_timeout`.
+The 53 lifecycle cases pass normally and under AddressSanitizer/UndefinedBehaviorSanitizer. They verify offer/answer role mapping, `call` before SDP, controlled-peer initialization and remote offer before the main loop, JSON CRLF preservation, bare candidates and early-ICE buffering, manual answer before the offer arrives, callback buffer ownership, retained peer configuration across ICE-server refresh, and teardown on timeouts/errors/resource exhaustion. They check cleanup and successful retry after queue/task initialization failures, and that oversized/repeated unsupported group messages cannot exhaust the ordinary call's queue. SDP acceptance does not mark the call connected, media starts only after connection, producer timestamps and source gaps survive submission, and stale/empty publication does not become synthetic media or a catch-up burst. Audio startup and worker failures cleanly end the call; mode changes require idle and completed cleanup. A delayed audio shutdown prevents new incoming/outgoing calls until the peer is closed and workers acknowledge completion. Tests also check the one-tick active worker wait and connected-loop timing diagnostics, excluding DTLS transition time. Signaling generation changes invalidate an apparent connection completed during disconnect. Foreign-ring rejection does not send `hangup`, because the upstream handler ends authenticated origin's active calls rather than using `to` to select one. The teardown regressions verify ordinary `hangup` after connection and retain `connect_timeout` for setup failure.
 
 The initial runtime limits are eight queued signaling events, 32 buffered remote candidates of at most 512 bytes, eight cached STUN URLs of at most 255 bytes, 12 KiB raw SDP and 16 KiB serialized signaling. Active peer configuration and remote SDP remain owned until `esp_peer_close` finishes. Host mock heap values are not measurements; the first board observations follow.
 
@@ -79,3 +88,210 @@ After both corrected-build calls, the Ring Test hardware retest passed: the seri
 At uptime 196,223 ms and the final USB status at 262,183 ms, the board remained online, paired and idle with internal free memory of 160,339 bytes, internal minimum of 116,123 bytes, largest internal block of 63,488 bytes, PSRAM free of 8,362,080 bytes and peer-worker stack headroom of 11,432 bytes.
 
 Together, these runs establish one-to-one LAN ICE, DTLS/SRTP and bidirectional encoded Opus interoperability through Digits signaling, plus consistently audible Ring Tests and 15 completed playbacks without the earlier stack panic on the corrected build. They do not establish audible call audio, microphone encoding/playback, Internet/TURN coverage, certificate fingerprint verification or long-duration resource stability. Concurrent Ring Test/recording behavior, the skipped-send-slot follow-up and ESP32 Wi-Fi-loss recovery require further hardware checks.
+
+## Call audio implementation and physical validation
+
+The ESP-IDF 5.5.3 build now includes `esp_audio_codec` 2.6.2 and passes with
+live ES7210 microphone encoding and ES8311 Opus playback. The configured
+current priority-corrected image is 1,369,904 bytes (`0x14e730`), leaving 67%
+of the 4 MiB application partition free, with ELF SHA-256 prefix `808a295d05`,
+and has been flashed. The private
+hardware configuration uses a 1,000 Hz tick; the supplied `sdkconfig` remains
+unchanged. Codec tasks reuse
+the existing 48 kHz mono PCM path; encoded packets and playback timestamps
+remain 20 ms. The encoder now has a 48 KiB internal stack and the decoder
+has 24 KiB, while bounded
+PCM/packet/jitter storage prefers PSRAM. A microphone consumer mutex and the
+speaker reservation exclude recording diagnostics and overlapping playback.
+Shutdown is asynchronous; a later call waits until old workers have stopped
+and their context has been released.
+
+Production audio-worker checks pass normally and under ASan/UBSan with finite
+capture/codec/two-DMA mocks. They cover 1,000 fixed-clock TX frames with 6 ms
+polling, 100 playback cycles without modeled starvation, injected scheduling
+stalls, bounded queues and cleanup/failure paths. Pure jitter/render checks
+also pass. These results support local ordering and scheduling logic, without
+claiming ESP32 execution deadlines, Opus quality or physical audibility.
+
+New configurations use a 1,000 Hz FreeRTOS tick, a 5 ms peer receive timeout
+and a one-tick active wait. The former 100 Hz timeout rounding and extra
+10 ms wait could delay local send slots. The encoder/peer now preserve
+capture-clock PTS, count source skips and expose stage age and loop-duration
+diagnostics. These changes address local scheduling; they do not prove that
+the earlier weak Wi-Fi signal caused the skipped-slot observation. Pion's RTP
+sequence-gap and contiguous-sequence timestamp-gap counters provide separate
+delivery and source-timeline evidence. Record/WAV drops remain local outcomes.
+
+The [audio guide](esp32-call-audio.md) records microphone-to-WAV,
+speech-WAV-to-speaker and full-duplex procedures. Pion-to-speaker speech was
+confirmed clear in RX-only and full-duplex calls below. Recorded microphone
+speech was confirmed intelligible with offline processing. End-to-end latency,
+long-duration resource stability still needs validation. Diagnostic recovery
+and a qualified single acoustic round-trip estimate are recorded below.
+The board cannot currently be moved
+for an improved-signal comparison. Stack-correction boots reported RSSI -86
+and -85 dBm. The priority-correction boot reported -67 dBm, while the completed
+ESP32-originated full call varied from -83 to -66 dBm and the Pion-originated
+full call from -79 to -65 dBm, with power-save mode 1 unchanged. Radio
+conditions vary between samples; no controlled improved-signal comparison exists.
+
+DTLS certificate-to-SDP fingerprint verification is a separate unresolved
+limitation. Adding codecs and speaker playback does not establish remote peer
+identity authentication or production security readiness.
+
+The first full-duplex call on the priority-3 peer-owner image lasted about
+222 seconds, and the user reported **“not so clear.”** ESP32 captured/encoded
+11,116 frames, sent 10,397 and counted 64 TX queue drops plus 654 pop drops,
+about 6.46% locally skipped source frames. Pion received 9,984 packets and
+inferred 413 missing RTP sequences across 240 events; contiguous-sequence
+timestamp gaps totaled 406,080 samples across 289 events. Its WAV recorder
+dropped no media and reported no disk errors. ESP32 used 799 PLC frames and
+counted 90 inferred producer feed gaps; decode/write errors and local playback
+skips were zero. Minimum internal free memory was 20,731 bytes; after cleanup,
+internal free was 158,883 bytes and PSRAM free 8,362,080 bytes.
+
+The [full result](esp32-call-audio.md#first-full-duplex-continuity-failure)
+keeps source skips, arrival-queue drops and inferred RTP gaps separate. These
+counters do not establish radio loss. The pinned library's 64-bit RTP timestamp
+conversion retains 20 ms alignment; cache abandonment or burst delivery may
+also contribute to discontinuities. The peer owner's priority is being raised
+from 3 to 6, above priority-5 audio workers, retaining the same affinity and
+power-save settings for the first comparison. RSSI/power-save mode and capture
+timeouts are added to its logs. The new image is flashed; bounded full-duplex
+audibility results follow, while repeated-cycle stability remains to be tested.
+
+The priority-6 ESP32-originated full call ran from 23:26:49 to 23:28:50 UTC,
+about 121 seconds. The user confirmed **“speech is fine”** while live capture
+continued. ESP32 captured/encoded 6,057 frames, submitted 6,031 and counted
+25 pop drops, about 0.413% local source skips, with no TX queue drops or capture
+gaps/stale frames/timeouts. Pion received all 6,031 packets with no inferred
+missing sequences; 25 timestamp gaps totaled 24,000 samples. Its receive WAV
+contains 5,789,760 samples (120.62 seconds), peak 9,092 and RMS 100.81, with
+zero recording drops/errors. ESP32 received 6,054, decoded 6,051 and played
+6,050 frames, with zero PLC, late/missing timestamps, discontinuities, local
+skips, queue drops/stale media, jitter overruns, producer gaps or decode/write
+errors. The last periodic peer-loop report showed 20,002 microseconds maximum
+and one loop above 20 ms. TX/RX minimum free stacks were 27,136/16,012 bytes,
+minimum internal free was 39,915 bytes and idle PSRAM returned to 8,362,080
+bytes. The detailed stage maxima are in the [audio results](esp32-call-audio.md#priority-6-full-duplex-and-recorded-microphone-speech).
+
+The original microphone receive WAV was retained. A separate last-35-second
+copy used 16× offline gain, an 80 Hz high-pass filter and a peak limiter of
+8,192 (RMS 438). During a Pion-originated full call starting at 23:29:59 UTC,
+Pion looped that copy, and the user confirmed **“My words are clear.”** This
+establishes intelligibility for the ESP32 microphone → Pion decoded WAV →
+Pion source → ESP32 speaker path with offline preparation. Native transmit
+gain remains unchanged. That call completed at 23:33:12 UTC, about 193 seconds.
+ESP32 captured/encoded 9,639 frames and submitted 9,587; Pion received all of
+them with zero inferred RTP gaps, reordering or duplicates. Fifty source PTS
+skips matched 50 timestamp gaps totaling 48,000 samples; 51 pop drops include
+closing discard. RX received 9,638, decoded 9,630, used three PLC frames and
+played 9,633, with three late/missing timestamps and one inferred producer gap.
+Queue drops/stale media, jitter overruns, local skips, discontinuities and
+decode/write errors were zero. Maximum peer loop was 28,879 microseconds with
+one loop over 20 ms; TX/RX minimum free stacks were 27,136/16,012 bytes and
+minimum internal free was 37,955 bytes. Stable idle internal free/largest block
+were 158,735/63,488 bytes, with PSRAM free 8,362,080 bytes.
+
+Two concurrent KEY1 requests declined with `Speaker busy`; the user confirmed
+streamed speech continued. Concurrent Ring Test was not dispatched because
+the WebUI disabled its button. After hangup, Ring Test queued 48,000 frames,
+and KEY1 recorded/played 98,880 samples over 2,060 ms with capture resumed;
+the user confirmed both diagnostics worked as usual. Four subsequent calls
+completed cleanup, alternating callers. Their idle internal free values were
+158,467, 158,487, 158,499 and 158,467 bytes, largest block 63,488 bytes and PSRAM
+free 8,362,080 bytes; internal minimum stayed 37,955 bytes. All had zero
+inferred missing RTP sequences at Pion. The first two had local playback
+skips/producer gaps of 16/14 and 4/4, alongside maximum decode durations of
+35,560 and 32,856 microseconds; the third and fourth had neither. These are local
+scheduling observations, not transport-loss evidence. Extra-cycle RSSI
+samples varied from -87 to -63 dBm without moving the board. Detailed
+[cycle results](esp32-call-audio.md#additional-callhangup-cycles) retain source
+timestamp gaps and boundary packet-count differences separately. A separate
+clean marker probe estimated about 170 ms acoustic round trip; calibrated
+one-way latency, jitter and long-duration stability remain unmeasured. Priority and
+RSSI both changed between runs; the continuity improvement cannot be assigned
+solely to the priority change.
+
+The exact pinned default peer creates no internal sender/receiver tasks; the
+public header states all work runs through the main loop. Its UDP RTP path
+packetizes, encrypts and submits synchronously, but the generic RTP encoder
+discards the write callback result and returns success. The visible UDP wrapper
+can retry buffer exhaustion twice with a 20 ms sleep plus up to 5 ms `select`
+wait per retry, then return a hidden error. Accordingly an application
+successful-send count is not confirmation of socket or wire delivery. RTP
+holes may include local transport failures, receiver drops or path loss,
+in addition to the separately measured source-frame skips.
+
+Five short acoustic-loop probes followed; four were rejected because source
+PTS gaps compressed the receive file's timeline. The clean Pion-originated
+probe from 23:43:26.82 to 23:43:28.93 UTC recorded 105 packets/100,800 samples,
+with zero RTP sequence/timestamp gaps, reordering, duplicates, decode errors or
+recording drops/errors. A 100 ms source chirp at sample 24,000 matched near
+receive sample 31,856, with correlation 0.598722 and weaker distant alternatives.
+Using the helper's first-send/first-decode software origins gave approximately
+170 ms for Pion → ESP32 speaker → onboard microphone → Pion, independently
+reproduced. This is a single acoustic round-trip estimate with uncalibrated
+origins; uncertainty can exceed 20 ms, and it supplies neither a proven timing
+bound nor one-way delay or jitter. The [measurement details](esp32-call-audio.md#single-acoustic-round-trip-estimate)
+record the origins, packet eligibility and limitations. After the final probe,
+idle internal free/largest block were 158,475/63,488 bytes, PSRAM free 8,362,080
+bytes and minimum internal free 37,955 bytes, with RSSI -66 dBm/power-save mode 1.
+At the final 23:45:35 UTC console check, the board was online, paired and idle
+in full mode with `cleanup_pending=no`; RSSI was -65 dBm, power-save mode 1,
+and peer-worker minimum free stack was 11,272 bytes. Pion and serial tools
+stopped normally, without resetting the board. No capture I²S read faults or
+RX DMA overruns were logged in the current boot; playback producer gaps remain
+inferred scheduling measurements, rather than calibrated DMA underruns.
+
+### First physical audio failure and corrected TX transport retest
+
+The initial 1,368,928-byte audio image (`0x14e360`, ELF prefix `559ad7bda5`)
+passed compilation. Its first TX-only call failed immediately with
+a stack overflow in `digits_call_tx`, before audio transmission. The initial
+16 KiB codec-worker allocations were insufficient for the real library.
+The pinned audio-codec documentation recommends about 40 KiB for tasks
+supporting all encoders and 20 KiB for all decoders. The correction increases
+TX to 48 KiB and RX to 24 KiB. The revised `6e93bdd4dc` build was flashed and
+completed a Pion-originated TX-only call, manually answered on ESP32, from
+23:12:42 to 23:17:09 UTC, about 267.7 seconds. ESP32 encoded 13,382 frames and
+sent 13,372 packets; Pion received all 13,372. Nine pop drops/source PTS skips
+represent about 0.0673% locally skipped source slots. Capture gaps, stale frames,
+encode errors, blocked sends and send errors were zero, with one initial capture
+discontinuity. Maximum encode/capture-age/send-age were 8,540/12,611/27,632
+microseconds; the peer loop maximum was 22,066 microseconds with nine loops
+above 20 ms. TX minimum free stack was 27,136 bytes of 48 KiB.
+
+Pion finalized 12,837,120 decoded samples, or 267.44 seconds of 48 kHz mono
+PCM16, with peak 1,805 and RMS 21.05. The user spoke for 10–15 seconds; the
+raw recording is quiet and its intelligibility remains unverified. RTP missing
+sequences, sequence gap events, reordering, duplicates, decode errors and
+recording drops/errors were zero. Nine contiguous-sequence timestamp gaps
+totaled 8,640 samples, matching nine locally unsent 20 ms frames. The new
+local skip sample is far below the historical approximately 21.5% sample;
+neither sample is a radio-loss measurement. After cleanup, internal free memory
+was 158,943 bytes and PSRAM free was 8,362,080 bytes.
+
+Host codec mocks verified ordering and cleanup without reproducing the actual
+library's stack use. This physical failure and correction do not change the
+earlier nine-call encoded-silence transport baseline.
+
+### Audible Pion-to-ESP32 speech
+
+An ESP32-originated RX-only call from 23:18:50 to 23:19:49 UTC looped a known
+7.842-second offline synthesized speech WAV from Pion (RMS 821.65, peak 6,564).
+The user confirmed **“Speech is clear”** through the integrated speaker.
+ESP32 reported 2,931 received, 2,556 decoded, 154 PLC and 2,709 played frames.
+Decode/write errors, queue drops/stale frames, jitter overruns and local skips
+were zero; late frames were 60, missing playout timestamps 154, the combined
+discontinuity/misaligned-timestamp counter 39 and producer feed gaps 11. The
+current `rebases` log label includes misaligned-timestamp rejection and does
+not establish 39 actual reprimes. Missing timestamps and producer gaps do not
+measure radio loss or calibrated DMA underruns.
+
+Maximum decode/receive-age/write times were 10,788/141,796/17,098 microseconds.
+RX minimum free stack was 16,000 bytes of 24 KiB. After cleanup, internal free
+memory was 158,835 bytes and PSRAM free was 8,362,080 bytes. This confirms
+intelligible RX speech in one short call. Later full-duplex and processed
+microphone-speech results above extend this baseline; latency, continuity and
+repeated-cycle stability remain bounded validation work.

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,36 +25,60 @@ type peerEvent struct {
 }
 
 type peerSnapshot struct {
-	Connection       string `json:"connection"`
-	ICE              string `json:"ice"`
-	DTLS             string `json:"dtls"`
-	SRTP             string `json:"srtp"`
-	Codec            string `json:"codec,omitempty"`
-	ClockRate        uint32 `json:"clock_rate,omitempty"`
-	Channels         uint16 `json:"channels,omitempty"`
-	CandidatePair    string `json:"candidate_pair,omitempty"`
-	TXFrames         uint64 `json:"tx_frames"`
-	RXPackets        uint64 `json:"rx_packets"`
-	TXBytes          uint64 `json:"tx_opus_bytes"`
-	RXBytes          uint64 `json:"rx_opus_bytes"`
-	DecodedSamples   uint64 `json:"decoded_samples"`
-	EncodeErrors     uint64 `json:"encode_errors"`
-	DecodeErrors     uint64 `json:"decode_errors"`
-	WriteErrors      uint64 `json:"write_errors"`
-	TransportTXBytes uint64 `json:"transport_bytes_sent"`
-	TransportRXBytes uint64 `json:"transport_bytes_received"`
+	Connection                  string  `json:"connection"`
+	ICE                         string  `json:"ice"`
+	DTLS                        string  `json:"dtls"`
+	SRTP                        string  `json:"srtp"`
+	Codec                       string  `json:"codec,omitempty"`
+	ClockRate                   uint32  `json:"clock_rate,omitempty"`
+	Channels                    uint16  `json:"channels,omitempty"`
+	CandidatePair               string  `json:"candidate_pair,omitempty"`
+	TXFrames                    uint64  `json:"tx_frames"`
+	RXPackets                   uint64  `json:"rx_packets"`
+	TXBytes                     uint64  `json:"tx_opus_bytes"`
+	RXBytes                     uint64  `json:"rx_opus_bytes"`
+	DecodedSamples              uint64  `json:"decoded_samples"`
+	EncodeErrors                uint64  `json:"encode_errors"`
+	DecodeErrors                uint64  `json:"decode_errors"`
+	WriteErrors                 uint64  `json:"write_errors"`
+	TransportTXBytes            uint64  `json:"transport_bytes_sent"`
+	TransportRXBytes            uint64  `json:"transport_bytes_received"`
+	ReceiveWAV                  string  `json:"receive_wav,omitempty"`
+	RecordedSamples             uint64  `json:"recorded_samples"`
+	RecordingDroppedPackets     uint64  `json:"recording_dropped_packets"`
+	RecordingDroppedSamples     uint64  `json:"recording_dropped_samples"`
+	RecordingErrors             uint64  `json:"recording_errors"`
+	RecordingFinalized          bool    `json:"recording_finalized"`
+	RecordingPCMPeak            uint32  `json:"recording_pcm_peak"`
+	RecordingPCMRMS             float64 `json:"recording_pcm_rms"`
+	SourceFirstSentAt           string  `json:"source_first_sent_at,omitempty"`
+	RecordingFirstDecodedAt     string  `json:"recording_first_decoded_at,omitempty"`
+	RecordingFirstRTPSequence   uint16  `json:"recording_first_rtp_sequence"`
+	RecordingFirstRTPTimestamp  uint32  `json:"recording_first_rtp_timestamp"`
+	RTPSequenceMissing          uint64  `json:"rtp_sequence_missing"`
+	RTPSequenceGapEvents        uint64  `json:"rtp_sequence_gap_events"`
+	RTPReorderedPackets         uint64  `json:"rtp_reordered_packets"`
+	RTPDuplicatePackets         uint64  `json:"rtp_duplicate_packets"`
+	RTPTimestampGapSamples      uint64  `json:"rtp_timestamp_gap_samples"`
+	RTPTimestampGapEvents       uint64  `json:"rtp_timestamp_gap_events"`
+	RTPTimestampDiscontinuities uint64  `json:"rtp_timestamp_discontinuities"`
 }
 
 // callPeer uses the original Digits PeerManager directly. It retains the exact
 // Pion defaults, local track, RTCP drainer, SDP methods, bare ICE representation,
 // and original Opus decoder. No ALSA, UART or telephone hardware is imported.
 type callPeer struct {
-	manager *owebrtc.PeerManager
-	encoder *codec.Encoder
-	audio   string
-	ctx     context.Context
-	cancel  context.CancelFunc
-	emit    func(peerEvent)
+	manager      *owebrtc.PeerManager
+	encoder      *codec.Encoder
+	audio        string
+	source       *pcmSource
+	recorder     *wavRecorder
+	reception    rtpReception
+	firstSent    atomic.Pointer[time.Time]
+	firstDecoded atomic.Pointer[decodedOrigin]
+	ctx          context.Context
+	cancel       context.CancelFunc
+	emit         func(peerEvent)
 
 	mu             sync.Mutex
 	closed         bool
@@ -74,9 +97,20 @@ type callPeer struct {
 	writeErrors    atomic.Uint64
 }
 
+type decodedOrigin struct {
+	At        time.Time
+	Sequence  uint16
+	Timestamp uint32
+}
+
 func newCallPeer(ctx context.Context, servers []sigclient.ICEServer, audio string, emit func(peerEvent)) (*callPeer, error) {
-	if audio != "silence" && audio != "tone" {
-		return nil, fmt.Errorf("audio must be silence or tone")
+	return newCallPeerWithMedia(ctx, servers, options{audio: audio}, emit)
+}
+
+func newCallPeerWithMedia(ctx context.Context, servers []sigclient.ICEServer, config options, emit func(peerEvent)) (*callPeer, error) {
+	source, err := newPCMSource(config.audio, config.audioFile)
+	if err != nil {
+		return nil, err
 	}
 	iceServers := make([]owebrtc.ICEServerConfig, len(servers))
 	for i, server := range servers {
@@ -86,6 +120,7 @@ func newCallPeer(ctx context.Context, servers []sigclient.ICEServer, audio strin
 	}
 	manager, err := owebrtc.NewPeerManager(owebrtc.NewICEConfig(iceServers))
 	if err != nil {
+		_ = source.Close()
 		return nil, fmt.Errorf("peer/Opus initialization: %w", err)
 	}
 	// SendPCMFrame deliberately hides encode/write errors in the original Pi
@@ -94,10 +129,19 @@ func newCallPeer(ctx context.Context, servers []sigclient.ICEServer, audio strin
 	encoder, err := codec.NewEncoder(48000, 1, 24000)
 	if err != nil {
 		_ = manager.Close()
+		_ = source.Close()
 		return nil, fmt.Errorf("Opus encoder: %w", err)
 	}
 	peerCtx, cancel := context.WithCancel(ctx)
-	p := &callPeer{manager: manager, encoder: encoder, audio: audio, ctx: peerCtx, cancel: cancel, emit: emit}
+	p := &callPeer{manager: manager, encoder: encoder, audio: config.audio, source: source, ctx: peerCtx, cancel: cancel, emit: emit}
+	if config.recordDir != "" {
+		p.recorder, err = newWAVRecorder(config.recordDir)
+		if err != nil {
+			p.Close()
+			return nil, fmt.Errorf("receive WAV initialization: %w", err)
+		}
+		slog.Info("Receive WAV opened", "path", p.recorder.path, "sample_rate", wavRate, "pcm_channels", 1)
+	}
 	manager.SetOnICECandidate(func(candidate string) {
 		p.publish(peerEvent{Kind: "candidate", Text: candidate})
 	})
@@ -176,7 +220,6 @@ func (p *callPeer) mediaLoop() {
 	defer ticker.Stop()
 	statsTicker := time.NewTicker(5 * time.Second)
 	defer statsTicker.Stop()
-	var sample uint64
 	slog.Info("Opus source started", "stage", "Opus", "source", p.audio, "sample_rate", 48000,
 		"pcm_channels", 1, "frame_samples", codec.FrameSize, "bitrate", 24000, "fec", true, "dtx", true)
 	for {
@@ -186,14 +229,10 @@ func (p *callPeer) mediaLoop() {
 		case <-statsTicker.C:
 			p.logSnapshot()
 		case <-ticker.C:
-			if p.audio == "tone" {
-				for i := range frame {
-					// Quiet 440 Hz (-24 dBFS peak) test source; nothing is sent
-					// to physical audio hardware on the development machine.
-					frame[i] = int16(2048 * math.Sin(2*math.Pi*440*float64(sample+uint64(i))/48000))
-				}
+			if err := p.source.Fill(frame); err != nil {
+				p.publish(peerEvent{Kind: "failure", Text: "WAV", Err: err})
+				return
 			}
-			sample += codec.FrameSize
 			encoded, err := p.encoder.Encode(frame)
 			if err != nil {
 				p.encodeErrors.Add(1)
@@ -208,7 +247,12 @@ func (p *callPeer) mediaLoop() {
 				p.publish(peerEvent{Kind: "failure", Text: "SRTP", Err: fmt.Errorf("SRTP RTP sample write: %w", err)})
 				return
 			}
-			p.txFrames.Add(1)
+			sentAt := time.Now().UTC()
+			if p.txFrames.Add(1) == 1 {
+				p.firstSent.Store(&sentAt)
+				slog.Info("First source frame sent", "source_first_sent_at", sentAt.Format(time.RFC3339Nano),
+					"source_first_sample_offset", 0, "frame_samples", codec.FrameSize)
+			}
 			p.txBytes.Add(uint64(len(encoded)))
 		}
 	}
@@ -247,6 +291,7 @@ func (p *callPeer) remoteTrack(track *webrtc.TrackRemote) {
 			slog.Info("first authenticated/decrypted SRTP audio packet", "stage", "SRTP",
 				"sequence", packet.SequenceNumber, "timestamp", packet.Timestamp, "bytes", len(packet.Payload))
 		}
+		forward := p.reception.Observe(packet.SequenceNumber, packet.Timestamp)
 		pcm, err := p.manager.Decode(packet.Payload)
 		if err != nil {
 			p.decodeErrors.Add(1)
@@ -254,9 +299,19 @@ func (p *callPeer) remoteTrack(track *webrtc.TrackRemote) {
 			continue
 		}
 		p.decodedSamples.Add(uint64(len(pcm)))
-		// Consume PCM here; it is the upstream decoder's reusable buffer.
-		// Counting successful samples verifies codec compatibility without any
-		// sound device, microphone, loopback or retained unbounded audio queue.
+		if len(pcm) > 0 && p.firstDecoded.Load() == nil {
+			origin := &decodedOrigin{At: time.Now().UTC(), Sequence: packet.SequenceNumber, Timestamp: packet.Timestamp}
+			p.firstDecoded.Store(origin)
+			slog.Info("First decoded PCM received", "recording_first_decoded_at", origin.At.Format(time.RFC3339Nano),
+				"recording_first_sample_offset", 0, "recording_first_rtp_sequence", origin.Sequence,
+				"recording_first_rtp_timestamp", origin.Timestamp)
+		}
+		if forward {
+			p.reception.SetFrameSamples(len(pcm))
+		}
+		if p.recorder != nil {
+			p.recorder.Submit(pcm)
+		}
 	}
 }
 
@@ -266,6 +321,25 @@ func (p *callPeer) Snapshot() peerSnapshot {
 		TXFrames: p.txFrames.Load(), RXPackets: p.rxPackets.Load(), TXBytes: p.txBytes.Load(), RXBytes: p.rxBytes.Load(),
 		DecodedSamples: p.decodedSamples.Load(), EncodeErrors: p.encodeErrors.Load(), DecodeErrors: p.decodeErrors.Load(), WriteErrors: p.writeErrors.Load(),
 	}
+	if p.recorder != nil {
+		r := p.recorder.Snapshot()
+		snapshot.ReceiveWAV, snapshot.RecordedSamples = r.Path, r.Samples
+		snapshot.RecordingDroppedPackets, snapshot.RecordingDroppedSamples = r.DroppedPackets, r.DroppedSamples
+		snapshot.RecordingErrors, snapshot.RecordingFinalized = r.Errors, r.Finalized
+		snapshot.RecordingPCMPeak, snapshot.RecordingPCMRMS = r.Peak, r.RMS
+	}
+	if first := p.firstSent.Load(); first != nil {
+		snapshot.SourceFirstSentAt = first.Format(time.RFC3339Nano)
+	}
+	if first := p.firstDecoded.Load(); first != nil {
+		snapshot.RecordingFirstDecodedAt = first.At.Format(time.RFC3339Nano)
+		snapshot.RecordingFirstRTPSequence, snapshot.RecordingFirstRTPTimestamp = first.Sequence, first.Timestamp
+	}
+	rtp := p.reception.Snapshot()
+	snapshot.RTPSequenceMissing, snapshot.RTPSequenceGapEvents = rtp.SequenceMissing, rtp.SequenceGapEvents
+	snapshot.RTPReorderedPackets, snapshot.RTPDuplicatePackets = rtp.Reordered, rtp.Duplicates
+	snapshot.RTPTimestampGapSamples, snapshot.RTPTimestampGapEvents = rtp.TimestampGapSamples, rtp.TimestampGapEvents
+	snapshot.RTPTimestampDiscontinuities = rtp.TimestampDiscontinuities
 	p.mu.Lock()
 	snapshot.Codec = p.codec.MimeType
 	snapshot.ClockRate = p.codec.ClockRate
@@ -314,7 +388,17 @@ func (p *callPeer) logSnapshot() {
 		"tx_opus_bytes", s.TXBytes, "rx_opus_bytes", s.RXBytes, "decoded_samples", s.DecodedSamples,
 		"encode_errors", s.EncodeErrors, "decode_errors", s.DecodeErrors, "write_errors", s.WriteErrors,
 		"transport_bytes_sent", s.TransportTXBytes, "transport_bytes_received", s.TransportRXBytes,
-		"candidate_pair", s.CandidatePair)
+		"candidate_pair", s.CandidatePair, "receive_wav", s.ReceiveWAV, "recorded_samples", s.RecordedSamples,
+		"recording_dropped_packets", s.RecordingDroppedPackets, "recording_dropped_samples", s.RecordingDroppedSamples,
+		"recording_errors", s.RecordingErrors, "recording_finalized", s.RecordingFinalized,
+		"recording_pcm_peak", s.RecordingPCMPeak, "recording_pcm_rms", s.RecordingPCMRMS,
+		"source_first_sent_at", s.SourceFirstSentAt, "recording_first_decoded_at", s.RecordingFirstDecodedAt,
+		"source_first_sample_offset", 0, "recording_first_sample_offset", 0,
+		"recording_first_rtp_sequence", s.RecordingFirstRTPSequence, "recording_first_rtp_timestamp", s.RecordingFirstRTPTimestamp,
+		"rtp_sequence_missing", s.RTPSequenceMissing, "rtp_sequence_gap_events", s.RTPSequenceGapEvents,
+		"rtp_reordered_packets", s.RTPReorderedPackets, "rtp_duplicate_packets", s.RTPDuplicatePackets,
+		"rtp_timestamp_gap_samples", s.RTPTimestampGapSamples, "rtp_timestamp_gap_events", s.RTPTimestampGapEvents,
+		"rtp_timestamp_discontinuities", s.RTPTimestampDiscontinuities)
 }
 
 func (p *callPeer) Close() {
@@ -330,6 +414,13 @@ func (p *callPeer) Close() {
 			slog.Warn("peer close failed", "stage", "connection", "error", err)
 		}
 		p.wg.Wait()
+		if err := p.source.Close(); err != nil {
+			slog.Warn("WAV source close failed", "error", err)
+		}
+		if p.recorder != nil {
+			p.recorder.Close()
+		}
+		p.logSnapshot()
 		slog.Info("peer media workers stopped", "stage", "connection", "tx_frames", p.txFrames.Load(), "rx_packets", p.rxPackets.Load())
 	})
 }
