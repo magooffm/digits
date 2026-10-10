@@ -55,6 +55,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Allow Git metadata reads in the container
+        run: |
+          # Checkout uses temporary Git config; Go needs trust for VCS stamping.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git status --porcelain
+
       - name: Report toolchain and Opus versions
         run: |
           go version
