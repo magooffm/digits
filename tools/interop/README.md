@@ -336,7 +336,7 @@ The post-answer setup deadline is **10 seconds**, matching the original Pi
 client; the local ringing bound is 60 seconds. Signaling loss ends the peer and
 reconnects with a bounded 6/12/24/48/60-second backoff for unstable sessions.
 Pion keeps its original IPv4/IPv6 candidate behavior while ESP32 is configured
-for IPv4; candidate interoperability still needs hardware observation.
+for IPv4; the live test below selected IPv4 UDP host candidates.
 No TURN, ICE restart, signaling grace-period recovery, conference/group calls
 or physical audio integration is added. The ESP32 upstream fingerprint
 verification uncertainty remains documented in its
@@ -358,8 +358,7 @@ The [interoperability CI workflow](../../.github/workflows/interop-ci.yml)
 is configured to build and run the tests, race detector, vet and CLI help in
 official Fedora **43/44 x86_64 containers**, using native Fedora Go/Opus
 dependencies. It preserves the full checkout so the original Pi packages remain
-available. This workflow has not been run yet; Fedora 43 and x86_64 runtime
-verification remain pending CI. VM/container tests exercise local peers and do
+available. VM/container tests exercise local peers and do
 not verify the development machine's LAN firewall, SELinux policy or a physical
 ESP32 connection.
 
@@ -376,7 +375,24 @@ Pion's DTLS error `remote certificate does not match any fingerprint`, with no
 connected state or media accepted. Depending on DTLS CloseNotify scheduling,
 the aggregate connection can terminate as failed or closed.
 
-These tests and compilation are distinct from a live ESP32 ↔ Pion call.
-**Physical interoperability has not been demonstrated.**
-Record both endpoint logs and per-stage results when performing the procedure
-above; unresolved hardware failures must remain classified by their evidence.
+On **2026-10-11** (Europe/Berlin), this helper passed a live same-LAN test with
+the physical ESP32. A Fedora 44 x86_64 Podman container with **host networking**,
+Go **1.26.9**, libopus **1.6** and Pion **4.2.20** passed `make build`, `make test`
+and the CLI help check. Pion was independently paired as `3140002`, alongside
+ESP32 `3140001`. Three calls in each direction and one further Pion-originated
+call after signaling reconnect all established ICE/DTLS/SRTP and exchanged
+Opus packets in both directions, with zero Pion codec/write errors. Both
+endpoints returned idle after hangup; the saved Pion identity survived reconnect.
+
+After fixing the ESP32 Ring Test stack overflow and post-connection teardown
+reason, two further calls (one in each direction) passed the same transport and
+codec checks, bringing the total to **nine** successful calls. Pairing survived
+the firmware flash. Fifteen subsequent Ring Tests completed without a reset;
+the ring worker retained at least 5,932 bytes of its 8,192-byte stack. The user
+confirmed consistent audible playback.
+
+See the [hardware results and remaining issues](../../docs/esp32-webrtc-interoperability.md#live-hardware-verification)
+for counters, ESP32 memory observations, the corrected teardown reason and
+Ring Test stack regression, and the remaining skipped transmit slots. This
+verifies encoded media transport; microphone streaming and received-audio playback remain
+unfinished. Preserve both endpoint logs when repeating the procedure above.

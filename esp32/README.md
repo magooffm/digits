@@ -227,7 +227,8 @@ does not establish runtime memory use; `idf.py size` reports the static footprin
 
 ### Verification and remaining limits
 
-All three configurations build with ESP-IDF 5.5.3 and the locked components:
+Before the Ring Test and teardown corrections, all three configurations built
+with ESP-IDF 5.5.3 and the locked components:
 
 | Configuration | Application binary |
 | --- | --- |
@@ -235,10 +236,16 @@ All three configurations build with ESP-IDF 5.5.3 and the locked components:
 | KEY1 press-to-record | 1,185,328 bytes |
 | Two-second boot recording | 1,183,088 bytes |
 
-Each fits the 4 MiB application partition with 72% remaining. The default
-linker report uses 138,711 bytes of DIRAM, leaving 203,049 bytes in that linker
+Each fit the 4 MiB application partition with 72% remaining. The earlier default
+linker report used 138,711 bytes of DIRAM, leaving 203,049 bytes in that linker
 region, plus 16,384 bytes of dedicated IRAM. These figures describe static
 sections, not free heap after Wi-Fi, task creation or a DTLS handshake.
+
+The corrected build using a separate copy of the supplied configuration, with
+KEY1 hold-to-record enabled to match the already flashed board, also passes
+with ESP-IDF 5.5.3: its application is 1,185,200 bytes (`0x1215b0`), leaving
+72% of the 4 MiB app partition free. The other two configurations' figures
+above are historical; their corrected-build sizes are not recorded here.
 
 The worker and WebSocket tests compile the complete production sources against
 real cJSON and the installed peer headers, with deterministic peer/RTOS/transport
@@ -251,14 +258,19 @@ python3 esp32/tests/signaling_webrtc_test.py --idf-path "$IDF_PATH"
 python3 esp32/tests/signaling_webrtc_test.py --idf-path "$IDF_PATH" --sanitize
 ```
 
-The 41 peer lifecycle cases and 12 WebSocket transport cases pass both normal
+The 45 peer lifecycle cases and 12 WebSocket transport cases pass both normal
 and AddressSanitizer/UndefinedBehaviorSanitizer runs. Existing Ring Test deadline,
 microphone capture, recorded playback and KEY1 worker regression checks also
 pass. Host tests verify sequencing and resource ownership; the peer mock does
 not perform ICE, DTLS or SRTP negotiation.
 
-When an existing Digits/Pion handset is available, put both devices on the same
-LAN in an authorized Digits family, with working registration:
+The added teardown regressions fail against the original implementation. They
+verify that transport failures after connection send ordinary `hangup`, while
+setup failures retain `connect_timeout`.
+
+For subsequent hardware checks, use an existing Digits/Pion handset or the
+[Pion test helper](../tools/interop/README.md), with both endpoints on the same
+LAN in an authorized Digits family and working registration:
 
 1. Boot the ESP32 and enter `webrtc status`. Confirm signaling is online,
    paired is yes and the peer is idle.
@@ -288,10 +300,77 @@ could not be established. Do not treat this milestone as verified peer identity
 authentication or production readiness. No server or peer-library workaround
 was introduced.
 
-**Physical WebRTC interoperability is not yet verified.** No Pion endpoint is
-currently available. Successful builds and host lifecycle tests do not establish
-an ICE, DTLS/SRTP or media connection on the Waveshare board, nor concurrent
-audio quality or runtime heap/stack limits.
+**Nine LAN calls have verified hardware interoperability on 2026-10-11
+(Europe/Berlin): seven before the corrections and two afterward.**
+The initial board firmware (`7b94a10-dirty`, ESP-IDF 5.5.3, `esp_peer` 1.5.7)
+and the Fedora 44 Pion helper completed four Pion-to-ESP32 and three
+ESP32-to-Pion calls through the unchanged Digits deployment, including a
+successful call after manually reconnecting Pion with the saved identity.
+Every call connected, received SRTP-protected Opus in both directions and
+returned both peers to idle. Pion's encode/decode/write error counters stayed
+at zero; no board reboot or crash was observed during those seven calls.
+Existing microphone capture and level diagnostics continued throughout the calls.
+
+After warmup, idle internal free memory stayed around 166,200–166,400 bytes,
+PSRAM free returned to 8,362,080 bytes and minimum peer-worker stack headroom
+was 11,408 bytes. This measurement covers the WebRTC worker only, not the
+separate `digits_ring` worker. This short run does not prove absence of leaks.
+The initial firmware mislabeled post-connection transport closure as
+`connect_timeout`; the corrected behavior is recorded below. Approximately
+21.5% of send slots were locally skipped in one first-call status sample
+(1,222 submitted, 334 skipped, zero blocked) with Wi-Fi RSSI around -90 dBm.
+Skipped slots are not a network-loss measurement. See the
+[hardware verification record](../docs/esp32-webrtc-interoperability.md#live-hardware-verification)
+for endpoint versions, packet counters and resource observations. Audible call
+audio, concurrent Ring Test/recorded playback, ESP32 network-loss recovery and
+long-duration stability remain unverified.
+
+**The initial firmware's subsequent Ring Test smoke check failed.** At uptime 1,033,603 ms,
+`Playing 1s speaker test` was followed by a `digits_ring` stack-overflow panic,
+a corrupted backtrace and a software reset. Repeated requests produced five
+such panics in the capture, with one intervening Ring Test completing normally;
+the user heard the tone only on some presses. The board retained number
+`3140001` and reconnected after reset. This failed the initial firmware's smoke
+check while preserving its bounded seven-call LAN transport result.
+
+The corrected firmware (SHA-256 prefix `6970a82cf`) has been flashed using the
+separate private configuration copy described above. The supplied `sdkconfig`
+selected recording disabled and was left unchanged; the copy enabled KEY1
+hold-to-record to preserve the already flashed board's behavior. Bootloader,
+application and partition table were updated without erasing NVS; the original
+hardware ID and number `3140001` were retained. One further call in each
+direction established host ICE, DTLS/SRTP and bidirectional Opus reception,
+with zero Pion codec/write errors, and returned both endpoints to idle.
+Pion's 48 kHz Opus negotiation uses two SDP channels; received ESP32 silence
+decodes into 960 mono samples per 20 ms frame. A Pion hangup reproduced DTLS
+closure before signaling hangup; ESP32 logged `peer transport failed` and now
+sends ordinary `hangup` without `connect_timeout`. An ESP32 local hangup was
+received by Pion with an empty reason.
+
+After those two calls, idle internal free memory was 160,315 bytes, internal
+minimum was 116,123 bytes, largest internal block was 63,488 bytes and PSRAM
+free was 8,362,080 bytes. Peer-worker stack headroom was 11,432 bytes. These
+corrected-build measurements are separate from the initial seven-call values
+and do not measure the Ring Test worker's stack.
+
+The Ring Test correction moves its 1,920-byte PCM block off the worker stack
+into static storage and increases the stack from 4,096 to 8,192 bytes. Host
+checks pass. After both corrected-build calls, 15 hardware Ring Tests reached
+their normal stop logs between boot uptimes 148,103 and 185,893 ms, with no
+stack overflow, panic or further reset after the initial USB reset. Minimum
+Ring Test worker stack headroom was 5,932 bytes of its 8,192-byte stack.
+Playback queued 47,520 or 48,000 frames within the existing deadline;
+maximum render time was 218 microseconds and maximum producer gap was
+219 microseconds, against a 10,000-microsecond DMA block.
+
+At uptime 196,223 ms and the final USB status at 262,183 ms, the board remained
+online, paired and idle with internal
+free memory of 160,339 bytes; internal minimum, largest block, PSRAM free and
+peer-worker stack headroom matched the post-call values above.
+**The repeated Ring Test hardware check passed:** the user confirmed a
+consistently audible tone on every WebUI button press. These 15 completed
+playbacks are a bounded short retest, not a long-duration firmware stability result.
+Live microphone encoding and received-audio playback remain unfinished.
 
 ## Ring Test contract
 
@@ -951,8 +1030,13 @@ The user subsequently applied the static-directory bind and confirmed the
 WebUI Ring Test button works. These earlier hardware results exercised the
 16 kHz speaker-only firmware. The user has also confirmed an audible Ring Test
 on the later 48 kHz KEY1 microphone firmware while investigating quiet saved
-recordings. Re-run Ring Test and heartbeat checks after the playback gain
-adjustment; its saved-speech acoustic result remains to be verified.
+recordings. Later testing on 2026-10-11 exposed repeated `digits_ring` stack
+overflows and resets after seven successful WebRTC calls, as recorded in the
+[live hardware results](#verification-and-remaining-limits). Those earlier
+audible tests do not establish current Ring Test reliability. Repeat Ring Test
+and heartbeat checks on the corrected firmware now flashed. Fifteen subsequent
+Ring Tests completed without a stack panic, and the user confirmed consistent
+audible tones. The saved-speech acoustic result remains pending.
 
 Host PCM checks (no ESP-IDF needed), from the repo root:
 
@@ -966,14 +1050,17 @@ cc -std=c11 -Wall -Wextra -Werror -I esp32/main \
 Host DMA/deadline regression (requires Python 3 and a host C compiler):
 
 ```sh
-python3 esp32/tests/ring_deadline_test.py
+python3 esp32/tests/ring_deadline_test.py --stack-usage
 ```
 
 This compiles the actual worker bodies with a 100 Hz scheduler/DMA model,
-sweeps 70 timing phases/setup delays, and checks that genuine mid-playback
-stalls still fail while ordinary final completion stops without an error.
-It also checks overlap coalescing and subsequent playback. It does not
-establish physical I2C timing or replace the board test above.
+sweeps 70 DMA timing phases/setup delays and 40 producer-preemption cases, and
+checks that genuine mid-playback stalls still fail while ordinary final
+completion stops without an error. It also checks overlap coalescing and
+subsequent playback. With the static PCM block, the host compiler reports a
+160-byte worker frame versus 2,096 bytes previously. This measures only the
+worker's own host stack frame; it does not establish nested driver stack use,
+physical I2C timing or replace the board test above.
 
 ## Expected console sequence
 

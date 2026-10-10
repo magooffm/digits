@@ -11,6 +11,8 @@ repo = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description='Ring Test DMA/tick and producer-budget regression')
 parser.add_argument('--source', type=Path, default=repo / 'esp32/main/ring_test.c')
 parser.add_argument('--expect-bug', action='store_true', help='Verify a pre-deadline-fix source snapshot')
+parser.add_argument('--stack-usage', action='store_true',
+                    help='Use GCC stack reports to bound the worker host frame to 1 KiB; not ESP32 total stack use')
 args = parser.parse_args()
 source = args.source.read_text()
 bodies = source[source.index('static bool silence_output(void)'):source.index('static void release_audio(void)')]
@@ -41,6 +43,7 @@ typedef unsigned TickType_t;
 #define ESP_LOGW(tag, ...) log_warn(__VA_ARGS__)
 #define ESP_LOGE(tag, fmt, ...) log_error(fmt)
 static const char *esp_err_to_name(int err) {return "fake";}
+static unsigned uxTaskGetStackHighWaterMark(void *task) { assert(!task); return 4096; }
 static struct {void *device; void *tx; void *requests;} audio;
 static struct {void *device; void *tx;} board = {(void *)1, (void *)1};
 static bool digits_audio_speaker_silence(void);
@@ -327,7 +330,19 @@ with tempfile.TemporaryDirectory(prefix='digits-ring-deadline-') as directory:
     test = Path(directory) / 'ring_deadline_test.c'
     test.write_text(prefix + '\n' + defines + '\n' + silence + '\n' + bodies + suffix)
     binary = test.with_suffix('')
-    subprocess.run(['cc', '-std=c11', '-I', str(repo / 'esp32/main'),
-                    str(test), str(repo / 'esp32/main/ring_tone.c'),
-                    '-lm', '-o', str(binary)], check=True)
+    command = ['cc', '-std=c11', '-I', str(repo / 'esp32/main'),
+               str(test), str(repo / 'esp32/main/ring_tone.c'),
+               '-lm', '-o', str(binary)]
+    if args.stack_usage:
+        command.insert(1, '-fstack-usage')
+    subprocess.run(command, check=True)
+    if args.stack_usage:
+        # This catches a large automatic PCM block in the real worker body.
+        # It does not include nested IDF/codec/log calls or the ESP32 ABI.
+        reports = '\n'.join(path.read_text() for path in Path(directory).glob('*.su'))
+        usage = re.search(r':ring_worker\s+(\d+)\s+static', reports)
+        assert usage, 'Compiler did not produce a static ring_worker stack report'
+        frame_bytes = int(usage.group(1))
+        print(f'Ring worker host static frame: {frame_bytes} bytes (limit 1024; not hardware stack high-water)')
+        assert frame_bytes <= 1024, 'Ring worker automatic frame leaves too little task stack for driver/log calls'
     subprocess.run([str(binary)] + (['expect-bug'] if args.expect_bug else []), check=True)

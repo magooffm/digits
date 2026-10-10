@@ -292,6 +292,13 @@ static void end_call(bool notify, const char *reason)
     report_resources("Peer released");
 }
 
+static void end_failed_call(void)
+{
+    // Remote transport closure can precede its signaling hangup. Once media
+    // connected, retain the local diagnostic without failed-call treatment.
+    end_call(true, rtc.call.phase == CALL_CONNECTED ? rtc.call.failure : "connect_timeout");
+}
+
 static int on_peer_state(esp_peer_state_t state, void *context)
 {
     (void)context;
@@ -727,7 +734,7 @@ static void peer_task(void *context)
             process_event(event);
             free_event(event);
             refresh_transport();
-            if (rtc.call.failure) end_call(true, "connect_timeout");
+            if (rtc.call.failure) end_failed_call();
         }
         if (rtc.call.peer && current_transport()) {
             int ret = esp_peer_main_loop(rtc.call.peer);
@@ -737,7 +744,7 @@ static void peer_task(void *context)
         int64_t now = esp_timer_get_time();
         if (rtc.call.failure) {
             ESP_LOGW(TAG, "Peer failure: %s", rtc.call.failure);
-            end_call(true, "connect_timeout");
+            end_failed_call();
         } else if (rtc.call.deadline_us && now >= rtc.call.deadline_us) {
             end_call(true, rtc.call.phase == CALL_CONNECTING ? "connect_timeout" : "ringing timeout");
         } else {

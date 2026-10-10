@@ -806,6 +806,43 @@ static void test_timeouts(void)
     }
 }
 
+static void test_failure_hangup_reasons(void)
+{
+    for (unsigned connected = 0; connected < 2; ++connected) {
+        for (unsigned event_failure = 0; event_failure < 2; ++event_failure) {
+            setup();
+            start_outgoing();
+            apply_answer();
+            if (connected) connect_peer();
+            if (event_failure) {
+                // Cover cleanup while draining a late candidate, as well as
+                // cleanup after the peer loop observes remote transport close.
+                candidate_result = ESP_PEER_ERR_BAD_DATA;
+                receive("ice", "1002", "candidate", candidate_text, NULL);
+            } else {
+                in_worker = true;
+                assert(emit_peer_state(ESP_PEER_STATE_DISCONNECTED) == 0);
+                in_worker = false;
+            }
+            pump(1);
+            assert(!peer_opened && rtc.call.phase == CALL_IDLE && close_calls == 1);
+            assert(wires_of_type("hangup") == 1);
+            cJSON *hangup = wire_message(wire_count - 1, "hangup");
+            if (connected) assert(json_text(hangup, "reason") == NULL);
+            else assert(!strcmp(json_text(hangup, "reason"), "connect_timeout"));
+            cJSON_Delete(hangup);
+            // In the observed call, DTLS closure preceded signaling hangup.
+            // That later message must neither close twice nor echo a hangup.
+            unsigned sent = wire_count;
+            receive("hangup", "1002", NULL, NULL, NULL);
+            pump(1);
+            assert(close_calls == 1 && wire_count == sent);
+            finish();
+            ++cases;
+        }
+    }
+}
+
 static void test_candidate_limits_and_ownership(void)
 {
     setup();
@@ -1134,6 +1171,7 @@ int main(void)
     test_disconnect_during_dtls();
     test_teardown_events();
     test_timeouts();
+    test_failure_hangup_reasons();
     test_candidate_limits_and_ownership();
     test_overflow_and_copy_failure();
     test_library_and_transmit_failures();

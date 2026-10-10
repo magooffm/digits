@@ -10,6 +10,7 @@
 #define PCM_BLOCK_FRAMES DIGITS_AUDIO_DMA_FRAMES
 #define TEST_DURATION_US 1000000LL
 #define TEST_VOLUME 50
+#define RING_WORKER_STACK_BYTES 8192
 
 static struct { QueueHandle_t requests; } audio;
 
@@ -20,7 +21,9 @@ static bool silence_output(void)
 
 static void ring_worker(void *arg)
 {
-    int16_t pcm[PCM_BLOCK_FRAMES * 2];
+    // One boot-lifetime worker owns this block. Keep the 1920-byte PCM buffer
+    // off its stack, leaving headroom for nested driver and logging calls.
+    static int16_t pcm[PCM_BLOCK_FRAMES * 2];
     // IDF converts write milliseconds to ticks, rounding down. Allow one DMA
     // block plus a whole tick of scheduling margin before admitting a write.
     const uint32_t dma_ticks = (PCM_BLOCK_FRAMES * configTICK_RATE_HZ +
@@ -92,6 +95,11 @@ static void ring_worker(void *arg)
         if (max_render_us >= block_us || max_feed_gap_us >= block_us)
             ESP_LOGW("ring_test", "PCM producer exceeded one audio block; DMA gaps are possible");
         digits_audio_speaker_release();
+        // ESP-IDF reports this high-water minimum in bytes. Measure after the
+        // playback/stop path; host frame reports exclude its nested calls.
+        ESP_LOGI("ring_test", "Worker stack minimum free=%u bytes (allocation=%u bytes)",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                 (unsigned)RING_WORKER_STACK_BYTES);
     }
 }
 
@@ -109,7 +117,8 @@ esp_err_t digits_ring_test_init(void)
     // The real-time renderer then performs only bounded integer table copies.
     ring_tone_init();
     audio.requests = xQueueCreate(1, sizeof(int64_t));
-    if (!audio.requests || xTaskCreate(ring_worker, "digits_ring", 4096, NULL, 4, NULL) != pdPASS) {
+    if (!audio.requests || xTaskCreate(ring_worker, "digits_ring", RING_WORKER_STACK_BYTES,
+                                      NULL, 4, NULL) != pdPASS) {
         release_audio();
         return ESP_ERR_NO_MEM;
     }
