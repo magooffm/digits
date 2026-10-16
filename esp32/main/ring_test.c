@@ -42,7 +42,7 @@ static void ring_worker(void *arg)
             continue;
         }
         if (!digits_audio_speaker_acquire(0)) {
-            ESP_LOGW("ring_test", "Speaker reserved by microphone record/playback test; Ring Test skipped");
+            ESP_LOGW("ring_test", "Speaker reserved by another audio worker; Ring Test skipped");
             continue;
         }
         int64_t deadline = esp_timer_get_time() + TEST_DURATION_US;

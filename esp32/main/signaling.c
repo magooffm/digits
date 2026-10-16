@@ -1,5 +1,7 @@
 #include "signaling.h"
 #include "ring_test.h"
+#include "incoming_ring.h"
+#include "line_settings.h"
 #include "webrtc.h"
 #include "webrtc_console.h"
 #include "wifi.h"
@@ -84,6 +86,7 @@ static void discard_outbound(void)
 static void transport_down(signaling_t *s)
 {
     outbound_set(s->session, false);
+    digits_settings_transport(s->session, false);
     digits_webrtc_transport(s->session, false, NULL, false);
 }
 
@@ -157,12 +160,20 @@ static void dispatch_message(signaling_t *s)
             if (err == ESP_OK) {
                 *s->credentials = next;
                 ESP_LOGI("signaling", "%s persisted: number=%s; reconnecting", type, next.number);
+                transport_down(s);
                 xEventGroupSetBits(s->events, CREDENTIALS_CHANGED);
             } else {
                 ESP_LOGE("signaling", "%s persistence failed: %s; stopping automatic retries", type, esp_err_to_name(err));
+                transport_down(s);
                 xEventGroupSetBits(s->events, STORAGE_FAILED);
             }
         }
+    } else if (strcmp(type, "line_settings") == 0) {
+        // Only bounded validation/RAM publication here. The settings worker
+        // persists separately; publishing before the following ring message
+        // preserves the server's settings-before-call ordering.
+        if (digits_settings_receive(json, s->session))
+            digits_incoming_ring_set_silent(digits_settings_silent());
     } else if (strcmp(type, "ring_test") == 0) {
         digits_ring_test_request();
     } else if (strcmp(type, "error") == 0) {
@@ -219,6 +230,7 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t id, void *
             // Pairing messages still arrive on the unpaired registration, but
             // peer call traffic requires a registration with a stored token.
             outbound_set(s->session, s->credentials->device_token[0] != 0);
+            digits_settings_transport(s->session, s->credentials->device_token[0] != 0);
             digits_webrtc_transport(s->session, true, s->credentials->number,
                                     s->credentials->device_token[0] != 0);
         }

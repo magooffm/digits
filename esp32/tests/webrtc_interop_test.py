@@ -129,6 +129,8 @@ prefix = r'''
 #include "esp_peer_default.h"
 #include "webrtc.h"
 #include "call_audio.h"
+#include "line_settings.h"
+#include "incoming_ring.h"
 
 static int64_t host_now;
 static jmp_buf worker_boundary;
@@ -158,6 +160,10 @@ static unsigned media_receive_calls, media_pop_calls, media_record_calls;
 static esp_err_t media_start_result;
 static digits_call_audio_state_t media_initial_state;
 static bool media_stop_completes;
+static bool ring_stopped = true, ring_stop_completes, settings_busy;
+static unsigned ring_starts, ring_stops;
+static uint32_t last_ring_id;
+static digits_line_settings_t settings;
 static int64_t main_loop_delay_us;
 struct digits_call_audio {
     bool live;
@@ -223,6 +229,27 @@ static int emit_peer_state(esp_peer_state_t state)
 '''
 
 runtime = r'''
+void digits_settings_get(digits_line_settings_t *snapshot, digits_settings_stats_t *stats)
+{
+    if (snapshot) *snapshot = settings;
+    if (stats) memset(stats, 0, sizeof(*stats));
+}
+void digits_settings_set_media_busy(bool busy) { settings_busy = busy; }
+void digits_incoming_ring_start(uint32_t id)
+{
+    assert(in_worker && id && id != last_ring_id);
+    last_ring_id = id;
+    ++ring_starts;
+    ring_stopped = false;
+}
+void digits_incoming_ring_stop(void)
+{
+    assert(in_worker);
+    ++ring_stops;
+    if (ring_stop_completes) ring_stopped = true;
+}
+bool digits_incoming_ring_is_stopped(void) { return ring_stopped; }
+
 struct host_queue {
     unsigned length, size, head, count;
     unsigned char *items;
@@ -486,7 +513,7 @@ int esp_peer_close(esp_peer_handle_t peer)
 
 esp_err_t digits_call_audio_start(digits_call_audio_mode_t mode, digits_call_audio_t **out)
 {
-    assert(in_worker && out && !media.live);
+    assert(in_worker && out && !media.live && ring_stopped);
     assert(mode >= DIGITS_CALL_AUDIO_TX && mode <= DIGITS_CALL_AUDIO_FULL);
     ++media_start_calls;
     add_trace("media:start");
@@ -663,6 +690,10 @@ static void setup(void)
     media_start_result = ESP_OK;
     media_initial_state = DIGITS_CALL_AUDIO_READY;
     media_stop_completes = true;
+    ring_stopped = ring_stop_completes = true;
+    settings_busy = false;
+    ring_starts = ring_stops = last_ring_id = 0;
+    memset(&settings, 0, sizeof(settings));
     main_loop_delay_us = 0;
     last_worker_wait = largest_connected_wait = 0;
     memset(&media, 0, sizeof(media));
@@ -698,6 +729,7 @@ static void finish(void)
     pump(1);
     assert(!peer_opened && rtc.call.phase == CALL_IDLE && rtc.call.peer == NULL);
     assert(!media.live && !rtc.stopping_audio);
+    assert(ring_stopped && !settings_busy);
     assert(!rtc.call.offer && !rtc.call.candidate_count);
     assert(!rtc.call.remote_sdp_text && !rtc.call.server_count);
     assert(rtc.ice_count == 0 && rtc.queue->count == 0);
@@ -1516,6 +1548,84 @@ static void test_peer_loop_timing_diagnostics(void)
     ++cases;
 }
 
+static void test_ringtone_answer_ownership(void)
+{
+    setup();
+    receive("ring", "1002", NULL, NULL, NULL);
+    pump(1);
+    assert(ring_starts == 1 && !ring_stopped && settings_busy);
+    receive("sdp", "1002", "sdp", local_sdp_text, NULL);
+    pump(1);
+    ring_stop_completes = false;
+    command("answer", NULL);
+    pump(2);
+    assert(rtc.call.phase == CALL_RINGING && rtc.call.answer_requested);
+    assert(!peer_opened && !media_start_calls && ring_stops == 1);
+    // The worker stays responsive while the speaker owner's bounded write ends.
+    command("status", NULL);
+    pump(1);
+    assert(!peer_opened);
+    ring_stopped = true;
+    ring_stop_completes = true;
+    pump(1);
+    assert(rtc.call.phase == CALL_CONNECTING && peer_opened);
+    connect_peer();
+    assert(settings_busy && ring_starts == 1);
+    // Publishing settings while established never changes media or call state.
+    settings.silent_mode = true;
+    settings.voice_style = DIGITS_VOICE_MODERN;
+    settings.auto_update = settings.voicemail_enabled = true;
+    command("status", NULL);
+    pump(1);
+    assert(rtc.call.phase == CALL_CONNECTED && media_start_calls == 1 && !media_stop_calls);
+    settings.silent_mode = false;
+    pump(1);
+    assert(ring_starts == 1 && media.live);
+    media_stop_completes = false;
+    command("hangup", NULL);
+    pump(1);
+    assert(rtc.call.phase == CALL_IDLE && settings_busy && rtc.stopping_audio);
+    media.stats.state = DIGITS_CALL_AUDIO_STOPPED;
+    pump(1);
+    assert(!settings_busy && !rtc.stopping_audio);
+    finish();
+    ++cases;
+}
+
+static void test_ringtone_terminal_cleanup(void)
+{
+    for (unsigned terminal = 0; terminal < 3; ++terminal) {
+        setup();
+        receive("ring", "1002", NULL, NULL, NULL);
+        pump(1);
+        assert(ring_starts == 1);
+        ring_stop_completes = false;
+        if (terminal == 0) command("hangup", NULL);
+        else if (terminal == 1) host_now = rtc.call.deadline_us + 1;
+        else digits_webrtc_transport(peer_session, false, "1001", true);
+        pump(1);
+        assert(rtc.call.phase == CALL_IDLE && !ring_stopped && settings_busy);
+        if (terminal == 2) {
+            ++peer_session;
+            digits_webrtc_transport(peer_session, true, "1001", true);
+            pump(1);
+        }
+        command("call", "1002");
+        receive("ring", "1002", NULL, NULL, NULL);
+        pump(1);
+        assert(rtc.call.phase == CALL_IDLE && !peer_opened && ring_starts == 1);
+        ring_stopped = true;
+        ring_stop_completes = true;
+        pump(1);
+        assert(!settings_busy);
+        receive("ring", "1002", NULL, NULL, NULL);
+        pump(1);
+        assert(rtc.call.phase == CALL_RINGING && ring_starts == 2 && last_ring_id == 2);
+        finish();
+        ++cases;
+    }
+}
+
 int main(void)
 {
     test_initialization_failures();
@@ -1543,6 +1653,8 @@ int main(void)
     test_audio_modes_and_offline_control();
     test_async_audio_stop_and_repeated_calls();
     test_peer_loop_timing_diagnostics();
+    test_ringtone_answer_ownership();
+    test_ringtone_terminal_cleanup();
     printf("WebRTC adapter: %u real-worker lifecycle cases passed (mock peer; physical interoperability unverified)\n", cases);
     return 0;
 }

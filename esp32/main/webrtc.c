@@ -12,6 +12,8 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "call_audio.h"
+#include "incoming_ring.h"
+#include "line_settings.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -70,6 +72,7 @@ static struct {
     bool ice_received;
     digits_call_audio_mode_t audio_mode;
     digits_call_audio_t *stopping_audio;
+    uint32_t next_ring_id;
     call_audio_packet_t send_packet;
     struct {
         esp_peer_handle_t peer;
@@ -161,6 +164,8 @@ static void reap_audio(void)
             report_resources("Audio released");
         }
     }
+    digits_settings_set_media_busy(rtc.call.phase != CALL_IDLE || rtc.stopping_audio ||
+                                   !digits_incoming_ring_is_stopped());
 }
 
 static const char *peer_state_name(esp_peer_state_t state)
@@ -330,6 +335,7 @@ static void report_resources(const char *where)
 static void end_call(bool notify, const char *reason)
 {
     if (rtc.call.phase == CALL_IDLE && !rtc.call.peer) return;
+    digits_incoming_ring_stop();
     ESP_LOGI(TAG, "Ending one-to-one call peer=%s reason=%s tx=%" PRIu32 " rx=%" PRIu32,
              rtc.call.remote, reason ? reason : "local", rtc.call.tx_packets, rtc.call.rx_packets);
     if (notify && rtc.call.remote[0])
@@ -575,9 +581,15 @@ static void answer_incoming(void)
         ESP_LOGW(TAG, "No incoming call to answer");
         return;
     }
+    bool first_request = !rtc.call.answer_requested;
     rtc.call.answer_requested = true;
+    digits_incoming_ring_stop();
     if (!rtc.call.offer) {
-        ESP_LOGI(TAG, "Answer requested; waiting for caller SDP");
+        if (first_request) ESP_LOGI(TAG, "Answer requested; waiting for caller SDP");
+        return;
+    }
+    if (!digits_incoming_ring_is_stopped()) {
+        if (first_request) ESP_LOGI(TAG, "Answer requested; waiting for ringtone speaker release");
         return;
     }
     rtc.call.phase = CALL_CONNECTING;
@@ -627,20 +639,37 @@ static void process_event(event_t *event)
 {
     if (event->epoch != rtc.owner_transport.epoch || event->session != rtc.owner_transport.session) return;
     if (event->kind == COMMAND_STATUS) {
+        digits_line_settings_t settings;
+        digits_settings_stats_t settings_stats;
+        digits_settings_get(&settings, &settings_stats);
         ESP_LOGI(TAG, "Status: signaling=%s paired=%s peer=%s codec_info=%s tx=%" PRIu32 " rx=%" PRIu32,
                  rtc.owner_transport.online ? "online" : "offline",
                  rtc.owner_transport.paired ? "yes" : "no", phase_name(rtc.call.phase),
                  rtc.call.audio_info ? "received" : "pending", rtc.call.tx_packets, rtc.call.rx_packets);
         report_resources("Status");
         ESP_LOGI(TAG, "Audio mode=%s cleanup_pending=%s peer_loop_max_us=%" PRIu32 " peer_loops_over_20ms=%" PRIu32,
-                 audio_mode_name(rtc.audio_mode), rtc.stopping_audio ? "yes" : "no",
+                 audio_mode_name(rtc.audio_mode), rtc.stopping_audio ||
+                 (rtc.call.phase != CALL_RINGING && !digits_incoming_ring_is_stopped()) ? "yes" : "no",
                  rtc.call.max_peer_loop_us, rtc.call.slow_peer_loops);
+        ESP_LOGI(TAG, "Settings: effective_silent=%s voice_style=%s auto_update=%s voicemail=%s timeout=%us (voice/auto/voicemail cached only)",
+                 settings.silent_mode ? "yes" : "no",
+                 settings.voice_style == DIGITS_VOICE_MODERN ? "modern" : "copper",
+                 settings.auto_update ? "yes" : "no", settings.voicemail_enabled ? "yes" : "no",
+                 (unsigned)settings.voicemail_ring_timeout_seconds);
+        ESP_LOGI(TAG, "Settings storage: loaded=%s dirty=%s revision=%" PRIu32 " writes=%" PRIu32 " errors=%" PRIu32 " load=%s last_write=%s; ringtone_worker_busy=%s",
+                 settings_stats.loaded ? "yes" : "no", settings_stats.dirty ? "yes" : "no",
+                 settings_stats.revision, settings_stats.writes, settings_stats.write_errors,
+                 esp_err_to_name(settings_stats.load_error), esp_err_to_name(settings_stats.last_write_error),
+                 digits_incoming_ring_is_stopped() ? "no" : "yes");
+        ESP_LOGI(TAG, "Settings receive: accepted=%" PRIu32 " duplicates=%" PRIu32 " invalid=%" PRIu32 " stale=%" PRIu32 " persistence_deferred=%s",
+                 settings_stats.accepted, settings_stats.duplicates, settings_stats.invalid,
+                 settings_stats.stale, settings_stats.media_busy ? "yes" : "no");
         report_call_audio(rtc.call.audio ? rtc.call.audio : rtc.stopping_audio);
         if (rtc.call.peer) esp_peer_query(rtc.call.peer);
         return;
     }
     if (event->kind == COMMAND_AUDIO) {
-        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio) {
+        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio || !digits_incoming_ring_is_stopped()) {
             ESP_LOGW(TAG, "Audio mode change requires idle with completed cleanup");
             return;
         }
@@ -671,11 +700,13 @@ static void process_event(event_t *event)
         return;
     }
     if (event->kind == COMMAND_CALL) {
-        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio || strcmp(event->from, rtc.owner_transport.number) == 0) {
+        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio || !digits_incoming_ring_is_stopped() ||
+            strcmp(event->from, rtc.owner_transport.number) == 0) {
             ESP_LOGW(TAG, "Call requires an idle device and a different destination");
             return;
         }
         strcpy(rtc.call.remote, event->from);
+        digits_settings_set_media_busy(true);
         rtc.call.phase = CALL_CALLING;
         rtc.call.caller = true;
         rtc.call.deadline_us = esp_timer_get_time() + RING_TIMEOUT_US;
@@ -689,7 +720,7 @@ static void process_event(event_t *event)
     if (event->kind == COMMAND_HANGUP) { end_call(true, "local hangup"); return; }
     if (event->kind == EVENT_RING) {
         if (!event->from[0]) return;
-        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio) {
+        if (rtc.call.phase != CALL_IDLE || rtc.stopping_audio || !digits_incoming_ring_is_stopped()) {
             // Upstream ordinary hangup ends every call for this line; To does
             // not scope it. Never reject a foreign ring by hanging up this call.
             if (strcmp(event->from, rtc.call.remote) != 0)
@@ -697,10 +728,13 @@ static void process_event(event_t *event)
             return;
         }
         strcpy(rtc.call.remote, event->from);
+        digits_settings_set_media_busy(true);
         rtc.call.phase = CALL_RINGING;
         rtc.call.deadline_us = esp_timer_get_time() + RING_TIMEOUT_US;
         ESP_LOGI(TAG, "Incoming call from %s; use 'webrtc answer' or 'webrtc hangup'",
                  rtc.call.remote);
+        if (++rtc.next_ring_id == 0) ++rtc.next_ring_id;
+        digits_incoming_ring_start(rtc.next_ring_id);
 #if CONFIG_DIGITS_WEBRTC_AUTO_ANSWER
         answer_incoming();
 #endif
@@ -752,6 +786,9 @@ static void service_audio(int64_t now)
 {
     (void)now;
     if (rtc.call.phase != CALL_CONNECTED || !current_transport()) return;
+    // A stopped ringer must acknowledge all outstanding speaker operations
+    // before a codec worker can claim the output. Never wait in the peer task.
+    if (!digits_incoming_ring_is_stopped()) return;
     if (!rtc.call.audio) {
         esp_err_t err = digits_call_audio_start(rtc.audio_mode, &rtc.call.audio);
         if (err != ESP_OK) {
@@ -835,6 +872,9 @@ static void peer_task(void *context)
             refresh_transport();
             if (rtc.call.failure) end_failed_call();
         }
+        if (current_transport() && rtc.call.phase == CALL_RINGING && rtc.call.answer_requested &&
+            rtc.call.offer && digits_incoming_ring_is_stopped())
+            answer_incoming();
         if (rtc.call.peer && current_transport()) {
             int64_t before = esp_timer_get_time();
             bool connected = rtc.call.phase == CALL_CONNECTED;
@@ -867,7 +907,8 @@ static void peer_task(void *context)
         }
         // The short socket timeout already paces the owner. One tick permits
         // codec tasks to run without adding the old unconditional 10 ms delay.
-        ulTaskNotifyTake(pdTRUE, rtc.call.peer || rtc.stopping_audio ? 1 : pdMS_TO_TICKS(10));
+        ulTaskNotifyTake(pdTRUE, rtc.call.peer || rtc.stopping_audio ||
+                        !digits_incoming_ring_is_stopped() ? 1 : pdMS_TO_TICKS(10));
     }
 }
 

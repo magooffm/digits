@@ -131,6 +131,9 @@ static struct fake_client clients[4];
 static unsigned client_count, stops, destroys, waits, wait_begin, wifi_waits;
 static unsigned callback_depth, critical_depth, atomic_publications;
 static unsigned peer_up, peer_down, peer_received, ring_requests, saves, console_starts;
+static unsigned settings_receives, silent_publications;
+static uint32_t settings_session;
+static bool settings_ready, effective_silent;
 static unsigned json_live, tests;
 static bool last_paired, inject_during_register, owner_running;
 static bool register_fail, peer_write_fail, peer_init_fail;
@@ -348,6 +351,28 @@ esp_err_t credentials_save(const digits_credentials_t *credentials)
     return save_result;
 }
 void digits_ring_test_request(void) { assert(callback_depth == 1); ++ring_requests; }
+void digits_settings_transport(uint32_t session, bool ready)
+{
+    settings_session = session;
+    settings_ready = ready;
+}
+bool digits_settings_receive(const cJSON *message, uint32_t session)
+{
+    assert(callback_depth == 1 && !critical_depth);
+    ++settings_receives;
+    if (!settings_ready || settings_session != session) return false;
+    // Exact parser/persistence semantics are exercised by line_settings_test.py.
+    const cJSON *body = cJSON_GetObjectItemCaseSensitive(message, "line_settings");
+    if (!cJSON_IsObject(body)) return false;
+    effective_silent = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(body, "silent_mode"));
+    return true;
+}
+bool digits_settings_silent(void) { return effective_silent; }
+void digits_incoming_ring_set_silent(bool silent)
+{
+    assert(callback_depth == 1 && silent == effective_silent);
+    ++silent_publications;
+}
 void digits_wifi_wait_connected(void) { assert(!callback_depth); ++wifi_waits; }
 esp_err_t digits_webrtc_console_start(void) { ++console_starts; return ESP_OK; }
 esp_err_t digits_webrtc_init(digits_webrtc_send_fn send, void *context)
@@ -422,6 +447,8 @@ static void reset(void)
     memset(clients, 0, sizeof(clients));
     client_count = stops = destroys = waits = wait_begin = wifi_waits = 0;
     atomic_publications = peer_up = peer_down = peer_received = ring_requests = saves = console_starts = 0;
+    settings_receives = silent_publications = settings_session = 0;
+    settings_ready = effective_silent = false;
     last_paired = inject_during_register = owner_running = register_fail = peer_write_fail = peer_init_fail = false;
     last_session = received_session = delayed_ticks = 0;
     now_us = 1000000;
@@ -713,6 +740,36 @@ static void test_owner(enum owner_case scenario)
     assert(!outbound.queue->count && logs_used && strstr(logs, "No deliberate reconnect"));
     cleanup(NULL);
 }
+static void test_settings_dispatch_and_session(void)
+{
+    signaling_t s;
+    digits_credentials_t c = credentials(true);
+    setup(&s, &c);
+    connect(&s);
+    assert(settings_ready && settings_session == s.session);
+    text_event(s.client, "{\"type\":\"line_settings\",\"line_settings\":{\"voice_style\":\"modern\",\"silent_mode\":true,\"auto_update\":true}}");
+    assert(effective_silent && settings_receives == 1 && silent_publications == 1);
+    assert(!peer_received && !saves && sent_count == 1); // No new ACK/protocol.
+    text_event(s.client, "{\"type\":\"ring_test\"}");
+    assert(ring_requests == 1 && effective_silent); // Explicit diagnostic ignores mute.
+    text_event(s.client, "{\"type\":\"line_settings\",\"line_settings\":{}}");
+    assert(!effective_silent && silent_publications == 2);
+    emit(s.client, WEBSOCKET_EVENT_DISCONNECTED, NULL);
+    assert(!settings_ready);
+    unsigned applied = silent_publications;
+    text_event(s.client, "{\"type\":\"line_settings\",\"line_settings\":{\"silent_mode\":true}}");
+    assert(silent_publications == applied && !effective_silent);
+    cleanup(&s);
+
+    c = credentials(false);
+    setup(&s, &c);
+    connect(&s);
+    assert(!settings_ready);
+    text_event(s.client, "{\"type\":\"line_settings\",\"line_settings\":{\"silent_mode\":true}}");
+    assert(!silent_publications && !effective_silent);
+    cleanup(&s);
+}
+
 int main(void)
 {
     cJSON_Hooks hooks = {.malloc_fn = json_alloc, .free_fn = json_free};
@@ -724,6 +781,7 @@ int main(void)
     test_fragmented_sdp_and_ping();
     test_dispatch_preserves_existing_paths();
     test_bad_messages_and_callback_ownership();
+    test_settings_dispatch_and_session();
     test_owner(OWNER_RECONNECT);
     test_owner(OWNER_START_FAIL);
     test_owner(OWNER_INIT_FAIL);

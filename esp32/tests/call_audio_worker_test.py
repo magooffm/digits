@@ -8,6 +8,7 @@ concurrent ESP32 scheduling, transport or audible hardware interoperability.
 import argparse
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 repo = Path(__file__).resolve().parents[2]
@@ -439,7 +440,9 @@ with tempfile.TemporaryDirectory(prefix="digits-call-audio-") as temporary:
     (build / "test.c").write_text(harness)
     command = ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-g"]
     if args.sanitize:
-        command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-no-pie"]
+        command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+        if sys.platform.startswith("linux"):
+            command += ["-no-pie"]
     for include in [build, repo / "esp32/main", codec, codec / "encoder", codec / "encoder/impl",
                     codec / "decoder", codec / "decoder/impl"]:
         command += ["-I", str(include)]

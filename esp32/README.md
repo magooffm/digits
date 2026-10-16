@@ -20,6 +20,11 @@ latency remain under assessment. The
 nine-call baseline established encoded transport, and the earlier audible
 Ring Tests checked the local speaker.
 See the [call audio implementation and validation guide](../docs/esp32-call-audio.md).
+Phase 1 now consumes and caches server line settings, adds incoming-call speaker
+ringing, and applies effective Silent Mode/Quiet Hours suppression. See the
+[settings and ringing acceptance guide](../docs/esp32-settings-ringing.md) for
+cache semantics, tests and pending physical acceptance. Voice Style, voicemail
+and Auto Update preferences are cached only in this phase.
 Call buttons, hook handling and handset wiring remain unused.
 The console defaults to the ESP32-S3's native USB Serial/JTAG port.
 
@@ -66,6 +71,10 @@ Default NVS partition, namespace `digits`:
 | --- | --- | --- |
 | `hardware_id` | string | Lowercase UUID v4, 36 characters plus NUL. Generated with `esp_fill_random` after Wi-Fi starts, committed before registration. |
 | `pairing` | blob | 98 bytes: version byte `1`, 32-byte NUL-terminated number, 65-byte NUL-terminated original token. Both strings are saved as a single NVS value, then committed. |
+
+Line settings use a separate namespace `digits_settings`, key `snapshot`, with
+a versioned 12-byte blob. Its asynchronous worker never erases or modifies
+pairing. See the [cache contract](../docs/esp32-settings-ringing.md#exact-settings-and-cache-behavior).
 
 The token is never hashed by the device or printed in application logs.
 Missing `pairing` means unpaired. Existing invalid identity/record or NVS

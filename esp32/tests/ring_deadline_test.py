@@ -334,7 +334,15 @@ with tempfile.TemporaryDirectory(prefix='digits-ring-deadline-') as directory:
                str(test), str(repo / 'esp32/main/ring_tone.c'),
                '-lm', '-o', str(binary)]
     if args.stack_usage:
-        command.insert(1, '-fstack-usage')
+        # Apple Clang can overwrite the first .su when several sources share
+        # one -o executable. Compile separately so both reports survive.
+        objects = []
+        for source in (test, repo / 'esp32/main/ring_tone.c'):
+            obj = Path(directory) / (source.stem + '.o')
+            subprocess.run(['cc', '-std=c11', '-fstack-usage', '-I', str(repo / 'esp32/main'),
+                            '-c', str(source), '-o', str(obj)], check=True)
+            objects.append(str(obj))
+        command = ['cc', *objects, '-lm', '-o', str(binary)]
     subprocess.run(command, check=True)
     if args.stack_usage:
         # This catches a large automatic PCM block in the real worker body.

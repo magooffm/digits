@@ -3,6 +3,10 @@
 Source analysis, 2026-10-14. No feature implementation, firmware flash, deployment,
 or hardware acceptance test was performed for this document.
 
+Subsequent Phase 1 implementation is recorded separately in
+[esp32-settings-ringing.md](esp32-settings-ringing.md). The baseline matrix and
+source-derived wire contracts below remain the compatibility specification.
+
 ## Scope and evidence
 
 - Server baseline: `server/v1.99.0`, commit `a4edaaa`.
