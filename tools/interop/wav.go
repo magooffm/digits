@@ -27,11 +27,12 @@ type pcmSource struct {
 	kind   string
 	sample uint64
 	wav    *wavInput
+	live   *liveCapture
 }
 
 func validateAudio(audio, file string) error {
-	if audio != "tone" && audio != "silence" && audio != "wav" {
-		return fmt.Errorf("audio must be tone, silence or wav")
+	if audio != "tone" && audio != "silence" && audio != "wav" && audio != "live" {
+		return fmt.Errorf("audio must be tone, silence, wav or live")
 	}
 	if (audio == "wav") != (file != "") {
 		return fmt.Errorf("--audio wav requires --audio-file; --audio-file is only valid with --audio wav")
@@ -44,6 +45,12 @@ func newPCMSource(audio, file string) (*pcmSource, error) {
 		return nil, err
 	}
 	s := &pcmSource{kind: audio}
+	if audio == "live" {
+		if err := checkLiveAudio(); err != nil {
+			return nil, err
+		}
+		s.live = &liveCapture{}
+	}
 	if audio == "wav" {
 		var err error
 		s.wav, err = openWAVInput(file)
@@ -55,6 +62,9 @@ func newPCMSource(audio, file string) (*pcmSource, error) {
 }
 
 func (s *pcmSource) Fill(frame []int16) error {
+	if s.live != nil {
+		return s.live.Fill(frame)
+	}
 	if s.wav != nil {
 		return s.wav.Fill(frame)
 	}
@@ -69,6 +79,9 @@ func (s *pcmSource) Fill(frame []int16) error {
 }
 
 func (s *pcmSource) Close() error {
+	if s.live != nil {
+		return s.live.Close()
+	}
 	if s.wav != nil {
 		return s.wav.file.Close()
 	}
@@ -248,10 +261,15 @@ type wavRecorder struct {
 }
 
 func newWAVRecorder(directory string) (*wavRecorder, error) {
+	return newNamedWAVRecorder(directory, "receive")
+}
+
+// newNamedWAVRecorder creates PREFIX-<UTC time>-<random>.wav with 0600 mode.
+func newNamedWAVRecorder(directory, prefix string) (*wavRecorder, error) {
 	if err := prepareRecordingDir(directory); err != nil {
 		return nil, err
 	}
-	f, err := os.CreateTemp(directory, "receive-"+time.Now().UTC().Format("20060102T150405Z")+"-*.wav")
+	f, err := os.CreateTemp(directory, prefix+"-"+time.Now().UTC().Format("20060102T150405Z")+"-*.wav")
 	if err != nil {
 		return nil, err
 	}

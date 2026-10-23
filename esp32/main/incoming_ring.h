@@ -14,6 +14,9 @@ esp_err_t digits_incoming_ring_init(void);
 void digits_incoming_ring_start(uint32_t call_id);
 void digits_incoming_ring_stop(void);
 void digits_incoming_ring_set_silent(bool silent);
+// Handset lifted: no tone while true. Unlike silent, this is not latched;
+// clearing it while a call still rings restarts that call's cadence.
+void digits_incoming_ring_set_suppressed(bool suppressed);
 
 // After stop(), true acknowledges no speaker ownership or in-flight acquire,
 // start or write from that call. A later start() can of course acquire again.

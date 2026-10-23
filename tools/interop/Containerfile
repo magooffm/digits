@@ -1,0 +1,6 @@
+# Build environment for the helper on hosts without Go or opus-devel, such as
+# a Flatpak VS Code terminal. Used by `make container-build`.
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf install -y golang gcc make pkgconf-pkg-config opus-devel && dnf clean all
+ENV CGO_ENABLED=1 GOTOOLCHAIN=auto
+WORKDIR /work/tools/interop

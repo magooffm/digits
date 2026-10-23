@@ -30,3 +30,23 @@ bool digits_webrtc_receive(const cJSON *message, uint32_t session);
 // Queue acceptance
 // is reported immediately; the owner task logs the actual result.
 esp_err_t digits_webrtc_command(const char *verb, const char *number);
+
+// One-to-one call phase, in the worker's own order.
+typedef enum {
+    DIGITS_CALL_IDLE,
+    DIGITS_CALL_CALLING,
+    DIGITS_CALL_RINGING,
+    DIGITS_CALL_CONNECTING,
+    DIGITS_CALL_CONNECTED,
+} digits_call_phase_t;
+
+typedef struct {
+    digits_call_phase_t phase;
+    bool online;
+    bool paired;
+    char remote[32];
+} digits_webrtc_call_state_t;
+
+// Nonblocking copy of the state the worker published after its last loop.
+// It can lag a just-queued command by one worker iteration.
+void digits_webrtc_call_state(digits_webrtc_call_state_t *state);

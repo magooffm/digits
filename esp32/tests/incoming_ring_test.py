@@ -67,7 +67,7 @@ harness = r'''
 #undef ring_tone_render
 void ring_tone_render(int16_t *,size_t,size_t);
 
-enum action { STOP, START, SILENT_ON, SILENT_OFF, OTHER_ACQUIRE, OTHER_RELEASE };
+enum action { STOP, START, SILENT_ON, SILENT_OFF, OTHER_ACQUIRE, OTHER_RELEASE, LIFT, REPLACE };
 enum stage { NONE, ACQUIRE, START_OUTPUT, RENDER, WRITE, SILENCE };
 struct event { int64_t at; enum action action; unsigned id; };
 static struct event events[32];
@@ -96,6 +96,8 @@ static void control(enum action action,unsigned id)
     case SILENT_OFF: digits_incoming_ring_set_silent(false); break;
     case OTHER_ACQUIRE: assert(owner == 0); owner = 1; break;
     case OTHER_RELEASE: assert(owner == 1); owner = 0; break;
+    case LIFT: digits_incoming_ring_set_suppressed(true); break;
+    case REPLACE: digits_incoming_ring_set_suppressed(false); break;
     }
     assert(now_us == before); // Control paths perform no audio I/O or wait.
 }
@@ -310,9 +312,34 @@ int main(void)
     start_during_cleanup=true; event(100000,STOP,0); run();
     assert(starts == 2 && releases == 2 && writes == 7 && start_times[1] == 40000);
 
+    // Handset lifted mid-tone: release at once; replaced while the same call
+    // still rings: restart its cadence immediately, not after the pause.
+    reset(); control(START,1); event(500000,LIFT,0); event(3500000,REPLACE,0);
+    event(3600000,STOP,0); run();
+    assert(starts == 2 && releases == 2 && start_times[1] == 3500000);
+    assert(release_times[0] == 530000 && release_times[1] == 3630000);
+
+    // Ring arriving while off-hook stays silent, and a later ring after the
+    // handset is replaced is audible again.
+    reset(); control(LIFT,0); control(START,1); event(200000,STOP,0);
+    event(300000,REPLACE,0); event(400000,START,2); event(500000,STOP,0); run();
+    assert(starts == 1 && start_times[0] == 400000 && releases == 1);
+
+    // Replacing the handset with no call active never starts the speaker.
+    reset(); control(LIFT,0); control(REPLACE,0); run();
+    assert(starts == 0 && acquires == 0);
+
+    // Lift during each worker stage still releases without a stale write.
+    for (enum stage stage=ACQUIRE;stage<=WRITE;++stage) {
+        reset(); control(START,1);
+        injection_stage=stage; injection_action=LIFT; event(100000,STOP,0); run();
+        assert(writes == (stage == WRITE ? 1 : 0) && releases == 1);
+        control(REPLACE,0);
+    }
+
     reset(); control(START,1); fail_silence=true; event(20000,STOP,0); run();
     assert(writes == 2 && releases == 1); // Report cleanup fault without leaking reservation.
-    printf("incoming-ring worker (%u Hz): cadence, ownership, mute latches, races and failures passed\n",
+    printf("incoming-ring worker (%u Hz): cadence, ownership, mute latches, handset suppression, races and failures passed\n",
            (unsigned)configTICK_RATE_HZ);
 }
 '''

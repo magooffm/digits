@@ -182,7 +182,7 @@ static void assert_gain_cleared(const record_playback_gain_t *gain)
 
 static void test_gain_prepare(void)
 {
-    int16_t mono[960];
+    int16_t mono[960] = {0};
     record_playback_gain_t gain;
     assert(!record_playback_gain_prepare(mono, 1, NULL));
     memset(&gain, 1, sizeof(gain));

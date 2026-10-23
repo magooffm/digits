@@ -182,7 +182,7 @@ Flags:
 | --- | --- |
 | `--server URL` | WebSocket endpoint; also `DIGITS_SERVER_URL` |
 | `--state PATH` | Persistent independent device identity |
-| `--audio tone\|silence\|wav` | Quiet 440 Hz tone by default, silence, or repeatedly streamed WAV input |
+| `--audio tone\|silence\|wav\|live` | Quiet 440 Hz tone by default, silence, repeatedly streamed WAV input, or the PC microphone and speaker (see [Live two-way call](#live-two-way-call)) |
 | `--audio-file PATH` | Required with `--audio wav`: uncompressed 48 kHz mono signed PCM16 WAV |
 | `--host-only` | Ignore server ICE servers for same-LAN tests |
 | `--trace-dir DIR` | Private per-call SDP and bare ICE files; disabled by default |
@@ -210,6 +210,46 @@ quit
 An incoming call waits for `answer`. Calling requires paired online signaling
 and an idle client. `hangup` releases the peer and media workers. `reconnect`
 ends any call and opens a fresh registered WebSocket; `quit` or Ctrl+C exits.
+
+## Live two-way call
+
+`--audio live` turns the helper into a second phone on the PC. It sends the
+default PulseAudio/PipeWire microphone and plays the ESP32 on the default
+output, through `parec` and `pacat` with 20 ms and 60 ms buffers. Both start
+only once a call is connected and stop at hangup. Use a headset: neither end
+cancels echo. The microphone queue holds 60 ms and drops older audio rather
+than growing delay. Counters for underruns and drops are logged at hangup.
+
+From a VS Code terminal, including the Flatpak build:
+
+```sh
+make -C tools/interop live              # builds via podman if bin/ is missing
+make -C tools/interop container-build   # rebuild after code changes
+make -C tools/interop container-test    # vet, tests and race detector
+```
+
+Or run the VS Code task **Pion: live call peer**. `live` uses the saved
+identity in `~/.config/digits-interop/device.json` (number 3140002 on this
+setup) and the server URL from `esp32/sdkconfig`; override with `STATE=` or
+`SERVER=`. `container-build` uses podman directly, or `flatpak-spawn --host
+podman` inside Flatpak. The image comes from `Containerfile`.
+
+To record calls, use `make -C tools/interop live-record` (or the task
+**Pion: live call peer (recording)**). Each call saves two 48 kHz mono WAV
+files in `~/.config/digits-interop/audio`: `receive-*.wav` is the ESP32 as
+heard on the PC, `send-*.wav` is your microphone as sent. `make -C
+tools/interop mix` joins the newest pair into a stereo `call-*.wav` (left
+ESP32, right PC). The two files start at the first sent and first received
+frame, so they line up only approximately. `receive-*.wav` is in arrival
+order without gap filling, as described below.
+
+Test the ESP32 phone controls against it:
+
+1. ESP32 console: `phone set a 3140002`.
+2. **ESP32 calls:** press KEY1 (handset up), then KEY2. Type `answer` in the
+   helper and talk. Press KEY1 again to hang up.
+3. **PC calls:** type `call 3140001` in the helper. The ESP32 rings; press KEY1
+   to answer and talk. Type `hangup` or press KEY1 to end.
 
 ## Wire and media contract
 

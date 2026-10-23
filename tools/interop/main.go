@@ -48,7 +48,7 @@ func execute() error {
 	number := flag.String("number", "", "import paired number into a new state file")
 	// Keep the bearer token out of flag defaults: --help prints defaults.
 	token := flag.String("device-token", "", "import original device token (also DIGITS_DEVICE_TOKEN)")
-	audio := flag.String("audio", "tone", "audio source: tone, silence or wav (repeated per call)")
+	audio := flag.String("audio", "tone", "audio: tone, silence, wav (repeated per call) or live (PC microphone and speaker via parec/pacat)")
 	audioFile := flag.String("audio-file", "", "48 kHz mono PCM16 WAV input for --audio wav")
 	hostOnly := flag.Bool("host-only", false, "ignore server STUN/TURN settings for a same-LAN host-candidate test")
 	traceDir := flag.String("trace-dir", "", "optional private directory for per-call SDP and ICE traces")

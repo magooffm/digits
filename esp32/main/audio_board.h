@@ -18,6 +18,13 @@ i2s_chan_handle_t digits_audio_rx_channel(void);
 esp_err_t digits_audio_record_button_init(void);
 esp_err_t digits_audio_record_button_read(bool *pressed);
 
+// Waveshare KEY1-KEY3: TCA9555 P11-P13 (Extend_IO9-11 in the schematic),
+// active low with onboard 10 kOhm pull-ups. Bit 0 of the result is KEY1.
+// KEY1 is shared with the hold-to-record diagnostic; never use both.
+#define DIGITS_BOARD_KEY_COUNT 3
+esp_err_t digits_audio_board_keys_init(void);
+esp_err_t digits_audio_board_keys_read(uint8_t *pressed);
+
 // Reserve output across recording/playback; never acquire from the WS callback.
 bool digits_audio_speaker_acquire(uint32_t timeout_ms);
 void digits_audio_speaker_release(void);

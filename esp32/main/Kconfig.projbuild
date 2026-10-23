@@ -43,6 +43,68 @@ menu "Digits development configuration"
                 call can transmit live microphone audio and play received
                 audio through the integrated speaker.
     endmenu
+    menu "Phone controls"
+        depends on DIGITS_WEBRTC
+        config DIGITS_PHONE
+            bool "Enable hook switch and call buttons"
+            default y
+            help
+                Lifting the handset during an incoming call answers it,
+                replacing it ends any call, and with the handset lifted
+                call button A or B dials its configured number. The
+                incoming ringtone is suppressed while the handset is lifted.
+                Console: phone status, phone set a|b NUMBER, phone clear a|b,
+                phone hook up|down and phone press a|b for testing.
+        choice DIGITS_PHONE_INPUTS
+            prompt "Input hardware"
+            depends on DIGITS_PHONE
+            default DIGITS_PHONE_INPUT_BOARD_KEYS
+            config DIGITS_PHONE_INPUT_BOARD_KEYS
+                bool "Waveshare board keys (KEY1 toggles hook, KEY2 calls A, KEY3 calls B)"
+                depends on !DIGITS_MIC_BUTTON_RECORD_PLAYBACK
+                help
+                    Development mapping on TCA9555 P11-P13. KEY1 is a
+                    momentary key, so each press lifts or replaces the
+                    simulated handset. Unavailable while the KEY1
+                    hold-to-record diagnostic is selected.
+            config DIGITS_PHONE_INPUT_GPIO
+                bool "Direct GPIO hook switch and call buttons"
+                help
+                    Hook switch and buttons on ESP32-S3 GPIOs with internal
+                    pull-ups. Buttons connect the GPIO to ground when pressed.
+        endchoice
+        config DIGITS_PHONE_HOOK_GPIO
+            int "Hook switch GPIO"
+            depends on DIGITS_PHONE_INPUT_GPIO
+            range 0 48
+            default 4
+        config DIGITS_PHONE_HOOK_OFF_HOOK_LOW
+            bool "Hook switch input reads low while the handset is lifted"
+            depends on DIGITS_PHONE_INPUT_GPIO
+            default y
+        config DIGITS_PHONE_CALL_A_GPIO
+            int "Call button A GPIO"
+            depends on DIGITS_PHONE_INPUT_GPIO
+            range 0 48
+            default 5
+        config DIGITS_PHONE_CALL_B_GPIO
+            int "Call button B GPIO"
+            depends on DIGITS_PHONE_INPUT_GPIO
+            range 0 48
+            default 6
+        config DIGITS_PHONE_CALL_A_NUMBER
+            string "Default number for call button A"
+            depends on DIGITS_PHONE
+            default ""
+            help
+                Used until 'phone set a NUMBER' stores a per-device number in
+                NVS. Each phone calls different participants, so prefer the
+                console setting and keep one firmware image for all phones.
+        config DIGITS_PHONE_CALL_B_NUMBER
+            string "Default number for call button B"
+            depends on DIGITS_PHONE
+            default ""
+    endmenu
     menu "Onboard microphone"
         choice DIGITS_MIC_RECORD_MODE
             prompt "Microphone record/playback diagnostic"

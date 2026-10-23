@@ -114,6 +114,13 @@ during a cadence pause; if another owner holds the speaker, its existing skip
 behavior remains. A playback start/write failure stops audible attempts for
 that ringtone generation while leaving the call answerable and logged.
 
+**Handset suppression (added 2026-10-23).** The phone controls call
+`digits_incoming_ring_set_suppressed` with the handset state. While the
+handset is lifted the worker releases the speaker and plays nothing. Unlike
+silent mode this is not latched: replacing the handset while the same call
+still rings restarts its cadence at once. See
+[Phone controls](../esp32/README.md#phone-controls).
+
 Answering stops the ringtone immediately at the command level and waits
 asynchronously for release acknowledgement before creating the answering peer.
 Call media cannot start while a ringtone operation remains outstanding. Hangup,

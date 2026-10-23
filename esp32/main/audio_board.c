@@ -13,6 +13,8 @@
 #define TCA_POLARITY_1 0x05
 #define TCA_INPUT_1 0x01
 #define RECORD_KEY_BIT (1U << 1)
+#define BOARD_KEYS_SHIFT 1
+#define BOARD_KEYS_MASK (0x7U << BOARD_KEYS_SHIFT)
 #define SPEAKER_VOLUME 50
 
 static struct {
@@ -198,6 +200,24 @@ esp_err_t digits_audio_record_button_read(bool *pressed)
     uint8_t reg = TCA_INPUT_1, value;
     esp_err_t err = i2c_master_transmit_receive(board.expander, &reg, 1, &value, 1, 20);
     if (err == ESP_OK) *pressed = (value & RECORD_KEY_BIT) == 0;
+    return err;
+}
+
+esp_err_t digits_audio_board_keys_init(void)
+{
+    if (!board.expander || !board.expander_lock) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = update_expander(TCA_CONFIG_1, BOARD_KEYS_MASK, true);
+    if (err == ESP_OK) err = update_expander(TCA_POLARITY_1, BOARD_KEYS_MASK, false);
+    return err;
+}
+
+esp_err_t digits_audio_board_keys_read(uint8_t *pressed)
+{
+    if (!pressed) return ESP_ERR_INVALID_ARG;
+    if (!board.expander) return ESP_ERR_INVALID_STATE;
+    uint8_t reg = TCA_INPUT_1, value;
+    esp_err_t err = i2c_master_transmit_receive(board.expander, &reg, 1, &value, 1, 20);
+    if (err == ESP_OK) *pressed = (uint8_t)((~value & BOARD_KEYS_MASK) >> BOARD_KEYS_SHIFT);
     return err;
 }
 

@@ -3,6 +3,7 @@
 
 #ifdef CONFIG_DIGITS_WEBRTC_CONSOLE
 #include "webrtc.h"
+#include "phone.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -48,6 +49,16 @@ esp_err_t digits_webrtc_console_start(void)
     };
     esp_err_t err = esp_console_cmd_register(&command);
     if (err != ESP_OK) return err;
+#ifdef CONFIG_DIGITS_PHONE
+    const esp_console_cmd_t phone = {
+        .command = "phone",
+        .help = "Phone controls: status, set a|b NUMBER, clear a|b; hook up|down and press a|b simulate inputs.",
+        .hint = "status | set a|b NUMBER | clear a|b | hook up|down | press a|b",
+        .func = digits_phone_console,
+    };
+    err = esp_console_cmd_register(&phone);
+    if (err != ESP_OK) return err;
+#endif
 
     esp_console_repl_config_t config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     config.prompt = "digits>";
@@ -61,6 +72,9 @@ esp_err_t digits_webrtc_console_start(void)
     if (err != ESP_OK) {
         // Construction can deinitialize the command registry on failure.
         (void)esp_console_cmd_deregister("webrtc");
+#ifdef CONFIG_DIGITS_PHONE
+        (void)esp_console_cmd_deregister("phone");
+#endif
         return err;
     }
     err = esp_console_start_repl(console);

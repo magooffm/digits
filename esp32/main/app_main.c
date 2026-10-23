@@ -4,6 +4,7 @@
 #include "line_settings.h"
 #include "audio_board.h"
 #include "microphone.h"
+#include "phone.h"
 #include "record_playback_test.h"
 #include "signaling.h"
 #include "wifi.h"
@@ -42,5 +43,8 @@ void app_main(void)
                 ESP_LOGE("digits", "Record/playback test initialization failed: %s; signaling continues", esp_err_to_name(err));
         }
     }
+    err = digits_phone_start();
+    if (err != ESP_OK)
+        ESP_LOGE("digits", "Phone controls unavailable: %s; console calls still work", esp_err_to_name(err));
     digits_signaling_run(&credentials);
 }

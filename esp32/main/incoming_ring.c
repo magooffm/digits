@@ -20,6 +20,7 @@ typedef struct {
     bool active;
     bool silent;
     bool latched;
+    bool suppressed;
     bool stopped;
 } ring_state_t;
 
@@ -38,7 +39,7 @@ static ring_state_t snapshot(void)
 static bool still_audible(uint32_t revision)
 {
     portENTER_CRITICAL(&state_mux);
-    bool audible = state.revision == revision && state.active && !state.latched;
+    bool audible = state.revision == revision && state.active && !state.latched && !state.suppressed;
     portEXIT_CRITICAL(&state_mux);
     return audible;
 }
@@ -78,7 +79,7 @@ static void ring_worker(void *arg)
         ring_state_t current = snapshot();
         int64_t elapsed = esp_timer_get_time() - current.started_us;
         int64_t phase = elapsed >= 0 ? elapsed % RING_PERIOD_US : 0;
-        bool enabled = current.active && !current.latched;
+        bool enabled = current.active && !current.latched && !current.suppressed;
         bool on = enabled && phase < RING_ON_US && current.revision != failed_revision;
 
         if (owned && (!on || current.revision != owned_revision)) {
@@ -106,7 +107,8 @@ static void ring_worker(void *arg)
             // stop()+is_stopped() can never race an old snapshot into a later
             // acquire after reporting completion.
             portENTER_CRITICAL(&state_mux);
-            bool acquire = state.revision == current.revision && state.active && !state.latched;
+            bool acquire = state.revision == current.revision && state.active && !state.latched &&
+                !state.suppressed;
             if (acquire) state.stopped = false;
             portEXIT_CRITICAL(&state_mux);
             if (!acquire) continue;
@@ -204,6 +206,21 @@ void digits_incoming_ring_set_silent(bool silent)
     // Disabling silent mode does not un-latch this call.
     portEXIT_CRITICAL(&state_mux);
     if (worker) xTaskNotifyGive(worker);
+}
+
+void digits_incoming_ring_set_suppressed(bool suppressed)
+{
+    portENTER_CRITICAL(&state_mux);
+    bool changed = state.suppressed != suppressed;
+    state.suppressed = suppressed;
+    if (changed && state.active) {
+        ++state.revision;
+        if (!state.revision) ++state.revision;
+        // Ring at once when the handset is replaced, not mid-pause.
+        if (!suppressed) state.started_us = esp_timer_get_time();
+    }
+    portEXIT_CRITICAL(&state_mux);
+    if (changed && worker) xTaskNotifyGive(worker);
 }
 
 bool digits_incoming_ring_is_stopped(void)

@@ -73,6 +73,8 @@ type callPeer struct {
 	audio        string
 	source       *pcmSource
 	recorder     *wavRecorder
+	sendRecorder *wavRecorder // Live mode: the PC microphone as sent.
+	player       *livePlayback
 	reception    rtpReception
 	firstSent    atomic.Pointer[time.Time]
 	firstDecoded atomic.Pointer[decodedOrigin]
@@ -141,6 +143,17 @@ func newCallPeerWithMedia(ctx context.Context, servers []sigclient.ICEServer, co
 			return nil, fmt.Errorf("receive WAV initialization: %w", err)
 		}
 		slog.Info("Receive WAV opened", "path", p.recorder.path, "sample_rate", wavRate, "pcm_channels", 1)
+		if config.audio == "live" {
+			p.sendRecorder, err = newNamedWAVRecorder(config.recordDir, "send")
+			if err != nil {
+				p.Close()
+				return nil, fmt.Errorf("send WAV initialization: %w", err)
+			}
+			slog.Info("Send WAV opened", "path", p.sendRecorder.path, "sample_rate", wavRate, "pcm_channels", 1)
+		}
+	}
+	if config.audio == "live" {
+		p.player = &livePlayback{}
 	}
 	manager.SetOnICECandidate(func(candidate string) {
 		p.publish(peerEvent{Kind: "candidate", Text: candidate})
@@ -233,6 +246,9 @@ func (p *callPeer) mediaLoop() {
 				p.publish(peerEvent{Kind: "failure", Text: "WAV", Err: err})
 				return
 			}
+			if p.sendRecorder != nil {
+				p.sendRecorder.Submit(frame)
+			}
 			encoded, err := p.encoder.Encode(frame)
 			if err != nil {
 				p.encodeErrors.Add(1)
@@ -311,6 +327,9 @@ func (p *callPeer) remoteTrack(track *webrtc.TrackRemote) {
 		}
 		if p.recorder != nil {
 			p.recorder.Submit(pcm)
+		}
+		if p.player != nil {
+			p.player.Submit(pcm)
 		}
 	}
 }
@@ -419,6 +438,15 @@ func (p *callPeer) Close() {
 		}
 		if p.recorder != nil {
 			p.recorder.Close()
+		}
+		if p.sendRecorder != nil {
+			p.sendRecorder.Close()
+			s := p.sendRecorder.Snapshot()
+			slog.Info("Send WAV closed", "path", s.Path, "recorded_samples", s.Samples,
+				"dropped_samples", s.DroppedSamples, "errors", s.Errors, "finalized", s.Finalized)
+		}
+		if p.player != nil {
+			p.player.Close()
 		}
 		p.logSnapshot()
 		slog.Info("peer media workers stopped", "stage", "connection", "tx_frames", p.txFrames.Load(), "rx_packets", p.rxPackets.Load())

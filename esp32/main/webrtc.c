@@ -113,6 +113,10 @@ static struct {
 
 static portMUX_TYPE transport_mux = portMUX_INITIALIZER_UNLOCKED;
 static transport_t latest_transport;
+static portMUX_TYPE call_state_mux = portMUX_INITIALIZER_UNLOCKED;
+static digits_webrtc_call_state_t published_call_state;
+
+_Static_assert(CALL_CONNECTED == (call_phase_t)DIGITS_CALL_CONNECTED, "public phase order");
 
 static const char *phase_name(call_phase_t phase)
 {
@@ -859,6 +863,26 @@ static void refresh_transport(void)
     }
 }
 
+static void publish_call_state(void)
+{
+    digits_webrtc_call_state_t state = {
+        .phase = (digits_call_phase_t)rtc.call.phase,
+        .online = rtc.owner_transport.online,
+        .paired = rtc.owner_transport.paired,
+    };
+    strcpy(state.remote, rtc.call.remote);
+    portENTER_CRITICAL(&call_state_mux);
+    published_call_state = state;
+    portEXIT_CRITICAL(&call_state_mux);
+}
+
+void digits_webrtc_call_state(digits_webrtc_call_state_t *state)
+{
+    portENTER_CRITICAL(&call_state_mux);
+    *state = published_call_state;
+    portEXIT_CRITICAL(&call_state_mux);
+}
+
 static void peer_task(void *context)
 {
     (void)context;
@@ -905,6 +929,7 @@ static void peer_task(void *context)
                 report_resources("Connected");
             }
         }
+        publish_call_state();
         // The short socket timeout already paces the owner. One tick permits
         // codec tasks to run without adding the old unconditional 10 ms delay.
         ulTaskNotifyTake(pdTRUE, rtc.call.peer || rtc.stopping_audio ||
@@ -1094,6 +1119,11 @@ esp_err_t digits_webrtc_command(const char *verb, const char *number)
 {
     (void)verb; (void)number;
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+void digits_webrtc_call_state(digits_webrtc_call_state_t *state)
+{
+    *state = (digits_webrtc_call_state_t){.phase = DIGITS_CALL_IDLE};
 }
 
 #endif

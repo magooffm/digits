@@ -25,7 +25,8 @@ ringing, and applies effective Silent Mode/Quiet Hours suppression. See the
 [settings and ringing acceptance guide](../docs/esp32-settings-ringing.md) for
 cache semantics, tests and pending physical acceptance. Voice Style, voicemail
 and Auto Update preferences are cached only in this phase.
-Call buttons, hook handling and handset wiring remain unused.
+Hook switch and call buttons work through the board keys or GPIOs; see
+[Phone controls](#phone-controls). Handset wiring remains unused.
 The console defaults to the ESP32-S3's native USB Serial/JTAG port.
 
 ## Configure, build, flash and monitor
@@ -63,6 +64,65 @@ export IDF_TOOLS_PATH=/private/tmp/digits-idf-tools
 . /private/tmp/digits-esp-idf/export.sh
 ```
 
+### Shortcuts
+
+`esp32/Makefile` wraps `idf.py`. It expects ESP-IDF at `~/esp/esp-idf-v5.5.3`
+and the board at `/dev/ttyACM0`; override with `IDF_PATH=` or `PORT=`.
+
+```sh
+make -C esp32 deploy      # build, flash, open the console (Ctrl+] exits)
+make -C esp32 build       # or: flash, monitor, menuconfig, size
+make -C esp32 test        # every host test, normal and sanitized
+```
+
+In VS Code, Ctrl+Shift+B runs `deploy`. The other targets are under
+Terminal > Run Task as "ESP32: ...". Flashing keeps NVS.
+
+## Phone controls
+
+`phone.c` maps the hook switch and two call buttons onto the existing WebRTC
+commands. Rules follow the Pi controller:
+
+- Lifting the handset while a call rings answers it.
+- Replacing the handset ends any call, outgoing or connected.
+- With the handset lifted and the line idle, button A or B calls its number.
+- Buttons pressed on-hook or during a call are logged and ignored.
+- The incoming ringtone is silent while the handset is lifted. If a call
+  arrives off-hook, replacing the handset starts ringing; it is not rejected.
+
+Inputs are chosen under **Digits development configuration → Phone controls**:
+
+| Mode | Hook | Call A | Call B |
+| --- | --- | --- | --- |
+| Board keys (default) | KEY1, each press lifts or replaces | KEY2 | KEY3 |
+| Direct GPIO | level switch, default GPIO4, low = lifted | GPIO5 to ground | GPIO6 to ground |
+
+Board keys are TCA9555 P11-P13. KEY1 doubles as the hold-to-record key, so the
+board-key mode is unavailable while that diagnostic is selected.
+
+Each phone calls different people, so button numbers are stored per device
+in NVS rather than in the build. They survive flashing:
+
+```text
+phone set a 3140002     # save the number for button A
+phone clear a           # fall back to the menuconfig default (empty)
+phone status            # handset, call phase, configured numbers
+phone hook up|down      # simulate the handset
+phone press a|b         # simulate a call button
+```
+
+The logic is a pure state machine in `phone_fsm.c`, tested on the host by
+`tests/phone_fsm_test.c`. `tests/incoming_ring_test.py` covers ringtone
+suppression races.
+
+For a two-way test against a second phone on the PC, see the helper's
+[live two-way call](../tools/interop/README.md#live-two-way-call).
+
+Verified on the board on 2026-10-23: idle on-hook presses are ignored, lift
+plus button A sends `call` and creates a peer, and replacing the handset
+hangs up and releases it. Not yet verified: physical KEY1-KEY3 presses, an
+incoming call answered by lifting, and silence while off-hook.
+
 ## Persistent storage
 
 Default NVS partition, namespace `digits`:
@@ -75,6 +135,9 @@ Default NVS partition, namespace `digits`:
 Line settings use a separate namespace `digits_settings`, key `snapshot`, with
 a versioned 12-byte blob. Its asynchronous worker never erases or modifies
 pairing. See the [cache contract](../docs/esp32-settings-ringing.md#exact-settings-and-cache-behavior).
+
+Call button numbers use namespace `digits_phone`, string keys `call_a` and
+`call_b` (digits only, at most 31). A missing key means the build default.
 
 The token is never hashed by the device or printed in application logs.
 Missing `pairing` means unpaired. Existing invalid identity/record or NVS
