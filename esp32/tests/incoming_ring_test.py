@@ -80,6 +80,7 @@ static enum stage injection_stage;
 static enum action injection_action;
 static unsigned injection_id;
 static bool start_during_cleanup;
+static unsigned start_ringtone; // Ringtone passed by START events.
 static void (*task_entry)(void *);
 static jmp_buf done;
 
@@ -91,7 +92,7 @@ static void control(enum action action,unsigned id)
         digits_incoming_ring_stop();
         if (owner == 2 || acquiring) assert(!digits_incoming_ring_is_stopped());
         break;
-    case START: digits_incoming_ring_start(id); break;
+    case START: digits_incoming_ring_start(id, start_ringtone); break;
     case SILENT_ON: digits_incoming_ring_set_silent(true); break;
     case SILENT_OFF: digits_incoming_ring_set_silent(false); break;
     case OTHER_ACQUIRE: assert(owner == 0); owner = 1; break;
@@ -188,7 +189,8 @@ esp_err_t digits_audio_speaker_write(const int16_t *pcm,size_t bytes,
         assert(pcm[i] == pcm[i + 1] && pcm[i] <= 4096 && pcm[i] >= -4096);
         nonzero |= pcm[i] != 0;
     }
-    assert(nonzero); // Both seconds contain real waveform data.
+    // Both seconds of the standard ring contain waveform; melodies have rests.
+    if (state.ringtone == RINGTONE_STANDARD) assert(nonzero);
     inject(WRITE);
     advance(now_us + 10000);
     *written = writes == partial_write ? bytes / 2 : bytes;
@@ -227,6 +229,7 @@ static void reset(void)
     fail_write=partial_write=fail_start=task_creates=owner=0;
     amplifier=fail_task=acquiring=start_during_cleanup=fail_silence=false;
     rx_available=true;
+    start_ringtone=0;
     now_us=0;
     injection_stage=NONE;
     assert(digits_incoming_ring_init() == ESP_OK);
@@ -337,6 +340,22 @@ int main(void)
         control(REPLACE,0);
     }
 
+    // A melody plays once per cycle (its length), then pauses 2 s.
+    {
+        unsigned song = 2;
+        int64_t on = (int64_t)ringtones_melody_frames(song) * 1000000 / RINGTONE_SAMPLE_RATE;
+        int64_t period = on + 2000000;
+        reset(); start_ringtone = song; control(START,1);
+        event(period + 100000,STOP,0); run();
+        assert(starts == 2 && start_times[0] == 0 && start_times[1] == period);
+        assert(release_times[0] >= on && release_times[0] <= on + 40000);
+        assert(writes >= (unsigned)(on / 10000) && writes <= (unsigned)(on / 10000) + 12);
+        // Unknown ringtone falls back to the standard 2 s / 6 s ring.
+        reset(); start_ringtone = 77; control(START,1);
+        event(7000000,STOP,0); run();
+        assert(starts == 2 && start_times[1] == 6000000);
+    }
+
     reset(); control(START,1); fail_silence=true; event(20000,STOP,0); run();
     assert(writes == 2 && releases == 1); // Report cleanup fault without leaking reservation.
     printf("incoming-ring worker (%u Hz): cadence, ownership, mute latches, handset suppression, races and failures passed\n",
@@ -357,7 +376,8 @@ with tempfile.TemporaryDirectory(prefix="digits-incoming-ring-") as directory:
         command = ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                    "-Wno-unused-variable", f"-DconfigTICK_RATE_HZ={tick_rate}",
                    "-I", str(root), "-I", str(repo / "esp32/main"),
-                   str(source), str(repo / "esp32/main/ring_tone.c"), "-lm", "-o", str(binary)]
+                   str(source), str(repo / "esp32/main/ring_tone.c"),
+                   str(repo / "esp32/main/ringtones.c"), "-lm", "-o", str(binary)]
         if args.sanitize:
             command[1:1] = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]
         subprocess.run(command, check=True)

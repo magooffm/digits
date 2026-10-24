@@ -545,3 +545,75 @@ func TestTraceFilesPreserveRawSDPAndBareCandidates(t *testing.T) {
 		}
 	}
 }
+
+func TestControllerOutgoingRingtoneChoice(t *testing.T) {
+	a, transport, ctx := testApplication(t, true)
+	a.command(ctx, "call 5002 9")
+	if a.call != nil || len(transport.messages()) != 0 {
+		t.Fatal("invalid ringtone must not start a call")
+	}
+	a.command(ctx, "call 5002 3")
+	messages := transport.messages()
+	if len(messages) < 2 || !strings.Contains(messages[1].SDP, "\na=x-digits-ringtone:3\r\nm=") {
+		t.Fatalf("offer lacks the ringtone attribute before media: %+v", messages)
+	}
+	a.command(ctx, "hangup")
+	before := len(transport.messages())
+	a.command(ctx, "call 5002")
+	messages = transport.messages()
+	if len(messages) < before+2 || strings.Contains(messages[before+1].SDP, ringtoneSDPAttribute) {
+		t.Fatal("a call without a ringtone must not add the attribute")
+	}
+}
+
+func TestControllerIncomingRingtoneStartsRinger(t *testing.T) {
+	withLiveCommands(t, []string{"sh"}, []string{"sh", "-c", "exec cat >/dev/null"})
+	a, _, ctx := testApplication(t, true)
+	a.options.audio = "live"
+	if err := a.receive(ctx, &sigclient.Message{Type: sigclient.TypeRing, From: "5002"}); err != nil {
+		t.Fatal(err)
+	}
+	if a.ringer != nil || a.call.ringAt.IsZero() {
+		t.Fatal("ringing must wait for the offer")
+	}
+	caller, err := newCallPeer(ctx, nil, "silence", func(peerEvent) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer caller.Close()
+	offer, err := caller.Offer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.receive(ctx, &sigclient.Message{Type: sigclient.TypeSDP, From: "5002", SDP: addRingtoneToOffer(offer, 2)}); err != nil {
+		t.Fatal(err)
+	}
+	if a.ringer == nil || a.ringer.ringtone != 2 || !a.call.ringAt.IsZero() {
+		t.Fatal("offer ringtone did not start the ringer")
+	}
+	if a.call.offer != offer {
+		t.Fatal("ringtone attribute must be removed before Pion sees the offer")
+	}
+	a.command(ctx, "answer")
+	if a.ringer != nil {
+		t.Fatal("answer must stop ringing")
+	}
+}
+
+func TestControllerRingWithoutOfferUsesStandard(t *testing.T) {
+	withLiveCommands(t, []string{"sh"}, []string{"sh", "-c", "exec cat >/dev/null"})
+	a, _, ctx := testApplication(t, true)
+	a.options.audio = "live"
+	if err := a.receive(ctx, &sigclient.Message{Type: sigclient.TypeRing, From: "5002"}); err != nil {
+		t.Fatal(err)
+	}
+	a.call.ringAt = time.Now().Add(-time.Millisecond) // The wait has passed.
+	a.startRinging(ringtoneStandard)
+	if a.ringer == nil || a.ringer.ringtone != ringtoneStandard {
+		t.Fatal("standard ring did not start")
+	}
+	a.endCall(false, "test")
+	if a.ringer != nil {
+		t.Fatal("ending the call must stop ringing")
+	}
+}

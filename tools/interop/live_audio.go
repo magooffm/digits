@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -217,4 +218,77 @@ func (p *livePlayback) Close() {
 	_ = p.stdin.Close()
 	waitOrKill(p.cmd)
 	slog.Info("Live speaker stopped", "dropped_packets", p.drops.Load(), "write_errors", p.errors.Load())
+}
+
+// Incoming-call ring for live mode: 440+480 Hz, 2 s on / 4 s off, the same
+// tone and cadence as the ESP32 ringer. Plays until answer or call end.
+const (
+	ringOnSamples     = 2 * wavRate
+	ringPeriodSamples = 6 * wavRate
+	ringComponentPeak = 2048
+)
+
+func renderRing(frame []byte, start uint64) {
+	for i := 0; i < len(frame)/2; i++ {
+		n := start + uint64(i)
+		var sample int16
+		if n%ringPeriodSamples < ringOnSamples {
+			t := float64(n) / wavRate
+			sample = int16(ringComponentPeak * (math.Sin(2*math.Pi*440*t) + math.Sin(2*math.Pi*480*t)))
+		}
+		binary.LittleEndian.PutUint16(frame[2*i:], uint16(sample))
+	}
+}
+
+type liveRinger struct {
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	ringtone int
+	stop     chan struct{}
+	done     chan struct{}
+}
+
+// startLiveRinger returns nil when no player can start; ringing is a
+// convenience and never blocks the call.
+func startLiveRinger(ringtone int) *liveRinger {
+	cmd := exec.Command(livePlaybackCommand[0], livePlaybackCommand[1:]...)
+	stdin, err := cmd.StdinPipe()
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err != nil {
+		slog.Warn("Incoming ring unavailable", "error", err)
+		return nil
+	}
+	r := &liveRinger{cmd: cmd, stdin: stdin, ringtone: ringtone, stop: make(chan struct{}), done: make(chan struct{})}
+	go r.write()
+	return r
+}
+
+func (r *liveRinger) write() {
+	defer close(r.done)
+	frame := make([]byte, liveFrameBytes)
+	for n := uint64(0); ; n += wavFrameSamples {
+		select {
+		case <-r.stop:
+			return
+		default:
+		}
+		renderRingtoneCycle(r.ringtone, frame, n)
+		// pacat's short buffer paces this loop at real time.
+		if _, err := r.stdin.Write(frame); err != nil {
+			return
+		}
+	}
+}
+
+// Stop silences at once: the player is killed rather than drained.
+func (r *liveRinger) Stop() {
+	if r == nil {
+		return
+	}
+	close(r.stop)
+	_ = r.cmd.Process.Kill()
+	<-r.done
+	_ = r.cmd.Wait()
 }

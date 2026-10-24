@@ -2,3 +2,5 @@
 /managed_components/
 /sdkconfig
 /sdkconfig.old
+/ringtones/*
+!/ringtones/README.md

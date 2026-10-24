@@ -10,8 +10,10 @@ esp_err_t digits_incoming_ring_init(void);
 
 // Nonblocking control. A nonzero ID identifies one incoming call; repeating
 // the same active ID is idempotent, including its silent-until-hangup latch.
-// A new ID starts a fresh 2 s on / 4 s off cadence using the current policy.
-void digits_incoming_ring_start(uint32_t call_id);
+// A new ID starts a fresh cadence using the current policy. ringtone selects
+// a ringtones.h entry: 0 is the standard 2 s on / 4 s off ring, a melody plays
+// once per cycle followed by a 2 s pause. Unknown values use the standard ring.
+void digits_incoming_ring_start(uint32_t call_id, unsigned ringtone);
 void digits_incoming_ring_stop(void);
 void digits_incoming_ring_set_silent(bool silent);
 // Handset lifted: no tone while true. Unlike silent, this is not latched;

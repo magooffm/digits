@@ -52,8 +52,10 @@ esp_err_t digits_webrtc_console_start(void)
 #ifdef CONFIG_DIGITS_PHONE
     const esp_console_cmd_t phone = {
         .command = "phone",
-        .help = "Phone controls: status, set a|b NUMBER, clear a|b; hook up|down and press a|b simulate inputs.",
-        .hint = "status | set a|b NUMBER | clear a|b | hook up|down | press a|b",
+        .help = "Phone controls: status, set/clear a|b|c, ringtones, ringtone a|b|c N (how they "
+                "ring), preview N, positions, position P N, selector a|b|c P (how they ring here); "
+                "hook up|down and press a|b|c simulate inputs.",
+        .hint = "status | set | clear | ringtones | ringtone | preview | positions | position | selector | hook | press",
         .func = digits_phone_console,
     };
     err = esp_console_cmd_register(&phone);

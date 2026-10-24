@@ -307,14 +307,14 @@ static void check_settings_ringing(void)
 
     // Boot cache takes effect before the first ring; turning silence off does
     // not unexpectedly start sound for this already-silenced call.
-    digits_incoming_ring_start(501); run_ring();
+    digits_incoming_ring_start(501, 0); run_ring();
     assert(digits_incoming_ring_is_stopped() && !writes && !starts);
     assert(receive_and_apply(silent_off, 80)); run_ring();
     assert(digits_incoming_ring_is_stopped() && !writes && !starts);
 
     // A subsequent call may ring. A live effective silent/Quiet Hours snapshot
     // stops it via its owning worker; the callback itself performs no I/O.
-    digits_incoming_ring_stop(); digits_incoming_ring_start(502);
+    digits_incoming_ring_stop(); digits_incoming_ring_start(502, 0);
     speaker_write_hook = enable_silent_during_write; run_ring();
     assert(writes == 1 && starts == 1 && silences == 1 && releases == 1);
     assert(digits_incoming_ring_is_stopped() && !speaker_owner && digits_settings_silent());
@@ -324,7 +324,7 @@ static void check_settings_ringing(void)
     // Disconnect preserves cached effective silence. Stale/unregistered pushes
     // cannot change it; a fresh session may update the next call's behavior.
     assert(receive_and_apply(silent_on, 80));
-    digits_incoming_ring_stop(); digits_incoming_ring_start(503); run_ring();
+    digits_incoming_ring_stop(); digits_incoming_ring_start(503, 0); run_ring();
     digits_settings_transport(80, false);
     assert(!receive_and_apply(silent_off, 80));
     digits_settings_transport(81, false);
@@ -333,7 +333,7 @@ static void check_settings_ringing(void)
     assert(!receive_and_apply(silent_off, 80) && digits_settings_silent());
     assert(receive_and_apply(silent_off, 81)); run_ring();
     assert(!digits_settings_silent() && writes == 1);
-    digits_incoming_ring_stop(); digits_incoming_ring_start(504);
+    digits_incoming_ring_stop(); digits_incoming_ring_start(504, 0);
     speaker_write_hook = answer_during_write; run_ring();
     assert(writes == 2 && starts == 2 && silences == 2 && releases == 2);
     assert(digits_incoming_ring_is_stopped() && !speaker_owner);
@@ -536,7 +536,7 @@ with tempfile.TemporaryDirectory(prefix="digits-line-settings-") as temporary:
         command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
     command += ["-I", str(build), "-I", str(repo / "esp32/main"), "-I", str(cjson),
                 str(build / "test.c"), str(repo / "esp32/main/incoming_ring.c"),
-                str(repo / "esp32/main/ring_tone.c"), str(cjson / "cJSON.c"),
+                str(repo / "esp32/main/ring_tone.c"), str(repo / "esp32/main/ringtones.c"), str(cjson / "cJSON.c"),
                 "-lm", "-o", str(build / "test")]
     subprocess.run(command, check=True)
     subprocess.run([str(build / "test")], check=True)

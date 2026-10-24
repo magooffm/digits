@@ -157,3 +157,62 @@ func TestNamedRecorderPrefix(t *testing.T) {
 		t.Fatalf("snapshot %+v", s)
 	}
 }
+
+func TestRenderRingCadenceAndLevel(t *testing.T) {
+	frame := make([]byte, liveFrameBytes)
+	peak := 0
+	for n := uint64(0); n < ringOnSamples; n += wavFrameSamples {
+		renderRing(frame, n)
+		for i := 0; i < wavFrameSamples; i++ {
+			v := int(int16(binary.LittleEndian.Uint16(frame[2*i:])))
+			if v < 0 {
+				v = -v
+			}
+			if v > peak {
+				peak = v
+			}
+		}
+	}
+	if peak < 3900 || peak > 2*ringComponentPeak {
+		t.Fatalf("ring peak %d", peak)
+	}
+	renderRing(frame, ringOnSamples) // First frame of the 4 s pause.
+	for i := range frame {
+		if frame[i] != 0 {
+			t.Fatal("pause is not silent")
+		}
+	}
+	renderRing(frame, ringPeriodSamples) // Next cycle rings again.
+	if binary.LittleEndian.Uint16(frame[2*100:]) == 0 {
+		t.Fatal("second cycle silent")
+	}
+}
+
+func TestLiveRingerStopsPromptly(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "ring.raw")
+	// A slow consumer, like pacat's real-time buffer: Stop must not wait for it.
+	withLiveCommands(t, []string{"sh"}, []string{"sh", "-c", `exec dd of="$0" bs=1920 2>/dev/null`, out})
+	ringer := startLiveRinger(2)
+	if ringer == nil {
+		t.Fatal("ringer did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	ringer.Stop()
+	if time.Since(start) > time.Second {
+		t.Fatal("Stop took too long")
+	}
+	info, err := os.Stat(out)
+	if err != nil || info.Size() == 0 {
+		t.Fatalf("ringer wrote nothing: %v", err)
+	}
+	var none *liveRinger
+	none.Stop() // nil-safe for calls without live audio
+}
+
+func TestLiveRingerMissingPlayer(t *testing.T) {
+	withLiveCommands(t, []string{"sh"}, []string{"digits-no-such-player"})
+	if startLiveRinger(ringtoneStandard) != nil {
+		t.Fatal("ringer reported running without a player")
+	}
+}

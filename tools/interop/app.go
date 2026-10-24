@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,11 +15,12 @@ import (
 )
 
 const (
-	maxSDP         = 12288
-	maxCandidate   = 512
-	maxCandidates  = 32
-	ringTimeout    = 60 * time.Second
-	connectTimeout = 10 * time.Second // upstream digitsd's post-answer deadline
+	maxSDP           = 12288
+	maxCandidate     = 512
+	maxCandidates    = 32
+	ringTimeout      = 60 * time.Second
+	connectTimeout   = 10 * time.Second       // upstream digitsd's post-answer deadline
+	ringtoneHintWait = 500 * time.Millisecond // offer with the caller's ringtone follows the ring
 )
 
 type signalingConnection interface {
@@ -43,6 +45,7 @@ type callSession struct {
 	localICE, remoteICE                          []string
 	peer                                         *callPeer
 	deadline                                     time.Time
+	ringAt                                       time.Time // Live mode: pending ring start.
 }
 
 // A single controller owns signaling, call state and all SDP/ICE ordering.
@@ -64,6 +67,7 @@ type application struct {
 	backoff                              time.Duration
 	pendingHangup                        bool
 	traceSequence                        uint64
+	ringer                               *liveRinger // Live mode: audible incoming ring.
 }
 
 func newApplication(store *stateStore, config options) *application {
@@ -154,6 +158,9 @@ func (a *application) run(parent context.Context, commands <-chan string) error 
 			if a.connection != nil && !a.pairingRefresh.IsZero() && !now.Before(a.pairingRefresh) {
 				slog.Info("Refreshing expiring pairing code", "stage", "pairing")
 				a.disconnect(true)
+			}
+			if a.call != nil && !a.call.ringAt.IsZero() && !now.Before(a.call.ringAt) {
+				a.startRinging(ringtoneStandard) // No offer yet.
 			}
 			if a.call != nil && !a.call.deadline.IsZero() && !now.Before(a.call.deadline) {
 				if a.call.phase == "connecting" {
@@ -301,6 +308,8 @@ func (a *application) receive(ctx context.Context, message *sigclient.Message) e
 		a.callID++
 		a.call = &callSession{id: a.callID, remote: message.From, phase: "ringing", deadline: time.Now().Add(ringTimeout)}
 		slog.Info("Incoming call: enter answer or hangup", "from", message.From)
+		// Ring once the offer reveals the caller's ringtone, or after a short wait.
+		a.call.ringAt = time.Now().Add(ringtoneHintWait)
 		return nil
 	}
 	call := a.call
@@ -324,8 +333,14 @@ func (a *application) receive(ctx context.Context, message *sigclient.Message) e
 				a.failCall("SDP", errors.New("unexpected or repeated offer"))
 				return nil
 			}
-			call.offer = message.SDP
-			slog.Info("Incoming SDP retained until manual answer", "stage", "SDP", "bytes", len(call.offer))
+			ringtone, offer := takeRingtoneFromOffer(message.SDP)
+			call.offer = offer
+			slog.Info("Incoming SDP retained until manual answer", "stage", "SDP", "bytes", len(call.offer),
+				"caller_ringtone", ringtone)
+			if ringtone < 0 {
+				ringtone = ringtoneStandard
+			}
+			a.startRinging(ringtone)
 			if call.answerRequested {
 				a.answer(ctx)
 			}
@@ -397,7 +412,16 @@ func (a *application) command(ctx context.Context, line string) {
 	if len(fields) == 0 {
 		return
 	}
-	if fields[0] == "call" && len(fields) == 2 {
+	if fields[0] == "call" && (len(fields) == 2 || len(fields) == 3) {
+		ringtone := -1
+		if len(fields) == 3 {
+			id, err := strconv.Atoi(fields[2])
+			if err != nil || !validRingtone(id) {
+				slog.Warn("Ringtone must be a number from 0 to the last entry of 'ringtones'")
+				return
+			}
+			ringtone = id
+		}
 		if a.connection == nil || a.store.Snapshot().DeviceToken == "" {
 			slog.Warn("Call requires online paired registration")
 			return
@@ -421,6 +445,9 @@ func (a *application) command(ctx context.Context, line string) {
 			a.failCall("SDP", err)
 			return
 		}
+		if ringtone >= 0 {
+			offer = addRingtoneToOffer(offer, ringtone)
+		}
 		if len(offer) > maxSDP {
 			a.failCall("SDP", errors.New("local SDP exceeds ESP32 limit"))
 			return
@@ -431,7 +458,7 @@ func (a *application) command(ctx context.Context, line string) {
 		}
 		a.call.localSDP = true
 		a.drainLocalICE()
-		slog.Info("Outgoing call; offer sent before local ICE", "to", fields[1])
+		slog.Info("Outgoing call; offer sent before local ICE", "to", fields[1], "ringtone", ringtone)
 		return
 	}
 	if len(fields) != 1 {
@@ -451,6 +478,13 @@ func (a *application) command(ctx context.Context, line string) {
 			a.disconnect(true)
 		} else if !a.connecting {
 			a.retryAt = time.Now()
+		}
+	case "ringtones":
+		for id, song := range ringtoneSongs {
+			fmt.Fprintf(os.Stderr, "%2d  %s\n", id, song.Name)
+		}
+		for _, clip := range clips.list() {
+			fmt.Fprintf(os.Stderr, "%2d  %s  (clip)\n", clip.ID, clip.Name)
 		}
 	case "help":
 		printHelp()
@@ -486,6 +520,7 @@ func (a *application) answer(ctx context.Context) {
 		return
 	}
 	call.answerRequested = true
+	a.stopRinging()
 	if call.offer == "" {
 		slog.Info("Answer requested; waiting for caller SDP")
 		return
@@ -588,7 +623,25 @@ func (a *application) failCall(stage string, err error) {
 	a.endCall(true, sigclient.HangupReasonConnectTimeout)
 }
 
+func (a *application) startRinging(ringtone int) {
+	call := a.call
+	if call == nil || call.phase != "ringing" || call.ringAt.IsZero() || call.answerRequested {
+		return
+	}
+	call.ringAt = time.Time{}
+	slog.Info("Ringing", "ringtone", ringtone, "name", ringtoneName(ringtone))
+	if a.options.audio == "live" {
+		a.ringer = startLiveRinger(ringtone)
+	}
+}
+
+func (a *application) stopRinging() {
+	a.ringer.Stop()
+	a.ringer = nil
+}
+
 func (a *application) endCall(notify bool, reason string) {
+	a.stopRinging()
 	call := a.call
 	if call == nil {
 		return

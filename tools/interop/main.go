@@ -53,6 +53,7 @@ func execute() error {
 	hostOnly := flag.Bool("host-only", false, "ignore server STUN/TURN settings for a same-LAN host-candidate test")
 	traceDir := flag.String("trace-dir", "", "optional private directory for per-call SDP and ICE traces")
 	recordDir := flag.String("record-dir", "", "optional private directory for per-call decoded receive WAV files")
+	ringtoneDir := flag.String("ringtone-dir", defaultRingtoneDir(), "ringtone clips NN-Name.ext, as packed into the ESP32 firmware")
 	flag.Parse()
 	if *token == "" {
 		*token = os.Getenv("DIGITS_DEVICE_TOKEN")
@@ -84,6 +85,9 @@ func execute() error {
 	if err := prepareRecordingDir(*recordDir); err != nil {
 		return err
 	}
+	if err := clips.load(*ringtoneDir); err != nil {
+		return err
+	}
 	store, err := openState(*statePath, *hardware, *number, *token)
 	if err != nil {
 		return err
@@ -102,7 +106,7 @@ func execute() error {
 }
 
 func printHelp() {
-	fmt.Fprintln(os.Stderr, "Commands: call NUMBER | answer | hangup | status | reconnect | help | quit")
+	fmt.Fprintln(os.Stderr, "Commands: call NUMBER [RINGTONE] | ringtones | answer | hangup | status | reconnect | help | quit")
 }
 
 func readCommands(ctx context.Context, output chan<- string) {

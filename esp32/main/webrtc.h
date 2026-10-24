@@ -31,6 +31,20 @@ bool digits_webrtc_receive(const cJSON *message, uint32_t session);
 // is reported immediately; the owner task logs the actual result.
 esp_err_t digits_webrtc_command(const char *verb, const char *number);
 
+// Like digits_webrtc_command("call", number), and asks the callee to ring
+// with ringtones.h entry `ringtone`. The choice travels as a session-level
+// SDP attribute (DIGITS_RINGTONE_SDP_ATTR) in the offer; the unchanged server
+// relays it, and phones that do not know it ignore it.
+#define DIGITS_RINGTONE_SDP_ATTR "a=x-digits-ringtone:"
+esp_err_t digits_webrtc_call(const char *number, unsigned ringtone);
+
+// Picks the ringtone for an incoming call from `caller`; offered is the
+// caller's choice, or -1 for none. Runs on the peer worker when ringing
+// starts: it must be quick and nonblocking. Without a resolver the caller's
+// choice is used, or the standard ring.
+typedef unsigned (*digits_ringtone_resolver_fn)(const char *caller, int offered);
+void digits_webrtc_set_ringtone_resolver(digits_ringtone_resolver_fn resolver);
+
 // One-to-one call phase, in the worker's own order.
 typedef enum {
     DIGITS_CALL_IDLE,
@@ -40,11 +54,23 @@ typedef enum {
     DIGITS_CALL_CONNECTED,
 } digits_call_phase_t;
 
+// Why the most recent call ended.
+typedef enum {
+    DIGITS_CALL_END_LOCAL,         // This device hung up.
+    DIGITS_CALL_END_REMOTE_HANGUP, // Peer sent hangup.
+    DIGITS_CALL_END_BUSY,          // Peer or server reported busy.
+    DIGITS_CALL_END_UNREACHABLE,   // Server error, e.g. "phone not connected".
+    DIGITS_CALL_END_FAILED,        // Timeouts, transport, setup or signaling loss.
+} digits_call_end_t;
+
 typedef struct {
     digits_call_phase_t phase;
     bool online;
     bool paired;
     char remote[32];
+    uint32_t ended_calls;      // Increments once per ended call.
+    digits_call_end_t last_end;
+    bool last_connected;       // The ended call had reached CONNECTED.
 } digits_webrtc_call_state_t;
 
 // Nonblocking copy of the state the worker published after its last loop.

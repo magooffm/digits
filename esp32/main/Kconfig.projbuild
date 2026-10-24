@@ -92,6 +92,13 @@ menu "Digits development configuration"
             depends on DIGITS_PHONE_INPUT_GPIO
             range 0 48
             default 6
+        config DIGITS_PHONE_CALL_C_GPIO
+            int "Call button C GPIO"
+            depends on DIGITS_PHONE_INPUT_GPIO
+            range 0 48
+            default 39
+            help
+                Board-key mode has no third key; button C exists only here.
         config DIGITS_PHONE_CALL_A_NUMBER
             string "Default number for call button A"
             depends on DIGITS_PHONE
@@ -104,6 +111,38 @@ menu "Digits development configuration"
             string "Default number for call button B"
             depends on DIGITS_PHONE
             default ""
+        config DIGITS_PHONE_CALL_C_NUMBER
+            string "Default number for call button C"
+            depends on DIGITS_PHONE
+            default ""
+        config DIGITS_PHONE_SELECTOR_POSITIONS
+            int "Ringtone selector positions"
+            depends on DIGITS_PHONE
+            range 2 12
+            default 12
+            help
+                Positions of each local ringtone selector (rotary switch or
+                fader). The last position follows the caller's choice; the
+                others map to ringtones with 'phone position N RINGTONE'.
+        config DIGITS_PHONE_SELECTOR_A_GPIO
+            int "Ringtone selector A analog GPIO (-1: set from the console)"
+            depends on DIGITS_PHONE
+            range -1 9
+            default -1
+            help
+                ADC1 pin (GPIO1-9; GPIO10 is the board I2C clock) wired to a resistor ladder or fader for
+                calls from button A's number. -1 keeps the position set with
+                'phone selector a N'. Avoid GPIO3 (strapping).
+        config DIGITS_PHONE_SELECTOR_B_GPIO
+            int "Ringtone selector B analog GPIO (-1: set from the console)"
+            depends on DIGITS_PHONE
+            range -1 9
+            default -1
+        config DIGITS_PHONE_SELECTOR_C_GPIO
+            int "Ringtone selector C analog GPIO (-1: set from the console)"
+            depends on DIGITS_PHONE
+            range -1 9
+            default -1
     endmenu
     menu "Onboard microphone"
         choice DIGITS_MIC_RECORD_MODE

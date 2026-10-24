@@ -13,6 +13,8 @@
 #include "esp_wifi.h"
 #include "call_audio.h"
 #include "incoming_ring.h"
+#include "call_tones.h"
+#include "ringtones.h"
 #include "line_settings.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -28,6 +30,9 @@
 #define RING_TIMEOUT_US (60LL * 1000000)
 #define CONNECT_TIMEOUT_US (10LL * 1000000) // Pi connectTimeout, v1.99.0.
 #define AUDIO_FRAME_US 20000
+// The caller's offer, with its ringtone choice, normally follows the ring
+// within a few hundred milliseconds; ring with the standard tone if not.
+#define RINGTONE_HINT_WAIT_US 500000LL
 
 static const char *TAG = "webrtc";
 
@@ -47,6 +52,7 @@ typedef struct {
     char *servers[MAX_ICE_SERVERS];
     unsigned server_count;
     unsigned skipped_servers;
+    unsigned ringtone_hint; // COMMAND_CALL: 0 none, otherwise ringtone + 1.
 } event_t;
 
 typedef struct {
@@ -73,6 +79,9 @@ static struct {
     digits_call_audio_mode_t audio_mode;
     digits_call_audio_t *stopping_audio;
     uint32_t next_ring_id;
+    uint32_t ended_calls;
+    digits_call_end_t last_end;
+    bool last_connected;
     call_audio_packet_t send_packet;
     struct {
         esp_peer_handle_t peer;
@@ -80,6 +89,9 @@ static struct {
         char remote[NUMBER_CAPACITY];
         bool caller;
         bool answer_requested;
+        unsigned ringtone_hint;  // Outgoing: 0 none, otherwise ringtone + 1.
+        bool ring_started;       // Incoming: ringer started for this call.
+        int64_t ring_hint_deadline_us;
         bool remote_sdp;
         bool local_sdp;
         bool closing;
@@ -336,9 +348,22 @@ static void report_resources(const char *where)
         ESP_LOGI(TAG, "Wi-Fi RSSI=%d dBm power_save=%u", access_point.rssi, (unsigned)power_save);
 }
 
+static digits_call_end_t classify_end(const char *reason)
+{
+    if (!reason) return DIGITS_CALL_END_LOCAL;
+    if (!strcmp(reason, "local hangup")) return DIGITS_CALL_END_LOCAL;
+    if (!strcmp(reason, "remote hangup")) return DIGITS_CALL_END_REMOTE_HANGUP;
+    if (!strcmp(reason, "remote busy")) return DIGITS_CALL_END_BUSY;
+    if (!strcmp(reason, "server error")) return DIGITS_CALL_END_UNREACHABLE;
+    return DIGITS_CALL_END_FAILED;
+}
+
 static void end_call(bool notify, const char *reason)
 {
     if (rtc.call.phase == CALL_IDLE && !rtc.call.peer) return;
+    ++rtc.ended_calls;
+    rtc.last_end = classify_end(reason);
+    rtc.last_connected = rtc.call.phase == CALL_CONNECTED;
     digits_incoming_ring_stop();
     ESP_LOGI(TAG, "Ending one-to-one call peer=%s reason=%s tx=%" PRIu32 " rx=%" PRIu32,
              rtc.call.remote, reason ? reason : "local", rtc.call.tx_packets, rtc.call.rx_packets);
@@ -386,12 +411,79 @@ static int on_peer_state(esp_peer_state_t state, void *context)
         rtc.call.connected_at_us = esp_timer_get_time();
         rtc.call.next_audio_us = rtc.call.connected_at_us;
         rtc.call.next_report_us = rtc.call.connected_at_us + 1000000;
+        // Ringback may still hold the speaker; call audio waits for release.
+        digits_call_tones_stop();
         ESP_LOGI(TAG, "ICE and DTLS/SRTP connected; received media is still awaiting verification");
     } else if (state == ESP_PEER_STATE_DISCONNECTED || state == ESP_PEER_STATE_CONNECT_FAILED ||
                state == ESP_PEER_STATE_CLOSED) {
         rtc.call.failure = "peer transport failed";
     }
     return 0;
+}
+
+// Session-level attribute before the first media section. Returns a new
+// allocation, or NULL if it does not fit the SDP limit or memory runs out.
+static char *sdp_add_ringtone(const char *sdp, unsigned ringtone)
+{
+    char line[48];
+    int line_length = snprintf(line, sizeof(line), DIGITS_RINGTONE_SDP_ATTR "%u\r\n", ringtone);
+    size_t length = strlen(sdp);
+    if (line_length <= 0 || length + (size_t)line_length > DIGITS_WEBRTC_MAX_SDP) return NULL;
+    const char *media = strstr(sdp, "\nm=");
+    size_t at = media ? (size_t)(media - sdp) + 1 : length;
+    char *out = audio_heap_alloc(length + (size_t)line_length + 1);
+    if (!out) return NULL;
+    memcpy(out, sdp, at);
+    memcpy(out + at, line, (size_t)line_length);
+    memcpy(out + at + line_length, sdp + at, length - at + 1);
+    return out;
+}
+
+// Removes every ringtone attribute line in place so the peer library never
+// sees it. Returns the first valid ringtone, or -1 if none was offered.
+static int sdp_take_ringtone(char *sdp)
+{
+    static const char attribute[] = DIGITS_RINGTONE_SDP_ATTR;
+    int ringtone = -1;
+    char *line = sdp;
+    while (line && *line) {
+        char *end = strchr(line, '\n');
+        char *next = end ? end + 1 : line + strlen(line);
+        if (!strncmp(line, attribute, sizeof(attribute) - 1)) {
+            char *value = line + sizeof(attribute) - 1;
+            unsigned parsed = 0;
+            bool digits = value < next && *value >= '0' && *value <= '9';
+            while (value < next && *value >= '0' && *value <= '9' && parsed < 1000)
+                parsed = parsed * 10 + (unsigned)(*value++ - '0');
+            if (value < next && *value == '\r') ++value;
+            bool clean = value == next || (*value == '\n' && value + 1 == next);
+            if (ringtone < 0 && digits && clean && ringtones_valid(parsed)) ringtone = (int)parsed;
+            memmove(line, next, strlen(next) + 1);
+            continue; // The following line now starts here.
+        }
+        line = end ? next : NULL;
+    }
+    return ringtone;
+}
+
+static digits_ringtone_resolver_fn ringtone_resolver;
+
+void digits_webrtc_set_ringtone_resolver(digits_ringtone_resolver_fn resolver)
+{
+    ringtone_resolver = resolver; // Boot-time, before calls.
+}
+
+// offered: the caller's choice from the SDP, or -1.
+static void start_incoming_ring(int offered)
+{
+    if (rtc.call.phase != CALL_RINGING || rtc.call.ring_started || rtc.call.answer_requested) return;
+    rtc.call.ring_started = true;
+    unsigned ringtone = ringtone_resolver ? ringtone_resolver(rtc.call.remote, offered)
+                        : offered >= 0 ? (unsigned)offered : RINGTONE_STANDARD;
+    if (ringtone != (unsigned)offered)
+        ESP_LOGI(TAG, "Ringtone %u chosen on this phone (caller offered %d)", ringtone, offered);
+    if (++rtc.next_ring_id == 0) ++rtc.next_ring_id;
+    digits_incoming_ring_start(rtc.next_ring_id, ringtone);
 }
 
 static int on_peer_message(esp_peer_msg_t *message, void *context)
@@ -428,6 +520,16 @@ static int on_peer_message(esp_peer_msg_t *message, void *context)
             return ESP_PEER_ERR_BAD_DATA;
         }
         const char *type = rtc.call.caller ? "sdp" : "answer";
+        if (rtc.call.caller && rtc.call.ringtone_hint) {
+            char *tagged = sdp_add_ringtone(text, rtc.call.ringtone_hint - 1);
+            if (tagged) {
+                free(text);
+                text = tagged;
+                length = strlen(text);
+            } else {
+                ESP_LOGW(TAG, "Ringtone choice not added to offer; callee uses its standard ring");
+            }
+        }
         if (send_wire(type, rtc.call.remote, "sdp", text, NULL) != ESP_OK) {
             rtc.call.failure = "local SDP transmit queue failed";
             free(text);
@@ -710,6 +812,7 @@ static void process_event(event_t *event)
             return;
         }
         strcpy(rtc.call.remote, event->from);
+        rtc.call.ringtone_hint = event->ringtone_hint;
         digits_settings_set_media_busy(true);
         rtc.call.phase = CALL_CALLING;
         rtc.call.caller = true;
@@ -737,8 +840,8 @@ static void process_event(event_t *event)
         rtc.call.deadline_us = esp_timer_get_time() + RING_TIMEOUT_US;
         ESP_LOGI(TAG, "Incoming call from %s; use 'webrtc answer' or 'webrtc hangup'",
                  rtc.call.remote);
-        if (++rtc.next_ring_id == 0) ++rtc.next_ring_id;
-        digits_incoming_ring_start(rtc.next_ring_id);
+        // Ring once the offer reveals the caller's ringtone, or on timeout.
+        rtc.call.ring_hint_deadline_us = esp_timer_get_time() + RINGTONE_HINT_WAIT_US;
 #if CONFIG_DIGITS_WEBRTC_AUTO_ANSWER
         answer_incoming();
 #endif
@@ -759,7 +862,12 @@ static void process_event(event_t *event)
         }
         rtc.call.offer = event->data;
         event->data = NULL;
-        ESP_LOGI(TAG, "Caller SDP retained until answer (%u bytes)", (unsigned)strlen(rtc.call.offer));
+        {
+            int ringtone = sdp_take_ringtone(rtc.call.offer);
+            ESP_LOGI(TAG, "Caller SDP retained until answer (%u bytes); caller ringtone=%d",
+                     (unsigned)strlen(rtc.call.offer), ringtone);
+            start_incoming_ring(ringtone);
+        }
         if (rtc.call.answer_requested) answer_incoming();
         break;
     case EVENT_ANSWER:
@@ -794,6 +902,8 @@ static void service_audio(int64_t now)
     // before a codec worker can claim the output. Never wait in the peer task.
     if (!digits_incoming_ring_is_stopped()) return;
     if (!rtc.call.audio) {
+        // Same rule for call-progress tones; only the start waits.
+        if (!digits_call_tones_is_stopped()) return;
         esp_err_t err = digits_call_audio_start(rtc.audio_mode, &rtc.call.audio);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Call audio start failed: %s", esp_err_to_name(err));
@@ -869,6 +979,9 @@ static void publish_call_state(void)
         .phase = (digits_call_phase_t)rtc.call.phase,
         .online = rtc.owner_transport.online,
         .paired = rtc.owner_transport.paired,
+        .ended_calls = rtc.ended_calls,
+        .last_end = rtc.last_end,
+        .last_connected = rtc.last_connected,
     };
     strcpy(state.remote, rtc.call.remote);
     portENTER_CRITICAL(&call_state_mux);
@@ -899,6 +1012,9 @@ static void peer_task(void *context)
         if (current_transport() && rtc.call.phase == CALL_RINGING && rtc.call.answer_requested &&
             rtc.call.offer && digits_incoming_ring_is_stopped())
             answer_incoming();
+        if (rtc.call.phase == CALL_RINGING && !rtc.call.ring_started &&
+            esp_timer_get_time() >= rtc.call.ring_hint_deadline_us)
+            start_incoming_ring(-1); // No offer yet.
         if (rtc.call.peer && current_transport()) {
             int64_t before = esp_timer_get_time();
             bool connected = rtc.call.phase == CALL_CONNECTED;
@@ -1062,7 +1178,7 @@ bool digits_webrtc_receive(const cJSON *message, uint32_t session)
     return true;
 }
 
-esp_err_t digits_webrtc_command(const char *verb, const char *number)
+static esp_err_t queue_command(const char *verb, const char *number, unsigned ringtone_hint)
 {
     if (!verb) return ESP_ERR_INVALID_ARG;
     if (!rtc.queue) return ESP_ERR_INVALID_STATE;
@@ -1086,6 +1202,7 @@ esp_err_t digits_webrtc_command(const char *verb, const char *number)
         free_event(event);
         return ESP_ERR_INVALID_ARG;
     }
+    event->ringtone_hint = kind == COMMAND_CALL ? ringtone_hint : 0;
     if (kind == COMMAND_AUDIO) {
         if (!number || (strcmp(number, "tx") && strcmp(number, "rx") && strcmp(number, "full"))) {
             free_event(event);
@@ -1094,6 +1211,17 @@ esp_err_t digits_webrtc_command(const char *verb, const char *number)
         strcpy(event->from, number);
     }
     return enqueue(event);
+}
+
+esp_err_t digits_webrtc_command(const char *verb, const char *number)
+{
+    return queue_command(verb, number, 0);
+}
+
+esp_err_t digits_webrtc_call(const char *number, unsigned ringtone)
+{
+    if (!ringtones_valid(ringtone)) return ESP_ERR_INVALID_ARG;
+    return queue_command("call", number, ringtone + 1);
 }
 
 #else
@@ -1119,6 +1247,17 @@ esp_err_t digits_webrtc_command(const char *verb, const char *number)
 {
     (void)verb; (void)number;
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t digits_webrtc_call(const char *number, unsigned ringtone)
+{
+    (void)number; (void)ringtone;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+void digits_webrtc_set_ringtone_resolver(digits_ringtone_resolver_fn resolver)
+{
+    (void)resolver;
 }
 
 void digits_webrtc_call_state(digits_webrtc_call_state_t *state)

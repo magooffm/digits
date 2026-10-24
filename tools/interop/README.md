@@ -216,7 +216,13 @@ ends any call and opens a fresh registered WebSocket; `quit` or Ctrl+C exits.
 `--audio live` turns the helper into a second phone on the PC. It sends the
 default PulseAudio/PipeWire microphone and plays the ESP32 on the default
 output, through `parec` and `pacat` with 20 ms and 60 ms buffers. Both start
-only once a call is connected and stop at hangup. Use a headset: neither end
+only once a call is connected and stop at hangup. An incoming call rings on the same
+output until you type `answer` or the call ends. It uses the ringtone the
+caller chose (see the ESP32 README's caller-chosen ringtones), or the
+standard 440+480 Hz ring. `ringtones` lists them; `call NUMBER RINGTONE`
+makes the other phone ring with one, for example `call 3140001 3`. Clip numbers
+10-99 come from `esp32/ringtones` (override with `--ringtone-dir`), decoded
+with ffmpeg on first use; a clip that is missing on the PC rings standard. Use a headset: neither end
 cancels echo. The microphone queue holds 60 ms and drops older audio rather
 than growing delay. Counters for underruns and drops are logged at hangup.
 

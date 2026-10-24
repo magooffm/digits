@@ -1,6 +1,8 @@
 #include "credentials.h"
 #include "ring_test.h"
 #include "incoming_ring.h"
+#include "call_tones.h"
+#include "ringtone_pack.h"
 #include "line_settings.h"
 #include "audio_board.h"
 #include "microphone.h"
@@ -34,6 +36,12 @@ void app_main(void)
         if (err != ESP_OK)
             ESP_LOGE("digits", "Incoming ringtone unavailable: %s; calls still have logged indication", esp_err_to_name(err));
         digits_incoming_ring_set_silent(digits_settings_silent());
+        err = digits_ringtone_pack_load();
+        if (err != ESP_OK)
+            ESP_LOGE("digits", "Ringtone clips unavailable: %s; built-in ringtones still work", esp_err_to_name(err));
+        err = digits_call_tones_init();
+        if (err != ESP_OK)
+            ESP_LOGE("digits", "Call-progress tones unavailable: %s; calls still work", esp_err_to_name(err));
         err = digits_microphone_init();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Microphone initialization failed: %s; speaker and signaling continue", esp_err_to_name(err));

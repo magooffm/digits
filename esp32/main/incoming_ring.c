@@ -1,6 +1,7 @@
 #include "incoming_ring.h"
 #include "audio_board.h"
 #include "ring_tone.h"
+#include "ringtones.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -16,6 +17,8 @@
 typedef struct {
     uint32_t call_id;
     uint32_t revision;
+    unsigned ringtone;
+    int64_t on_us, period_us;
     int64_t started_us;
     bool active;
     bool silent;
@@ -78,9 +81,11 @@ static void ring_worker(void *arg)
     for (;;) {
         ring_state_t current = snapshot();
         int64_t elapsed = esp_timer_get_time() - current.started_us;
-        int64_t phase = elapsed >= 0 ? elapsed % RING_PERIOD_US : 0;
+        int64_t period = current.period_us ? current.period_us : RING_PERIOD_US;
+        int64_t phase = elapsed >= 0 ? elapsed % period : 0;
         bool enabled = current.active && !current.latched && !current.suppressed;
-        bool on = enabled && phase < RING_ON_US && current.revision != failed_revision;
+        bool on = enabled && phase < (current.on_us ? current.on_us : RING_ON_US) &&
+                  current.revision != failed_revision;
 
         if (owned && (!on || current.revision != owned_revision)) {
             release_speaker();
@@ -97,7 +102,7 @@ static void ring_worker(void *arg)
             portEXIT_CRITICAL(&state_mux);
             TickType_t delay = portMAX_DELAY;
             if (enabled && current.revision != failed_revision)
-                delay = wait_ticks((uint32_t)((RING_PERIOD_US - phase + 999) / 1000));
+                delay = wait_ticks((uint32_t)((period - phase + 999) / 1000));
             ulTaskNotifyTake(pdTRUE, delay);
             continue;
         }
@@ -130,10 +135,16 @@ static void ring_worker(void *arg)
             }
         }
         if (!still_audible(owned_revision)) continue;
-        // ring_tone_render deliberately stops after one second. Wrap the
-        // source cursor to repeat it through the two-second cadence window.
-        ring_tone_render(pcm, tone_frame, PCM_BLOCK_FRAMES);
-        for (size_t i = 0; i < PCM_BLOCK_FRAMES * 2; ++i) pcm[i] /= 2;
+        bool melody = current.ringtone != RINGTONE_STANDARD;
+        if (melody) {
+            // Melodies already render at the standard ring's level.
+            ringtones_render(current.ringtone, (uint32_t)tone_frame, pcm, PCM_BLOCK_FRAMES);
+        } else {
+            // ring_tone_render deliberately stops after one second. Wrap the
+            // source cursor to repeat it through the two-second cadence window.
+            ring_tone_render(pcm, tone_frame, PCM_BLOCK_FRAMES);
+            for (size_t i = 0; i < PCM_BLOCK_FRAMES * 2; ++i) pcm[i] /= 2;
+        }
         if (!still_audible(owned_revision)) continue;
         size_t written = 0;
         esp_err_t error = digits_audio_speaker_write(pcm, sizeof(pcm), &written, RING_WRITE_MS);
@@ -142,7 +153,9 @@ static void ring_worker(void *arg)
                      esp_err_to_name(error), (unsigned)written);
             failed_revision = owned_revision;
         }
-        tone_frame = (tone_frame + PCM_BLOCK_FRAMES) % RING_TONE_FRAMES;
+        // The speaker is released in every pause, so each cycle restarts at 0.
+        tone_frame = melody ? tone_frame + PCM_BLOCK_FRAMES
+                            : (tone_frame + PCM_BLOCK_FRAMES) % RING_TONE_FRAMES;
     }
 }
 
@@ -150,6 +163,7 @@ esp_err_t digits_incoming_ring_init(void)
 {
     if (worker) return ESP_ERR_INVALID_STATE;
     if (!digits_audio_rx_channel()) return ESP_ERR_INVALID_STATE;
+    if (!ringtones_init()) ESP_LOGE("incoming_ring", "Ringtone table invalid; melodies may be silent");
     if (xTaskCreate(ring_worker, "digits_in_ring", RING_WORKER_STACK_BYTES,
                     NULL, 4, &worker) != pdPASS) {
         worker = NULL;
@@ -158,13 +172,22 @@ esp_err_t digits_incoming_ring_init(void)
     return ESP_OK;
 }
 
-void digits_incoming_ring_start(uint32_t call_id)
+void digits_incoming_ring_start(uint32_t call_id, unsigned ringtone)
 {
     if (!call_id) return;
+    if (!ringtones_valid(ringtone)) ringtone = RINGTONE_STANDARD;
+    int64_t on_us = RING_ON_US, period_us = RING_PERIOD_US;
+    if (ringtone != RINGTONE_STANDARD) {
+        on_us = (int64_t)ringtones_melody_frames(ringtone) * 1000000 / RINGTONE_SAMPLE_RATE;
+        period_us = on_us + (int64_t)RINGTONE_PAUSE_FRAMES * 1000000 / RINGTONE_SAMPLE_RATE;
+    }
     portENTER_CRITICAL(&state_mux);
     bool duplicate = state.active && state.call_id == call_id;
     if (!duplicate) {
         state.call_id = call_id;
+        state.ringtone = ringtone;
+        state.on_us = on_us;
+        state.period_us = period_us;
         ++state.revision;
         // Avoid the worker's initial failed_revision sentinel on wraparound.
         if (!state.revision) ++state.revision;
@@ -176,8 +199,9 @@ void digits_incoming_ring_start(uint32_t call_id)
     bool silent = state.latched;
     portEXIT_CRITICAL(&state_mux);
     if (duplicate) return;
-    ESP_LOGI("incoming_ring", "Incoming call %u: %s", (unsigned)call_id,
-             silent ? "silent ringing" : "speaker ringing requested");
+    ESP_LOGI("incoming_ring", "Incoming call %u: %s, ringtone %u (%s)", (unsigned)call_id,
+             silent ? "silent ringing" : "speaker ringing requested", ringtone,
+             ringtones_name(ringtone));
     if (worker) xTaskNotifyGive(worker);
     else ESP_LOGW("incoming_ring", "Ringtone unavailable; incoming indication retained");
 }

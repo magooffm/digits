@@ -85,10 +85,121 @@ commands. Rules follow the Pi controller:
 
 - Lifting the handset while a call rings answers it.
 - Replacing the handset ends any call, outgoing or connected.
-- With the handset lifted and the line idle, button A or B calls its number.
-- Buttons pressed on-hook or during a call are logged and ignored.
+- With the handset lifted and dial tone playing, button A or B calls its number.
+- Buttons pressed on-hook, during a call, or after a call ended (busy or
+  reorder) are logged and ignored. Replace the handset first, as on the Pi.
 - The incoming ringtone is silent while the handset is lifted. If a call
   arrives off-hook, replacing the handset starts ringing; it is not rejected.
+
+### Call-progress tones
+
+With the handset lifted, the speaker plays the Pi's tones (`pi/tones`),
+generated in `tone_gen.c` instead of stored as WAV files:
+
+| When | Tone |
+| --- | --- |
+| Handset lifted, no call | Dial, 350+440 Hz continuous |
+| Calling out until answered | Ringback, 440+480 Hz, 2 s on / 4 s off |
+| Busy, or the far end left while ringing | Busy, 480+620 Hz, 0.5 s on / 0.5 s off |
+| Unreachable, failed, or the other side hung up | 1 s silence, then reorder, 480+620 Hz, 0.25 s on / 0.25 s off |
+| Dial tone unused for 15 s | Same reorder treatment |
+| 45 s of reorder | Silence until the handset is replaced |
+
+The Pi's spoken announcements and its howler tone are left out: there are no
+recordings on the ESP32, and the howler is too loud for the board speaker.
+`call_tones.c` owns the speaker only while a tone plays. Call audio waits
+until it has released the speaker, so ringback hands over cleanly when the
+call connects. Tests: `tests/tone_gen_test.c`, `tests/call_tones_test.py`,
+and tone cases in `tests/phone_fsm_test.c` and `tests/webrtc_interop_test.py`.
+
+Verified on the board on 2026-10-24: dial tone on lift, ringback on a button,
+reorder after "phone not connected", ignored button after a failed call, and
+reorder after 15 s of dial tone. Not yet verified: the audible tones, busy
+tone from a busy peer, and the ringback-to-call-audio hand-off on an answered
+call.
+
+### Caller-chosen ringtones
+
+The caller decides how the other phone rings. Each call button stores a
+ringtone next to its number:
+
+```text
+phone ringtones          # list: 0 standard ring, 1-4 melodies
+phone ringtone a 2       # calls from button A ring the other phone with Ode to Joy
+phone preview 2          # hear it on this phone (handset down, no call)
+```
+
+The choice travels as one session-level line in the SDP offer,
+`a=x-digits-ringtone:N`. The unchanged server relays the offer as-is; Pi
+phones and other clients ignore the line. The callee removes it before the
+offer reaches the peer library, waits up to 500 ms after `ring` for the
+offer, then rings with that ringtone, or with the standard ring if none
+arrives. A call from the console (`webrtc call`) adds nothing.
+
+The melodies are public-domain tunes synthesized in `ringtones.c` with a
+music-box timbre. One cycle is the melody plus a 2 s pause. Songs are defined
+in `ringtone_songs.h` as note strings; the index is the wire value, so append
+new songs and never reorder them. The Pion helper reads the same table and a
+test fails if the two drift apart. Tests: `tests/ringtones_test.c`, melody
+cases in `tests/incoming_ring_test.py` and `tests/call_tones_test.py`, and
+offer handling in `tests/webrtc_interop_test.py`.
+
+**Own recordings and songs.** Files in `esp32/ringtones/` named
+`NN-Name.ext` (NN 10-99, any format ffmpeg reads) are built into the firmware
+and selectable like the melodies, for example `phone ringtone a 12`. The
+build converts them to 24 kHz mono at the ringer level, trims silence, cuts
+at 30 s, and packs them into the 8 MB `ringtones` partition, flashed with the
+app (`make -C esp32 flash`); NVS is not touched. The folder is ignored by git
+except its README, which has the details. Flash every phone from the same
+folder: a phone without the requested clip rings with the standard ring.
+Numbers 0-9 stay reserved for built-in melodies, so adding songs never
+renumbers anything. Tests: `tests/pack_ringtones_test.py` and clip cases in
+`tests/ringtones_test.c`.
+
+Verified on the board on 2026-10-24: listing, setting, rejecting an invalid
+number and saving per button; a test clip was packed, listed, previewed and
+removed again. Not yet verified: how the melodies sound, and a
+call that rings the other phone with the chosen melody.
+
+### Ringtone selectors on this phone
+
+The other way around: each call button has a selector, a rotary switch or
+fader, that decides how calls *from* that button's number ring on this phone.
+All selectors share one position map; the last position always means "use
+the ringtone the caller chose". Callers that are on no button keep their
+own choice, and a selected clip this phone lacks falls back to it too.
+
+```text
+phone positions          # the map: 1-11 ringtones, 12 caller's choice
+phone position 3 12      # position 3 rings with clip 12
+phone selector a 3       # no switch fitted yet: set selector A from the console
+phone status             # per button: outgoing ringtone and how it rings here
+```
+
+Defaults: positions take the built-in ringtones and clips in order; unused
+positions ring standard. Positions, the map and console selector positions
+are saved in NVS. Under **Phone controls**, set the number of positions
+(2-12, matching the switch's end stop) and an analog pin per selector.
+
+Suggested hardware: a 1-pole 12-way rotary switch per caller (for example
+Lorlin CK1049, whose end stop can limit it to fewer positions, or Alpha
+SR2611F-0112) on a resistor ladder: eleven equal resistors (1 kOhm) in a
+chain between 3.3 V and GND, each switch contact on one tap, the wiper to the
+analog pin with 100 nF to GND. A 10 kOhm linear fader works the same way but
+has no detents; readings need 20% of a step past a border to change, so
+neither flickers. Use ADC1 pins (GPIO1-9, GPIO10 is the I2C clock; ADC2 does not work while Wi-Fi
+runs), for example GPIO7, 8 and 9 on the board's header; avoid GPIO3.
+
+Button C exists only in GPIO mode (default GPIO39); board-key mode keeps A
+and B. Logic: `ring_select.c`, tested by `tests/ring_select_test.c`; the
+WebRTC worker asks the phone through a resolver hook when ringing starts.
+
+Verified on the board on 2026-10-24: map listing, editing, the reserved last
+position, console selectors and status. GPIO mode with selectors on GPIO7-9
+compiles. Not yet verified: physical switches, and an incoming call ringing
+with the selector's choice.
+
+### Inputs
 
 Inputs are chosen under **Digits development configuration → Phone controls**:
 

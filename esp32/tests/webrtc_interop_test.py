@@ -131,6 +131,7 @@ prefix = r'''
 #include "call_audio.h"
 #include "line_settings.h"
 #include "incoming_ring.h"
+#include "call_tones.h"
 
 static int64_t host_now;
 static jmp_buf worker_boundary;
@@ -235,10 +236,12 @@ void digits_settings_get(digits_line_settings_t *snapshot, digits_settings_stats
     if (stats) memset(stats, 0, sizeof(*stats));
 }
 void digits_settings_set_media_busy(bool busy) { settings_busy = busy; }
-void digits_incoming_ring_start(uint32_t id)
+static unsigned last_ringtone = 99;
+void digits_incoming_ring_start(uint32_t id, unsigned ringtone)
 {
     assert(in_worker && id && id != last_ring_id);
     last_ring_id = id;
+    last_ringtone = ringtone;
     ++ring_starts;
     ring_stopped = false;
 }
@@ -249,6 +252,17 @@ void digits_incoming_ring_stop(void)
     if (ring_stop_completes) ring_stopped = true;
 }
 bool digits_incoming_ring_is_stopped(void) { return ring_stopped; }
+// Call-progress tones: the peer worker only ever stops them (at CONNECTED)
+// and must not start call audio until the player has released the speaker.
+static bool tones_stopped = true, tones_stop_completes = true;
+static unsigned tone_stop_requests;
+void digits_call_tones_stop(void)
+{
+    assert(in_worker);
+    ++tone_stop_requests;
+    if (tones_stop_completes) tones_stopped = true;
+}
+bool digits_call_tones_is_stopped(void) { return tones_stopped; }
 
 struct host_queue {
     unsigned length, size, head, count;
@@ -513,7 +527,7 @@ int esp_peer_close(esp_peer_handle_t peer)
 
 esp_err_t digits_call_audio_start(digits_call_audio_mode_t mode, digits_call_audio_t **out)
 {
-    assert(in_worker && out && !media.live && ring_stopped);
+    assert(in_worker && out && !media.live && ring_stopped && tones_stopped);
     assert(mode >= DIGITS_CALL_AUDIO_TX && mode <= DIGITS_CALL_AUDIO_FULL);
     ++media_start_calls;
     add_trace("media:start");
@@ -691,6 +705,8 @@ static void setup(void)
     media_initial_state = DIGITS_CALL_AUDIO_READY;
     media_stop_completes = true;
     ring_stopped = ring_stop_completes = true;
+    tones_stopped = tones_stop_completes = true;
+    tone_stop_requests = 0;
     settings_busy = false;
     ring_starts = ring_stops = last_ring_id = 0;
     memset(&settings, 0, sizeof(settings));
@@ -1553,9 +1569,10 @@ static void test_ringtone_answer_ownership(void)
     setup();
     receive("ring", "1002", NULL, NULL, NULL);
     pump(1);
-    assert(ring_starts == 1 && !ring_stopped && settings_busy);
+    assert(ring_starts == 0 && settings_busy); // Waits for the caller's ringtone.
     receive("sdp", "1002", "sdp", local_sdp_text, NULL);
     pump(1);
+    assert(ring_starts == 1 && last_ringtone == 0 && !ring_stopped); // No choice: standard.
     ring_stop_completes = false;
     command("answer", NULL);
     pump(2);
@@ -1592,13 +1609,185 @@ static void test_ringtone_answer_ownership(void)
     ++cases;
 }
 
+static void test_tones_release_before_call_audio(void)
+{
+    setup();
+    start_outgoing();
+    apply_answer();
+    // Ringback still owns the speaker when media connects.
+    tones_stopped = false;
+    tones_stop_completes = false;
+    connect_next_loop = true;
+    pump(1);
+    assert(rtc.call.phase == CALL_CONNECTED && tone_stop_requests == 1);
+    assert(media_start_calls == 0 && !media.live);
+    pump(3); // The worker keeps looping without blocking on the speaker.
+    assert(media_start_calls == 0 && rtc.call.phase == CALL_CONNECTED);
+    tones_stopped = true;
+    pump(1);
+    assert(media_start_calls == 1 && media.live);
+    // Once media runs, tone state no longer gates sending.
+    tones_stopped = false;
+    queue_microphone_packet(0, host_now);
+    pump(1);
+    assert(audio_calls == 1);
+    tones_stopped = true;
+    finish();
+    ++cases;
+}
+
+static void end_reason_case(const char *how, digits_call_end_t want, bool connect)
+{
+    setup();
+    digits_webrtc_call_state_t before, after;
+    digits_webrtc_call_state(&before);
+    start_outgoing();
+    if (connect) {
+        apply_answer();
+        connect_peer();
+    }
+    if (!strcmp(how, "local")) command("hangup", NULL);
+    else if (!strcmp(how, "timeout")) host_now += 61LL * 1000000;
+    else receive(how, "1002", NULL, NULL, NULL);
+    pump(2);
+    digits_webrtc_call_state(&after);
+    assert(rtc.call.phase == CALL_IDLE && after.phase == DIGITS_CALL_IDLE);
+    assert(after.ended_calls == before.ended_calls + 1);
+    assert(after.last_end == want && after.last_connected == connect);
+    finish();
+    ++cases;
+}
+
+static void test_call_end_reasons(void)
+{
+    end_reason_case("busy", DIGITS_CALL_END_BUSY, false);
+    end_reason_case("hangup", DIGITS_CALL_END_REMOTE_HANGUP, false);
+    end_reason_case("hangup", DIGITS_CALL_END_REMOTE_HANGUP, true);
+    end_reason_case("error", DIGITS_CALL_END_UNREACHABLE, false);
+    end_reason_case("local", DIGITS_CALL_END_LOCAL, true);
+    end_reason_case("timeout", DIGITS_CALL_END_FAILED, false);
+}
+
+static char resolver_caller[32];
+static int resolver_offered = -2;
+static unsigned test_resolver(const char *caller, int offered)
+{
+    assert(in_worker && caller);
+    snprintf(resolver_caller, sizeof(resolver_caller), "%s", caller);
+    resolver_offered = offered;
+    return 3;
+}
+
+static void offer_with(char *out, size_t size, const char *attribute_line)
+{
+    const char *media = strstr(local_sdp_text, "m=audio");
+    assert(media);
+    snprintf(out, size, "%.*s%s%s", (int)(media - local_sdp_text), local_sdp_text, attribute_line, media);
+}
+
+static void test_caller_ringtone(void)
+{
+    char offer[1024];
+    // Incoming choice: used for the ringer, removed before the peer library.
+    setup();
+    receive("ring", "1002", NULL, NULL, NULL);
+    pump(1);
+    assert(ring_starts == 0);
+    offer_with(offer, sizeof(offer), "a=x-digits-ringtone:3\r\n");
+    receive("sdp", "1002", "sdp", offer, NULL);
+    pump(1);
+    assert(ring_starts == 1 && last_ringtone == 3);
+    assert(!strstr(rtc.call.offer, "x-digits-ringtone") && !strcmp(rtc.call.offer, local_sdp_text));
+    command("answer", NULL);
+    pump(2);
+    assert(sdp_calls == 1 && !strcmp(remote_sdp, local_sdp_text));
+    finish();
+    ++cases;
+
+    // Unknown or malformed values fall back to the standard ring.
+    const char *bad[] = {"a=x-digits-ringtone:99\r\n", "a=x-digits-ringtone:\r\n",
+                         "a=x-digits-ringtone:2x\r\n"};
+    for (unsigned i = 0; i < 3; ++i) {
+        setup();
+        receive("ring", "1002", NULL, NULL, NULL);
+        offer_with(offer, sizeof(offer), bad[i]);
+        receive("sdp", "1002", "sdp", offer, NULL);
+        pump(2);
+        assert(ring_starts == 1 && last_ringtone == 0);
+        assert(!strstr(rtc.call.offer, "x-digits-ringtone"));
+        finish();
+        ++cases;
+    }
+
+    // Answering before the offer and before the wait never starts the ringer.
+    setup();
+    receive("ring", "1002", NULL, NULL, NULL);
+    command("answer", NULL);
+    pump(1);
+    host_now += 600000;
+    pump(1);
+    assert(ring_starts == 0);
+    offer_with(offer, sizeof(offer), "a=x-digits-ringtone:1\r\n");
+    receive("sdp", "1002", "sdp", offer, NULL);
+    pump(2);
+    assert(ring_starts == 0 && peer_opened);
+    finish();
+    ++cases;
+
+    // Outgoing choice travels as a session-level attribute before m=.
+    setup();
+    assert(digits_webrtc_call("1002", 4) == ESP_OK);
+    assert(digits_webrtc_call("1002", 99) == ESP_ERR_INVALID_ARG);
+    pump(1);
+    assert(rtc.call.phase == CALL_CALLING && wire_count == 2);
+    cJSON *sent = wire_message(1, "sdp");
+    const char *text = json_text(sent, "sdp");
+    const char *attribute = strstr(text, "a=x-digits-ringtone:4\r\n");
+    assert(attribute && attribute < strstr(text, "m=audio"));
+    offer_with(offer, sizeof(offer), "a=x-digits-ringtone:4\r\n");
+    assert(!strcmp(text, offer));
+    cJSON_Delete(sent);
+    finish();
+    ++cases;
+
+    // The phone layer's resolver decides the final ringtone per caller.
+    setup();
+    digits_webrtc_set_ringtone_resolver(test_resolver);
+    receive("ring", "1002", NULL, NULL, NULL);
+    offer_with(offer, sizeof(offer), "a=x-digits-ringtone:1\r\n");
+    receive("sdp", "1002", "sdp", offer, NULL);
+    pump(2);
+    assert(ring_starts == 1 && last_ringtone == 3);
+    assert(!strcmp(resolver_caller, "1002") && resolver_offered == 1);
+    finish();
+    ++cases;
+    setup(); // No offer: the resolver is told -1.
+    receive("ring", "1002", NULL, NULL, NULL);
+    pump(1);
+    host_now += 500000;
+    pump(1);
+    assert(ring_starts == 1 && resolver_offered == -1 && last_ringtone == 3);
+    digits_webrtc_set_ringtone_resolver(NULL);
+    finish();
+    ++cases;
+
+    // A plain console call adds nothing.
+    setup();
+    start_outgoing(); // Asserts the offer equals the library's SDP exactly.
+    finish();
+    ++cases;
+}
+
 static void test_ringtone_terminal_cleanup(void)
 {
     for (unsigned terminal = 0; terminal < 3; ++terminal) {
         setup();
         receive("ring", "1002", NULL, NULL, NULL);
         pump(1);
-        assert(ring_starts == 1);
+        assert(ring_starts == 0);
+        host_now += 500000; // No offer: the standard ring starts after the wait.
+        pump(1);
+        assert(ring_starts == 1 && last_ringtone == 0);
         ring_stop_completes = false;
         if (terminal == 0) command("hangup", NULL);
         else if (terminal == 1) host_now = rtc.call.deadline_us + 1;
@@ -1619,6 +1808,8 @@ static void test_ringtone_terminal_cleanup(void)
         pump(1);
         assert(!settings_busy);
         receive("ring", "1002", NULL, NULL, NULL);
+        pump(1);
+        host_now += 500000;
         pump(1);
         assert(rtc.call.phase == CALL_RINGING && ring_starts == 2 && last_ring_id == 2);
         finish();
@@ -1655,6 +1846,9 @@ int main(void)
     test_peer_loop_timing_diagnostics();
     test_ringtone_answer_ownership();
     test_ringtone_terminal_cleanup();
+    test_caller_ringtone();
+    test_tones_release_before_call_audio();
+    test_call_end_reasons();
     printf("WebRTC adapter: %u real-worker lifecycle cases passed (mock peer; physical interoperability unverified)\n", cases);
     return 0;
 }
@@ -1674,7 +1868,8 @@ with tempfile.TemporaryDirectory(prefix="digits-webrtc-host-") as directory:
         "cc", "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror",
         "-I", str(temporary), "-I", str(repo / "esp32/main"),
         "-I", str(args.peer_include), "-I", str(cjson_dir),
-        str(harness), str(cjson_dir / "cJSON.c"), "-lm", "-o", str(binary),
+        str(harness), str(cjson_dir / "cJSON.c"), str(repo / "esp32/main/ringtones.c"),
+        "-lm", "-o", str(binary),
     ]
     if args.sanitize:
         command[1:1] = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-g"]

@@ -3,3 +3,5 @@
 nvs,      data, nvs,     0x9000,  0x6000,
 phy_init, data, phy,     0xf000,  0x1000,
 factory,  app,  factory, 0x10000, 4M,
+# Caller-selectable ringtone clips packed at build time from esp32/ringtones.
+ringtones, data, 0x40,  0x410000, 8M,

@@ -1,0 +1,100 @@
+{
+    // ESP32 shortcuts: Ctrl+Shift+B runs the default "build, flash and monitor".
+    // Other tasks: Terminal > Run Task. ESP32 tasks call esp32/Makefile,
+    // Pion tasks call tools/interop/Makefile.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "ESP32: Build, flash and monitor",
+            "type": "shell",
+            "command": "make -C esp32 deploy",
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": "$gcc",
+            "presentation": { "panel": "dedicated", "focus": true, "clear": true }
+        },
+        {
+            "label": "ESP32: Build",
+            "type": "shell",
+            "command": "make -C esp32 build",
+            "group": "build",
+            "problemMatcher": { "base": "$gcc", "fileLocation": ["relative", "${workspaceFolder}/esp32/build"] },
+            "presentation": { "clear": true }
+        },
+        {
+            "label": "ESP32: Flash",
+            "type": "shell",
+            "command": "make -C esp32 flash",
+            "problemMatcher": "$gcc",
+            "presentation": { "clear": true }
+        },
+        {
+            "label": "ESP32: Monitor",
+            "type": "shell",
+            "command": "make -C esp32 monitor",
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "focus": true }
+        },
+        {
+            "label": "ESP32: Kill serial monitors",
+            "detail": "Stops every idf.py monitor, including ones in hidden terminals, and frees the port",
+            "type": "shell",
+            "command": "make -C esp32 kill-monitors",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "clear": true }
+        },
+        {
+            "label": "ESP32: Host tests",
+            "type": "shell",
+            "command": "make -C esp32 test",
+            "group": "test",
+            "problemMatcher": [],
+            "presentation": { "clear": true }
+        },
+        {
+            "label": "Pion: live call peer",
+            "detail": "Second phone on this PC: headset mic and speaker. Commands: call NUMBER, answer, hangup, status, quit",
+            "type": "shell",
+            "command": "make -C tools/interop live",
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "focus": true }
+        },
+        {
+            "label": "Pion: live call peer (recording)",
+            "detail": "Like the live peer, and saves each call to ~/.config/digits-interop/audio",
+            "type": "shell",
+            "command": "make -C tools/interop live-record",
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "focus": true }
+        },
+        {
+            "label": "Pion: mix last recorded call",
+            "detail": "Stereo call-*.wav: left ESP32, right PC microphone",
+            "type": "shell",
+            "command": "make -C tools/interop mix",
+            "problemMatcher": [],
+            "presentation": { "reveal": "always", "clear": true }
+        },
+        {
+            "label": "Pion: build helper",
+            "type": "shell",
+            "command": "make -C tools/interop container-build",
+            "problemMatcher": "$go",
+            "presentation": { "clear": true }
+        },
+        {
+            "label": "Pion: helper tests",
+            "type": "shell",
+            "command": "make -C tools/interop container-test",
+            "group": "test",
+            "problemMatcher": "$go",
+            "presentation": { "clear": true }
+        },
+        {
+            "label": "ESP32: menuconfig",
+            "type": "shell",
+            "command": "make -C esp32 menuconfig",
+            "problemMatcher": [],
+            "presentation": { "panel": "dedicated", "focus": true }
+        }
+    ]
+}
