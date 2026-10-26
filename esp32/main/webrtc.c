@@ -457,7 +457,7 @@ static int sdp_take_ringtone(char *sdp)
                 parsed = parsed * 10 + (unsigned)(*value++ - '0');
             if (value < next && *value == '\r') ++value;
             bool clean = value == next || (*value == '\n' && value + 1 == next);
-            if (ringtone < 0 && digits && clean && ringtones_valid(parsed)) ringtone = (int)parsed;
+            if (ringtone < 0 && digits && clean && ringtones_sendable(parsed)) ringtone = (int)parsed;
             memmove(line, next, strlen(next) + 1);
             continue; // The following line now starts here.
         }
@@ -1220,7 +1220,7 @@ esp_err_t digits_webrtc_command(const char *verb, const char *number)
 
 esp_err_t digits_webrtc_call(const char *number, unsigned ringtone)
 {
-    if (!ringtones_valid(ringtone)) return ESP_ERR_INVALID_ARG;
+    if (!ringtones_sendable(ringtone)) return ESP_ERR_INVALID_ARG;
     return queue_command("call", number, ringtone + 1);
 }
 

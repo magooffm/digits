@@ -165,39 +165,93 @@ call that rings the other phone with the chosen melody.
 
 The other way around: each call button has a selector, a rotary switch or
 fader, that decides how calls *from* that button's number ring on this phone.
-All selectors share one position map; the last position always means "use
-the ringtone the caller chose". Callers that are on no button keep their
-own choice, and a selected clip this phone lacks falls back to it too.
+All selectors share one position map, and every position is a ringtone.
+Callers that are on no button keep their own choice, and a selected clip
+this phone lacks falls back to it too.
 
 ```text
-phone positions          # the map: 1-11 ringtones, 12 caller's choice
+phone positions          # the map: positions 1-12 and their ringtones
 phone position 3 12      # position 3 rings with clip 12
 phone selector a 3       # no switch fitted yet: set selector A from the console
 phone status             # per button: outgoing ringtone and how it rings here
 ```
 
 Defaults: positions take the built-in ringtones and clips in order; unused
-positions ring standard. Positions, the map and console selector positions
-are saved in NVS. Under **Phone controls**, set the number of positions
+positions ring standard; console selectors start at position 1. Positions,
+the map and console selector positions are saved in NVS. A map saved by
+older firmware, whose last position meant "caller's choice", rings standard
+there until you set it with `phone position`. Under **Phone controls**, set the number of positions
 (2-12, matching the switch's end stop) and an analog pin per selector.
 
-Suggested hardware: a 1-pole 12-way rotary switch per caller (for example
-Lorlin CK1049, whose end stop can limit it to fewer positions, or Alpha
-SR2611F-0112) on a resistor ladder: eleven equal resistors (1 kOhm) in a
-chain between 3.3 V and GND, each switch contact on one tap, the wiper to the
-analog pin with 100 nF to GND. A 10 kOhm linear fader works the same way but
-has no detents; readings need 20% of a step past a border to change, so
-neither flickers. Use ADC1 pins (GPIO1-9, GPIO10 is the I2C clock; ADC2 does not work while Wi-Fi
-runs), for example GPIO7, 8 and 9 on the board's header; avoid GPIO3.
+Suggested hardware (in Germany): a 1-pole 12-way rotary switch per call button,
+TRU Components SR26A4-1X12-18F20 (Conrad 2353898, 6 mm knurled shaft; check
+the datasheet) with a PB Fastener 3030420 knob, on a resistor ladder: eleven
+equal resistors (1 kOhm) in a chain between 3.3 V and GND, each switch contact
+on one tap, the wiper to the analog pin with 100 nF to GND. A 10 kOhm linear
+fader or rotary pot works without the ladder but has no detents; readings need
+20% of a step past a border to change, so neither flickers. Use ADC1 pins
+(GPIO1-9; ADC2 does not work while Wi-Fi runs). Avoid GPIO3 (strapping),
+GPIO10 (I2C clock) and, in GPIO input mode, GPIO4-6 (hook, A, B): for example
+GPIO7, 8 and 9.
 
 Button C exists only in GPIO mode (default GPIO39); board-key mode keeps A
 and B. Logic: `ring_select.c`, tested by `tests/ring_select_test.c`; the
 WebRTC worker asks the phone through a resolver hook when ringing starts.
 
-Verified on the board on 2026-10-24: map listing, editing, the reserved last
-position, console selectors and status. GPIO mode with selectors on GPIO7-9
+Verified on the board on 2026-10-24: map listing, editing, console
+selectors and status (when the last position was still reserved for the
+caller's choice; since 2026-10-26 it is a ringtone like the others). GPIO mode with selectors on GPIO7-9
 compiles. Not yet verified: physical switches, and an incoming call ringing
 with the selector's choice.
+
+### Ringtones from the SD card
+
+Put MP3 files in a `ringtones` folder on a FAT32 microSD card in the board's
+slot, named after the selector position they take over. `ringtone-03.mp3`
+then plays whenever a selector stands on position 3, instead of that
+position's mapped ringtone. Positions without a file keep their map entry.
+The files stay on this phone: callers never see or choose them.
+
+```text
+ringtones/
+  ringtone-03.mp3
+  ringtone-07.mp3
+```
+
+- **Names.** `ringtone-NN.mp3`, NN from 01 to the number of selector
+  positions; `ringtone-3.mp3` and any letter case work too. Other files are
+  logged and ignored.
+- **Streaming.** Files play straight from the card, whole songs of any
+  length: a decoder task fills a one-second buffer while ringing, so memory
+  use does not depend on the file. Each ring cycle plays the song, pauses
+  two seconds and starts again. The card is mounted at boot and read for
+  file names and lengths (from the MP3 headers); restart the phone after
+  changing files.
+- **Quality.** Mono (the board has one speaker), leading silence skipped.
+  48 kHz files need no resampling; other rates go through
+  Espressif's high-quality resampler (`esp_audio_effects`, complexity 3)
+  instead of the linear interpolation packed clips use. Songs keep their
+  dynamics: **SD card ringtone level** scales them by a fixed percentage
+  (12 by default, which puts a full-scale master at the standard ring's
+  peak). For the best result, store 48 kHz MP3s at 192 kbps or more.
+- **Failures.** A file that cannot be decoded when it should ring falls back
+  to the standard ring for that call and to the mapped ringtone afterwards.
+- **Console.** `phone ringtones` shows the card status and the files as
+  numbers 101-112; `phone positions` and `phone status` show which positions
+  a file takes over; `phone preview 103` plays one. They cannot be sent as an
+  outgoing ringtone: `phone ringtone a 103` is refused.
+- **Setup.** On by default under **Phone controls → Ringtones from the SD
+  card**. The card uses GPIO40 (CLK), GPIO42 (CMD) and GPIO41 (D0) in 1-bit
+  mode, as in Waveshare's demos; keep buttons off those pins. Long file
+  names are enabled in `sdkconfig.defaults`; an older `sdkconfig` needs
+  **Component config → FAT Filesystem support → Long filename support** set
+  to the heap option.
+
+Verified on the board on 2026-10-26: boot with and without a card, five
+48 kHz files found with their lengths, previews streaming with no buffer
+underruns (heard through the board microphone), console output and the
+refused outgoing number. Not yet verified: an incoming call ringing with an
+SD file, and resampling of non-48 kHz files.
 
 ### Inputs
 

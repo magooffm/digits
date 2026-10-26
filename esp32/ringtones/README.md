@@ -18,3 +18,6 @@ commercial songs out of the repository.
   standard ring instead.
 
 The Pion helper (`tools/interop`) plays the same files from this folder.
+
+To give one phone its own ringtones without reflashing, use the SD card
+instead: see "Ringtones from the SD card" in `esp32/README.md`.

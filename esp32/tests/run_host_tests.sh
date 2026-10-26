@@ -42,6 +42,7 @@ c_sources() {
         tone_gen) echo "$main/tone_gen.c $tests/tone_gen_test.c" ;;
         ringtones) echo "$main/ringtones.c $tests/ringtones_test.c" ;;
         ring_select) echo "$main/ring_select.c $tests/ring_select_test.c" ;;
+        sd_ringtone_util) echo "$main/sd_ringtone_util.c $tests/sd_ringtone_util_test.c" ;;
         call_audio_jitter) echo "$main/call_audio_jitter.c $tests/call_audio_jitter_test.c" ;;
         ring_tone) echo "$main/ring_tone.c $tests/ring_tone_test.c" ;;
         microphone_pcm) echo "$main/microphone_pcm.c $tests/microphone_pcm_test.c" ;;
@@ -49,7 +50,7 @@ c_sources() {
     esac
 }
 
-for name in phone_fsm tone_gen ringtones ring_select call_audio_jitter ring_tone microphone_pcm record_playback_pcm; do
+for name in phone_fsm tone_gen ringtones ring_select sd_ringtone_util call_audio_jitter ring_tone microphone_pcm record_playback_pcm; do
     # shellcheck disable=SC2046 # word splitting of the source list is intended.
     run "$name" sh -c 'out="$1"; shift; cc -std=c11 -Wall -Wextra -Werror -I "$0" "$@" -lm -o "$out" && "$out"' \
         "$main" "$work/$name" $(c_sources "$name")

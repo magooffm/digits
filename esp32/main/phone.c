@@ -8,6 +8,7 @@
 #include "call_tones.h"
 #include "ringtones.h"
 #include "ring_select.h"
+#include "sd_ringtones.h"
 #include "webrtc.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -134,7 +135,7 @@ static void load_numbers(void)
     unsigned count = ringtones_list(available, sizeof(available) / sizeof(available[0]));
     ring_select_map_t map;
     ring_select_default_map(&map, SELECTOR_POSITIONS, available, count);
-    for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) selector[i] = (uint8_t)(map.positions - 1);
+    for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) selector[i] = 0;
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
     for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {
@@ -144,7 +145,7 @@ static void load_numbers(void)
             snprintf(numbers[i], NUMBER_CAPACITY, "%s", default_numbers[i]);
         uint8_t ringtone = RINGTONE_STANDARD;
         if (err == ESP_OK && nvs_get_u8(nvs, ringtone_keys[i], &ringtone) == ESP_OK &&
-            ringtones_valid(ringtone))
+            ringtones_sendable(ringtone))
             ringtones[i] = ringtone;
         uint8_t position;
         if (err == ESP_OK && nvs_get_u8(nvs, selector_keys[i], &position) == ESP_OK &&
@@ -524,14 +525,12 @@ static void print_status(void)
         printf("Call button %s: %s, rings their phone with %u (%s)\n", target_names[i],
                numbers[i][0] ? numbers[i] : "unset", ringtones[i], ringtones_name(ringtones[i]));
         unsigned position = selector[i];
-        uint8_t local = map.ringtone[position];
-        if (local == RING_SELECT_CALLER)
-            printf("  their calls ring here: selector %u/%u (%s) = caller's choice\n", position + 1,
-                   map.positions, hardware[i] ? "switch" : "console");
-        else
-            printf("  their calls ring here: selector %u/%u (%s) = %u (%s)\n", position + 1,
-                   map.positions, hardware[i] ? "switch" : "console", local,
-                   ringtones_name(local) ? ringtones_name(local) : "missing, falls back");
+        unsigned local = map.ringtone[position];
+        if (ringtones_valid(RINGTONE_FIRST_LOCAL + position)) local = RINGTONE_FIRST_LOCAL + position;
+        printf("  their calls ring here: selector %u/%u (%s) = %u (%s%s)\n", position + 1,
+               map.positions, hardware[i] ? "switch" : "console", local,
+               local >= RINGTONE_FIRST_LOCAL ? "SD card: " : "",
+               ringtones_name(local) ? ringtones_name(local) : "missing, falls back");
     }
 }
 
@@ -542,11 +541,11 @@ static void print_positions(void)
     portEXIT_CRITICAL(&shared_mux);
     for (unsigned p = 0; p < map.positions; ++p) {
         uint8_t ringtone = map.ringtone[p];
-        if (ringtone == RING_SELECT_CALLER)
-            printf("%2u  caller's choice\n", p + 1);
-        else
-            printf("%2u  %u %s\n", p + 1, ringtone,
-                   ringtones_name(ringtone) ? ringtones_name(ringtone) : "(missing: falls back)");
+        printf("%2u  %u %s", p + 1, ringtone,
+               ringtones_name(ringtone) ? ringtones_name(ringtone) : "(missing: falls back)");
+        if (ringtones_valid(RINGTONE_FIRST_LOCAL + p))
+            printf("  -> plays SD card %s instead", ringtones_name(RINGTONE_FIRST_LOCAL + p));
+        printf("\n");
     }
 }
 
@@ -559,11 +558,13 @@ static bool parse_position(const char *text, unsigned positions, unsigned *posit
     return true;
 }
 
-static bool parse_ringtone(const char *text, unsigned *ringtone)
+// local: also accept SD card ringtones, which only this phone can play.
+static bool parse_ringtone(const char *text, bool local, unsigned *ringtone)
 {
     char *end = NULL;
     unsigned long value = text ? strtoul(text, &end, 10) : 0;
-    if (!text || !text[0] || *end || !ringtones_valid((unsigned)value)) return false;
+    if (!text || !text[0] || *end || value > UINT8_MAX) return false;
+    if (local ? !ringtones_valid((unsigned)value) : !ringtones_sendable((unsigned)value)) return false;
     *ringtone = (unsigned)value;
     return true;
 }
@@ -625,11 +626,17 @@ int digits_phone_console(int argc, char **argv)
         for (unsigned i = 0; i < count; ++i)
             printf("%2u  %s%s\n", ids[i], ringtones_name(ids[i]),
                    ids[i] >= RINGTONE_FIRST_CLIP ? "  (clip)" : "");
+        printf("SD card: %s\n", digits_sd_ringtones_status());
+        for (unsigned id = RINGTONE_FIRST_LOCAL; id < RINGTONE_FIRST_LOCAL + RINGTONE_LOCAL_SLOTS; ++id)
+            if (ringtones_valid(id))
+                printf("%3u  %s  (SD card, position %u, %.1f s)\n", id, ringtones_name(id),
+                       id - RINGTONE_FIRST_LOCAL + 1,
+                       (double)ringtones_melody_frames(id) / RINGTONE_SAMPLE_RATE);
         return 0;
     }
     unsigned ringtone;
     if (!strcmp(verb, "ringtone") && argc == 4 && target >= 0) {
-        if (!parse_ringtone(argv[3], &ringtone)) {
+        if (!parse_ringtone(argv[3], false, &ringtone)) {
             printf("Unknown ringtone; see 'phone ringtones'\n");
             return 1;
         }
@@ -654,12 +661,11 @@ int digits_phone_console(int argc, char **argv)
     portEXIT_CRITICAL(&shared_mux);
     unsigned position;
     if (!strcmp(verb, "position") && argc == 4) {
-        if (!parse_position(argv[2], map.positions - 1, &position)) {
-            printf("Position must be 1-%u; %u is always the caller's choice\n", map.positions - 1,
-                   map.positions);
+        if (!parse_position(argv[2], map.positions, &position)) {
+            printf("Position must be 1-%u\n", map.positions);
             return 1;
         }
-        if (!parse_ringtone(argv[3], &ringtone)) {
+        if (!parse_ringtone(argv[3], false, &ringtone)) {
             printf("Unknown ringtone; see 'phone ringtones'\n");
             return 1;
         }
@@ -699,7 +705,7 @@ int digits_phone_console(int argc, char **argv)
         printf("Selector %s set to position %u (saved)\n", target_names[target], position + 1);
         return 0;
     }
-    if (!strcmp(verb, "preview") && argc == 3 && parse_ringtone(argv[2], &ringtone)) {
+    if (!strcmp(verb, "preview") && argc == 3 && parse_ringtone(argv[2], true, &ringtone)) {
         portENTER_CRITICAL(&shared_mux);
         shared.preview_request = (int)ringtone;
         portEXIT_CRITICAL(&shared_mux);

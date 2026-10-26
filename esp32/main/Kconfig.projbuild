@@ -122,8 +122,8 @@ menu "Digits development configuration"
             default 12
             help
                 Positions of each local ringtone selector (rotary switch or
-                fader). The last position follows the caller's choice; the
-                others map to ringtones with 'phone position N RINGTONE'.
+                fader). Each position maps to a ringtone with
+                'phone position N RINGTONE'.
         config DIGITS_PHONE_SELECTOR_A_GPIO
             int "Ringtone selector A analog GPIO (-1: set from the console)"
             depends on DIGITS_PHONE
@@ -143,6 +143,23 @@ menu "Digits development configuration"
             depends on DIGITS_PHONE
             range -1 9
             default -1
+        config DIGITS_SD_RINGTONES
+            bool "Ringtones from the SD card"
+            depends on DIGITS_PHONE
+            default y
+            help
+                Plays ringtones/ringtone-NN.mp3 from the board's SD card,
+                streamed while ringing: selector position NN then plays that
+                file instead of its mapped ringtone. The card uses
+                GPIO40-42; keep buttons off those pins.
+        config DIGITS_SD_RINGTONE_LEVEL
+            int "SD card ringtone level (percent of the file's level)"
+            depends on DIGITS_SD_RINGTONES
+            range 1 100
+            default 12
+            help
+                Songs are mastered near full scale. 12 puts their peaks at
+                the standard ring's level; raise it for louder songs.
     endmenu
     menu "Onboard microphone"
         choice DIGITS_MIC_RECORD_MODE

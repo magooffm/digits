@@ -94,6 +94,56 @@ static void test_clips(void)
     assert(ringtones_set_clips(NULL, 0, 24000, fake_read) == 0 && !ringtones_valid(12));
 }
 
+// Local (SD card) ringtones: streamed at 48 kHz, faded, never sendable.
+static unsigned stream_slot = 99;
+static uint32_t stream_next;
+static int16_t stream_sample(uint32_t n) { return (int16_t)(n % 200 * 20 - 2000); }
+static void fake_stream(unsigned slot, uint32_t position, int16_t *mono, size_t frames)
+{
+    assert(position + frames <= 48000); // Never asked past the registered end.
+    assert(position == stream_next || position == 0); // Sequential, or a restart.
+    stream_slot = slot;
+    stream_next = position + (uint32_t)frames;
+    for (size_t i = 0; i < frames; ++i) mono[i] = stream_sample(position + (uint32_t)i);
+}
+
+static void test_locals(void)
+{
+    const unsigned id = RINGTONE_FIRST_LOCAL + 2;
+    assert(!ringtones_valid(id) && ringtones_name(id) == NULL);
+    assert(!ringtones_set_local(RINGTONE_LOCAL_SLOTS, 48000, "x", fake_stream));
+    assert(!ringtones_set_local(2, 0, "x", fake_stream));
+    assert(!ringtones_set_local(2, 48000, "x", NULL));
+    assert(ringtones_set_local(2, 48000, "ringtone-03.mp3", fake_stream));
+    assert(!ringtones_set_local(2, 100, "again", fake_stream)); // Set once.
+    assert(ringtones_valid(id) && !ringtones_sendable(id));
+    assert(!ringtones_valid(id + 1));
+    assert(ringtones_sendable(0) && !ringtones_sendable(RINGTONE_FIRST_LOCAL - 1));
+    assert(!strcmp(ringtones_name(id), "ringtone-03.mp3"));
+    assert(ringtones_melody_frames(id) == 48000);
+    unsigned ids[64];
+    unsigned count = ringtones_list(ids, 64);
+    for (unsigned i = 0; i < count; ++i) assert(ids[i] < RINGTONE_FIRST_LOCAL); // Not listed.
+
+    int16_t *out = render(id, 0, 48000 + 480, 480);
+    assert(stream_slot == 2);
+    const uint32_t fade = RINGTONE_LOCAL_FADE_FRAMES;
+    assert(out[0] == 0 && out[2 * (47999)] == 0);                       // Faded ends.
+    assert(out[2 * (fade / 2)] == stream_sample(fade / 2) / 2);         // Halfway in.
+    for (uint32_t i = fade; i < 48000 - fade; ++i)
+        assert(out[2 * i] == stream_sample(i) && out[2 * i + 1] == out[2 * i]);
+    for (uint32_t i = 48000; i < 48480; ++i) assert(out[2 * i] == 0); // Then silence.
+    stream_next = 0;
+    int16_t *pieces = render(id, 0, 48000 + 480, 7);
+    assert(!memcmp(out, pieces, (48000 + 480) * 2 * sizeof(int16_t)));
+    free(out);
+    free(pieces);
+
+    ringtones_clear_local(2); // File gone: callers fall back from now on.
+    assert(!ringtones_valid(id) && ringtones_melody_frames(id) == 0);
+    assert(!ringtones_set_local(2, 48000, "reuse", fake_stream));
+}
+
 int main(void)
 {
     assert(ringtones_init());
@@ -146,6 +196,7 @@ int main(void)
     free(none);
     free(standard);
     test_clips();
+    test_locals();
     puts("ringtones_test: melodies (parse, pitch, level, continuity, blocks) and clips (upsampling, bounds, ordering, failures) passed");
     return 0;
 }

@@ -44,6 +44,22 @@ static unsigned clip_count;
 static uint32_t clip_rate;
 static ringtones_clip_read_fn clip_read;
 
+// Local ringtones: frames is published last (release) and read with acquire,
+// so a renderer never sees a half-registered slot.
+typedef struct {
+    ringtones_stream_fn stream;
+    uint32_t frames;
+    char name[RINGTONE_NAME_BYTES];
+} local_t;
+static local_t locals[RINGTONE_LOCAL_SLOTS];
+
+static const local_t *local_get(unsigned id)
+{
+    if (id < RINGTONE_FIRST_LOCAL || id >= RINGTONE_FIRST_LOCAL + RINGTONE_LOCAL_SLOTS) return NULL;
+    const local_t *local = &locals[id - RINGTONE_FIRST_LOCAL];
+    return __atomic_load_n(&local->frames, __ATOMIC_ACQUIRE) ? local : NULL;
+}
+
 static int clip_index(unsigned id)
 {
     for (unsigned i = 0; i < clip_count; ++i)
@@ -159,6 +175,24 @@ unsigned ringtones_set_clips(const ringtones_clip_t *source, unsigned count, uin
     return clip_count;
 }
 
+bool ringtones_set_local(unsigned slot, uint32_t frames, const char *name, ringtones_stream_fn stream)
+{
+    if (slot >= RINGTONE_LOCAL_SLOTS || !frames || !stream) return false;
+    local_t *local = &locals[slot];
+    if (__atomic_load_n(&local->frames, __ATOMIC_ACQUIRE) || local->stream) return false;
+    local->stream = stream;
+    strncpy(local->name, name ? name : "", RINGTONE_NAME_BYTES - 1);
+    local->name[RINGTONE_NAME_BYTES - 1] = '\0';
+    __atomic_store_n(&local->frames, frames, __ATOMIC_RELEASE);
+    return true;
+}
+
+void ringtones_clear_local(unsigned slot)
+{
+    // stream stays set, so the slot is never reused under a reader.
+    if (slot < RINGTONE_LOCAL_SLOTS) __atomic_store_n(&locals[slot].frames, 0, __ATOMIC_RELEASE);
+}
+
 unsigned ringtones_count(void) { return SONG_COUNT; }
 
 unsigned ringtones_list(unsigned *ids, unsigned max)
@@ -171,21 +205,26 @@ unsigned ringtones_list(unsigned *ids, unsigned max)
     return total;
 }
 
-bool ringtones_valid(unsigned id) { return id < SONG_COUNT || clip_index(id) >= 0; }
+bool ringtones_sendable(unsigned id) { return id < SONG_COUNT || clip_index(id) >= 0; }
+
+bool ringtones_valid(unsigned id) { return ringtones_sendable(id) || local_get(id); }
 
 const char *ringtones_name(unsigned id)
 {
     if (id < SONG_COUNT) return defs[id].name;
     int index = clip_index(id);
-    return index >= 0 ? clips[index].name : NULL;
+    if (index >= 0) return clips[index].name;
+    const local_t *local = local_get(id);
+    return local ? local->name : NULL;
 }
 
 uint32_t ringtones_melody_frames(unsigned id)
 {
     if (id < SONG_COUNT) return songs[id].frames;
     int index = clip_index(id);
-    if (index < 0) return 0;
-    return (uint32_t)((uint64_t)clips[index].samples * RINGTONE_SAMPLE_RATE / clip_rate);
+    if (index >= 0) return (uint32_t)((uint64_t)clips[index].samples * RINGTONE_SAMPLE_RATE / clip_rate);
+    const local_t *local = local_get(id);
+    return local ? local->frames : 0;
 }
 
 // Clips: linear interpolation from the clip rate up to 48 kHz. The frame at
@@ -219,6 +258,32 @@ static void render_clip(int index, uint32_t position, int16_t *stereo, size_t fr
     }
 }
 
+// Local ringtones arrive at 48 kHz; only the fades and the end are added here.
+static void render_local(unsigned id, const local_t *local, uint32_t position, int16_t *stereo,
+                         size_t frames)
+{
+    enum { CHUNK = 128 };
+    size_t done = 0;
+    while (done < frames) {
+        size_t n = frames - done < CHUNK ? frames - done : CHUNK;
+        uint32_t at = position + (uint32_t)done;
+        int16_t mono[CHUNK] = {0};
+        size_t audible = at >= local->frames ? 0 : local->frames - at < n ? local->frames - at : n;
+        if (audible) local->stream(id - RINGTONE_FIRST_LOCAL, at, mono, audible);
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t frame = at + (uint32_t)i;
+            int32_t value = mono[i];
+            uint32_t left = frame < local->frames ? local->frames - 1 - frame : 0;
+            if (frame < RINGTONE_LOCAL_FADE_FRAMES)
+                value = value * (int32_t)frame / RINGTONE_LOCAL_FADE_FRAMES;
+            if (left < RINGTONE_LOCAL_FADE_FRAMES)
+                value = value * (int32_t)left / RINGTONE_LOCAL_FADE_FRAMES;
+            stereo[2 * (done + i)] = stereo[2 * (done + i) + 1] = (int16_t)value;
+        }
+        done += n;
+    }
+}
+
 static int32_t envelope(uint32_t offset, uint32_t length)
 {
     uint32_t step = offset / DECAY_STEP_FRAMES;
@@ -239,8 +304,11 @@ void ringtones_render(unsigned id, uint32_t position, int16_t *stereo, size_t fr
 {
     if (id >= SONG_COUNT) {
         int index = clip_index(id);
+        const local_t *local = local_get(id);
         if (index >= 0) {
             render_clip(index, position, stereo, frames);
+        } else if (local) {
+            render_local(id, local, position, stereo, frames);
         } else {
             memset(stereo, 0, frames * 2 * sizeof(*stereo));
         }

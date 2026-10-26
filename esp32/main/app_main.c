@@ -3,6 +3,7 @@
 #include "incoming_ring.h"
 #include "call_tones.h"
 #include "ringtone_pack.h"
+#include "sd_ringtones.h"
 #include "line_settings.h"
 #include "audio_board.h"
 #include "microphone.h"
@@ -39,6 +40,9 @@ void app_main(void)
         err = digits_ringtone_pack_load();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Ringtone clips unavailable: %s; built-in ringtones still work", esp_err_to_name(err));
+        err = digits_sd_ringtones_start();
+        if (err != ESP_OK)
+            ESP_LOGE("digits", "SD card ringtones unavailable: %s; built-in ringtones still work", esp_err_to_name(err));
         err = digits_call_tones_init();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Call-progress tones unavailable: %s; calls still work", esp_err_to_name(err));

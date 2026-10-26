@@ -1,6 +1,8 @@
 #include "ring_select.h"
+#include "ringtones.h"
 
 #define HYSTERESIS_PERCENT 20
+#define LEGACY_CALLER 0xFF // Old maps reserved the last position for the caller's choice.
 
 static unsigned clamp_positions(unsigned positions)
 {
@@ -14,8 +16,7 @@ void ring_select_default_map(ring_select_map_t *map, unsigned positions,
 {
     map->positions = clamp_positions(positions);
     for (unsigned p = 0; p < RING_SELECT_MAX_POSITIONS; ++p)
-        map->ringtone[p] = p < count && available[p] < RING_SELECT_CALLER ? (uint8_t)available[p] : 0;
-    map->ringtone[map->positions - 1] = RING_SELECT_CALLER;
+        map->ringtone[p] = p < count && available[p] < LEGACY_CALLER ? (uint8_t)available[p] : 0;
 }
 
 bool ring_select_sanitize(ring_select_map_t *map)
@@ -26,15 +27,11 @@ bool ring_select_sanitize(ring_select_map_t *map)
         map->positions = positions;
         clean = false;
     }
-    for (unsigned p = 0; p + 1 < positions; ++p)
-        if (map->ringtone[p] == RING_SELECT_CALLER) {
+    for (unsigned p = 0; p < positions; ++p)
+        if (map->ringtone[p] == LEGACY_CALLER) {
             map->ringtone[p] = 0;
             clean = false;
         }
-    if (map->ringtone[positions - 1] != RING_SELECT_CALLER) {
-        map->ringtone[positions - 1] = RING_SELECT_CALLER;
-        clean = false;
-    }
     return clean;
 }
 
@@ -43,8 +40,9 @@ unsigned ring_select_resolve(const ring_select_map_t *map, int position, int off
 {
     unsigned fallback = offered >= 0 && valid((unsigned)offered) ? (unsigned)offered : 0;
     if (position < 0 || (unsigned)position >= map->positions) return fallback;
+    if (valid(RINGTONE_FIRST_LOCAL + (unsigned)position)) return RINGTONE_FIRST_LOCAL + (unsigned)position;
     uint8_t chosen = map->ringtone[position];
-    if (chosen == RING_SELECT_CALLER || !valid(chosen)) return fallback;
+    if (!valid(chosen)) return fallback;
     return chosen;
 }
 
