@@ -59,7 +59,8 @@ static tone_gen_tone_t line_tone(const phone_fsm_t *fsm, const phone_inputs_t *i
 }
 
 // Behavior follows the Pi controller (pi/digitsd/internal/phone/controller.go):
-// lifting during RINGING answers and replacing the handset ends any call. A
+// lifting during RINGING answers, lifting while the answering machine talks
+// takes the call over, and replacing the handset ends any call. A
 // ring arriving while off-hook is not answered by that lift; the ringer is
 // suppressed while off-hook and sounds once the handset is replaced. Busy
 // answers and a far end leaving while ringing out play busy; any other end
@@ -93,7 +94,13 @@ phone_output_t phone_fsm_step(phone_fsm_t *fsm, const phone_inputs_t *in)
             fsm->answered = true;
             enter_call(fsm, in, false);
         } else if (in->phase != PHONE_PHASE_IDLE) {
-            enter_call(fsm, in, in->phase == PHONE_PHASE_CALLING); // Console-started call.
+            // A call this handset did not answer: the answering machine's
+            // (or a console call). ANSWER takes it over.
+            if (in->phase == PHONE_PHASE_CONNECTING || in->phase == PHONE_PHASE_CONNECTED) {
+                out.action = PHONE_ACTION_ANSWER;
+                fsm->answered = true;
+            }
+            enter_call(fsm, in, in->phase == PHONE_PHASE_CALLING);
         } else {
             enter(fsm, PHONE_LINE_DIAL, in->now_us);
         }

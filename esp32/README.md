@@ -51,6 +51,12 @@ If using a USB-UART bridge instead of native USB, select UART under
 Component config -> ESP System Settings -> Channel for console output.
 Empty or oversized Wi-Fi settings and URLs other than `ws://.../ws` fail fast.
 
+Wi-Fi scans all channels and joins the strongest access point of the
+configured name. With the default fast scan, a mesh network sometimes handed
+the board a -91 dBm access point where DHCP took a minute or more. Once
+online, the clock is set from **Time server** (`pool.ntp.org`) in **Time
+zone** (Central European by default), so files on the SD card get real dates.
+
 Wi-Fi credentials and server URL are build configuration, not source constants.
 `sdkconfig`, `sdkconfig.old` and `build/` are ignored because they contain the
 configured values. Credentials are embedded in the development firmware;
@@ -252,6 +258,77 @@ Verified on the board on 2026-10-26: boot with and without a card, five
 underruns (heard through the board microphone), console output and the
 refused outgoing number. Not yet verified: an incoming call ringing with an
 SD file, and resampling of non-48 kHz files.
+
+### Silence
+
+Incoming calls ring unless the line is silent. The server decides that from
+the web toggle and quiet hours; the phone only receives the result. A local
+choice (the planned silence button, for now the console) overrides it until
+the server's value next changes, so the most recent change wins:
+
+- Silenced here, then quiet hours end: calls ring again.
+- Quiet hours, then set to ring here: calls ring until quiet hours end.
+
+The choice is kept in NVS across restarts. The server cannot be told about
+it: the wire protocol has no message for that, so the web page keeps
+showing the server's own setting.
+
+```text
+phone silence on|off|toggle   # what the silence button will do
+phone status                  # "Incoming calls: silent (server says ring, overridden here)"
+```
+
+The rule is `silence_policy.h`, tested by `tests/silence_policy_test.c`.
+
+### Answering machine
+
+With voicemail on for the line (web UI, per line, with a 5-60 second ring
+timeout), an unanswered call is picked up after that timeout, as on the Pi.
+The caller hears the greeting and a 500 ms, 1 kHz beep; their audio is then
+stored on the SD card. It needs a card; without one the phone keeps ringing.
+
+- **Privacy.** From the moment it answers, the room microphone is never
+  sent: every transmitted frame comes from the greeting, then silence. The
+  Pi only mutes after the beep. Nothing is played on the speaker meanwhile.
+- **Pickup.** Lifting the handset keeps what was recorded and continues as a
+  normal call. Replacing it hangs up.
+- **Files.** `voicemail/new/000012-1002.opus` (number, caller) holds unheard
+  messages, `voicemail/saved/` heard ones. They are standard Ogg Opus files
+  with the caller's original packets, so any player opens them on a
+  computer; the clock gives them real dates. Up to 50 messages of up to
+  10 minutes each, as on the Pi (**Answering machine** in menuconfig); a new
+  one beyond that removes the oldest heard message first. Messages under half
+  a second (a hang-up at the beep) are discarded.
+- **Greeting.** The Pi's default greeting is built in. Put your own as
+  `voicemail/greeting.mp3` on the card (any MP3; it streams like the SD
+  ringtones and is sent at full level, see **SD card greeting level**).
+- **Badge.** The number of unheard messages goes to the server on every
+  connection and whenever it changes, so the web page shows it.
+
+```text
+vm                # status: card, counts, greeting
+vm list           # number, new, caller, date, length
+vm play           # all new messages, oldest first, then marks them heard
+vm play 12        # one message
+vm greeting       # hear the greeting
+vm stop           # stop playing; lifting the handset also stops it
+vm heard 12 | vm delete 12 | vm delete heard
+```
+
+Playback uses the speaker while the line is idle; an incoming call stops it.
+Physical buttons for it are not assigned yet.
+
+Verified on the board on 2026-10-27 with the PC helper as caller: answered
+after the server's 20 s, the caller's recording held the greeting, the beep
+and then digital silence (peak 4 of 32767), an 11.8 s message was stored,
+listed with its date, played back and marked heard, and the count went to
+the server as 1 and then 0. Lifting the handset during a message kept the
+3.9 s already recorded and switched to a normal call; replacing it hung up.
+A local silence choice survived a restart. Host tests: `ogg_opus_test.c`
+(against an ffmpeg file; written files pass `opusinfo`),
+`voicemail_store_test.c`, `voicemail_prompt_test.c`, and answering-machine
+cases in `call_audio_worker_test.py` and `webrtc_interop_test.py`. Not yet
+verified: a custom `greeting.mp3`, a full card, the 10-minute limit.
 
 ### Inputs
 
@@ -481,11 +558,16 @@ holds eight copied events; limits are 32 remote candidates of up to 512 bytes,
 eight STUN URLs of up to 255 bytes, 12 KiB raw SDP and 16 KiB signaling JSON.
 The peer's transmit pool and audio jitter buffer are explicitly 8 KiB each,
 with 16 transmit entries and eight gathered candidates. The development console
-adds a 4 KiB stack at priority 3 and eight RAM-only history entries. Queue
+adds a 6 KiB stack (4 KiB before `vm list` read files) at priority 3 and
+eight RAM-only history entries. Queue
 exhaustion aborts affected setup rather than silently losing control messages.
 Per-call configuration, URLs and applied SDP remain valid until peer closure.
-The call encoder uses a 48 KiB internal stack and the decoder uses 24 KiB,
-both at priority 5;
+The call encoder uses a 36 KiB internal stack and the decoder uses 16 KiB,
+both at priority 5 (48/24 KiB until 2026-10-27; at those sizes 27,136 and
+16,012 bytes stayed unused, and once more features ran, the internal heap
+had no 48 KiB block left after peer creation). Tasks that never write flash
+(SD streamer, answering-machine recorder and player, microphone level log)
+keep their stacks in PSRAM;
 bounded PCM, packet queues and jitter storage prefer PSRAM. The microphone
 single-consumer reservation excludes recording diagnostics from call capture,
 and the shared speaker mutex excludes overlapping playback. The peer receive

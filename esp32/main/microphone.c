@@ -4,6 +4,7 @@
 #include <string.h>
 #include "esp_attr.h"
 #include "esp_codec_dev_defaults.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -274,7 +275,7 @@ static void capture_worker(void *arg)
 
 static void release_microphone(void)
 {
-    if (mic.report_task) vTaskDelete(mic.report_task);
+    if (mic.report_task) vTaskDeleteWithCaps(mic.report_task);
     if (mic.codec) audio_codec_delete_codec_if(mic.codec);
     if (mic.ctrl) audio_codec_delete_ctrl_if(mic.ctrl);
     if (mic.frames) vQueueDelete(mic.frames);
@@ -337,7 +338,9 @@ esp_err_t digits_microphone_init(void)
         err = ESP_ERR_NO_MEM;
         goto fail;
     }
-    if (xTaskCreate(report_worker, "digits_mic_log", 4096, NULL, 3, &mic.report_task) != pdPASS) {
+    // Logging only, no flash writes: its stack can live in PSRAM.
+    if (xTaskCreateWithCaps(report_worker, "digits_mic_log", 4096, NULL, 3, &mic.report_task,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         err = ESP_ERR_NO_MEM;
         goto fail;
     }

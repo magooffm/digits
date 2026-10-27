@@ -37,9 +37,23 @@ typedef struct {
 // Owner is the peer worker. All I2S/codec work occurs in dedicated tasks.
 // Queues and buffers are bounded and private to one call. Start does not wait
 // for codecs or hardware; poll status and fail the call if startup fails.
-// ESP32-S3 codec workers use internal 48 KiB TX / 24 KiB RX stacks. Their
+// ESP32-S3 codec workers use internal 36 KiB TX / 16 KiB RX stacks. Their
 // measured minima are reported after open, periodically and after cleanup.
 esp_err_t digits_call_audio_start(digits_call_audio_mode_t mode, digits_call_audio_t **out);
+
+// Answering machine. While unattended the room microphone is never sent:
+// fill supplies every transmitted 20 ms frame instead (encoder task, must
+// not block). Received packets go to record (caller's context, must not
+// block) instead of the speaker. Hooks must stay valid for the call.
+typedef struct {
+    void (*fill)(int16_t *mono, size_t frames);
+    void (*record)(const uint8_t *packet, size_t size);
+} digits_call_audio_unattended_t;
+esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
+                                             const digits_call_audio_unattended_t *hooks,
+                                             digits_call_audio_t **out);
+// Handset lifted: normal two-way audio from the next frame. Idempotent.
+void digits_call_audio_attend(digits_call_audio_t *audio);
 void digits_call_audio_get_stats(digits_call_audio_t *audio, digits_call_audio_stats_t *stats);
 bool digits_call_audio_pop_encoded(digits_call_audio_t *audio, call_audio_packet_t *packet);
 void digits_call_audio_record_send(digits_call_audio_t *audio, const call_audio_packet_t *packet,

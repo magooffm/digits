@@ -174,6 +174,8 @@ struct digits_call_audio {
     unsigned encoded_count;
     call_audio_packet_t last_popped;
     call_audio_packet_t received;
+    const digits_call_audio_unattended_t *hooks; // Set while unattended.
+    unsigned attends;
 };
 static struct digits_call_audio media;
 static esp_peer_cfg_t peer_config;
@@ -236,6 +238,32 @@ void digits_settings_get(digits_line_settings_t *snapshot, digits_settings_stats
     if (stats) memset(stats, 0, sizeof(*stats));
 }
 void digits_settings_set_media_busy(bool busy) { settings_busy = busy; }
+// Answering machine: storage and recording are tested in voicemail_*_test.c.
+static bool vm_ready, vm_full, vm_begin_fails, vm_session;
+static int vm_unheard = -1;
+static unsigned vm_begins, vm_ends;
+static char vm_caller[32];
+static void vm_fill(int16_t *mono, size_t frames) { (void)mono; (void)frames; }
+static void vm_record(const uint8_t *packet, size_t size) { (void)packet; (void)size; }
+static const digits_call_audio_unattended_t vm_hooks = {.fill = vm_fill, .record = vm_record};
+bool digits_voicemail_ready(void) { return vm_ready; }
+int digits_voicemail_unheard(void) { return vm_unheard; }
+const digits_call_audio_unattended_t *digits_voicemail_begin(const char *caller)
+{
+    assert(in_worker && caller && !vm_session);
+    ++vm_begins;
+    if (vm_begin_fails) return NULL;
+    snprintf(vm_caller, sizeof(vm_caller), "%s", caller);
+    vm_session = true;
+    return &vm_hooks;
+}
+void digits_voicemail_end(void)
+{
+    assert(in_worker);
+    if (vm_session) ++vm_ends;
+    vm_session = false;
+}
+bool digits_voicemail_full(void) { return vm_session && vm_full; }
 static unsigned last_ringtone = 99;
 void digits_incoming_ring_start(uint32_t id, unsigned ringtone)
 {
@@ -525,6 +553,24 @@ int esp_peer_close(esp_peer_handle_t peer)
     return ESP_PEER_ERR_NONE;
 }
 
+esp_err_t digits_call_audio_start(digits_call_audio_mode_t mode, digits_call_audio_t **out);
+esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
+                                             const digits_call_audio_unattended_t *hooks,
+                                             digits_call_audio_t **out)
+{
+    assert(hooks == &vm_hooks && vm_session); // The machine was ready first.
+    esp_err_t err = digits_call_audio_start(mode, out);
+    if (err == ESP_OK) media.hooks = hooks;   // Unattended from the first frame.
+    return err;
+}
+
+void digits_call_audio_attend(digits_call_audio_t *audio)
+{
+    assert(in_worker && audio == &media && media.live);
+    media.hooks = NULL;
+    ++media.attends;
+}
+
 esp_err_t digits_call_audio_start(digits_call_audio_mode_t mode, digits_call_audio_t **out)
 {
     assert(in_worker && out && !media.live && ring_stopped && tones_stopped);
@@ -710,6 +756,10 @@ static void setup(void)
     settings_busy = false;
     ring_starts = ring_stops = last_ring_id = 0;
     memset(&settings, 0, sizeof(settings));
+    vm_ready = vm_full = vm_begin_fails = vm_session = false;
+    vm_unheard = -1;
+    vm_begins = vm_ends = 0;
+    vm_caller[0] = '\0';
     main_loop_delay_us = 0;
     last_worker_wait = largest_connected_wait = 0;
     memset(&media, 0, sizeof(media));
@@ -745,7 +795,7 @@ static void finish(void)
     pump(1);
     assert(!peer_opened && rtc.call.phase == CALL_IDLE && rtc.call.peer == NULL);
     assert(!media.live && !rtc.stopping_audio);
-    assert(ring_stopped && !settings_busy);
+    assert(ring_stopped && !settings_busy && !vm_session);
     assert(!rtc.call.offer && !rtc.call.candidate_count);
     assert(!rtc.call.remote_sdp_text && !rtc.call.server_count);
     assert(rtc.ice_count == 0 && rtc.queue->count == 0);
@@ -1609,6 +1659,176 @@ static void test_ringtone_answer_ownership(void)
     ++cases;
 }
 
+// Rings with voicemail on (5 s) until the machine answers and connects.
+static void answer_by_machine(void)
+{
+    settings.voicemail_enabled = true;
+    settings.voicemail_ring_timeout_seconds = 5;
+    vm_ready = true;
+    receive("ring", "1002", NULL, NULL, NULL);
+    pump(1);
+    assert(rtc.call.phase == CALL_RINGING && rtc.call.voicemail_at_us == host_now + 5000000);
+    receive("sdp", "1002", "sdp", local_sdp_text, NULL);
+    pump(1);
+    assert(ring_starts == 1);
+    host_now += 4999999;
+    pump(1);
+    assert(rtc.call.phase == CALL_RINGING && !rtc.call.answer_requested && !peer_opened);
+    host_now += 1;
+    pump(1);
+    assert(rtc.call.voicemail && rtc.call.phase == CALL_CONNECTING && peer_opened && ring_stops >= 1);
+    assert(wires_of_type("answer") == 1 && !vm_begins); // An ordinary answer; no recording yet.
+    connect_next_loop = true;
+    pump(1);
+    assert(rtc.call.phase == CALL_CONNECTED && vm_begins == 1 && !strcmp(vm_caller, "1002"));
+    assert(media.live && media.hooks == &vm_hooks && media.mode == DIGITS_CALL_AUDIO_FULL);
+}
+
+static void test_answering_machine(void)
+{
+    // Picks up after the server's timeout; lifting the handset takes over.
+    setup();
+    answer_by_machine();
+    queue_microphone_packet(0, host_now); // The greeting still goes out as call audio.
+    pump(1);
+    assert(audio_calls == 1);
+    command("answer", NULL);
+    pump(1);
+    assert(!rtc.call.voicemail && !media.hooks && media.attends == 1 && vm_ends == 1);
+    assert(rtc.call.phase == CALL_CONNECTED && media_start_calls == 1 && wires_of_type("hangup") == 0);
+    command("answer", NULL); // A second lift report changes nothing.
+    pump(1);
+    assert(media.attends == 1 && vm_ends == 1);
+    finish();
+    assert(vm_ends == 1);
+    ++cases;
+
+    // The caller hangs up during the message: it is kept.
+    setup();
+    answer_by_machine();
+    receive("hangup", "1002", NULL, NULL, NULL);
+    pump(1);
+    assert(rtc.call.phase == CALL_IDLE && vm_ends == 1 && !rtc.call.voicemail);
+    finish();
+    ++cases;
+
+    // The message reached its limit: the machine hangs up.
+    setup();
+    answer_by_machine();
+    vm_full = true;
+    pump(1);
+    assert(rtc.call.phase == CALL_IDLE && vm_ends == 1 && wires_of_type("hangup") == 1);
+    assert(rtc.last_end == DIGITS_CALL_END_FAILED);
+    finish();
+    ++cases;
+
+    // No recording possible at connect: hang up rather than open the room microphone.
+    setup();
+    vm_begin_fails = true;
+    settings.voicemail_enabled = true;
+    settings.voicemail_ring_timeout_seconds = 5;
+    vm_ready = true;
+    receive("ring", "1002", NULL, NULL, NULL);
+    receive("sdp", "1002", "sdp", local_sdp_text, NULL);
+    pump(1);
+    host_now += 5000000;
+    pump(1);
+    connect_next_loop = true;
+    pump(2); // Connected, refused; the next iteration ends the call.
+    assert(vm_begins == 1 && !media_start_calls && rtc.call.phase == CALL_IDLE);
+    assert(wires_of_type("hangup") == 1);
+    finish();
+    ++cases;
+}
+
+static void test_answering_machine_not_armed(void)
+{
+    // Answered in person before the timeout: the machine never starts.
+    setup();
+    settings.voicemail_enabled = true;
+    settings.voicemail_ring_timeout_seconds = 5;
+    vm_ready = true;
+    receive("ring", "1002", NULL, NULL, NULL);
+    receive("sdp", "1002", "sdp", local_sdp_text, NULL);
+    pump(1);
+    host_now += 4000000;
+    command("answer", NULL);
+    pump(1);
+    host_now += 2000000;
+    connect_next_loop = true;
+    pump(1);
+    assert(rtc.call.phase == CALL_CONNECTED && !rtc.call.voicemail && !vm_begins && !media.hooks);
+    finish();
+    ++cases;
+
+    // Voicemail off, or no card: keeps ringing until the caller gives up.
+    for (unsigned variant = 0; variant < 3; ++variant) {
+        setup();
+        settings.voicemail_enabled = variant != 0;
+        settings.voicemail_ring_timeout_seconds = 5;
+        vm_ready = variant != 1;
+        if (variant == 2) {
+            command("audio", "rx"); // Lab mode cannot send a greeting.
+            pump(1);
+        }
+        receive("ring", "1002", NULL, NULL, NULL);
+        receive("sdp", "1002", "sdp", local_sdp_text, NULL);
+        pump(1);
+        assert(!rtc.call.voicemail_at_us);
+        host_now += 30000000;
+        pump(1);
+        assert(rtc.call.phase == CALL_RINGING && !peer_opened && !vm_begins);
+        finish();
+        ++cases;
+    }
+}
+
+static int reported_count(unsigned index)
+{
+    cJSON *message = wire_message(index, "voicemail_state");
+    const cJSON *count = cJSON_GetObjectItemCaseSensitive(message, "voicemail_unheard_count");
+    assert(cJSON_IsNumber(count) && !cJSON_GetObjectItemCaseSensitive(message, "to"));
+    int value = count->valueint;
+    cJSON_Delete(message);
+    return value;
+}
+
+static void test_voicemail_count_reports(void)
+{
+    setup();
+    pump(2);
+    assert(!wire_count); // No store: nothing to report.
+    vm_unheard = 2;
+    pump(1);
+    assert(wire_count == 1 && reported_count(0) == 2);
+    pump(3);
+    assert(wire_count == 1); // Unchanged: not repeated.
+    vm_unheard = 0;
+    pump(1);
+    assert(wire_count == 2 && reported_count(1) == 0); // An explicit zero clears the badge.
+    // A new session repeats it: the server dropped the count on disconnect.
+    digits_webrtc_transport(peer_session, false, "1001", true);
+    pump(1);
+    ++peer_session;
+    digits_webrtc_transport(peer_session, true, "1001", true);
+    clear_wire();
+    pump(1);
+    assert(wires_of_type("voicemail_state") == 1);
+    // A failed send is retried a second later.
+    clear_wire();
+    vm_unheard = 4;
+    transmit_result = ESP_ERR_NO_MEM;
+    pump(1);
+    transmit_result = ESP_OK;
+    pump(1);
+    assert(!wire_count);
+    host_now += 1000000;
+    pump(1);
+    assert(wire_count == 1 && reported_count(0) == 4);
+    finish();
+    ++cases;
+}
+
 static void test_tones_release_before_call_audio(void)
 {
     setup();
@@ -1849,6 +2069,9 @@ int main(void)
     test_caller_ringtone();
     test_tones_release_before_call_audio();
     test_call_end_reasons();
+    test_answering_machine();
+    test_answering_machine_not_armed();
+    test_voicemail_count_reports();
     printf("WebRTC adapter: %u real-worker lifecycle cases passed (mock peer; physical interoperability unverified)\n", cases);
     return 0;
 }

@@ -5,31 +5,28 @@
 
 #include "ring_tone.h"
 #include "ringtones.h"
+#include "sd_card.h"
 #include "sd_ringtone_util.h"
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include "driver/sdmmc_host.h"
 #include "esp_ae_rate_cvt.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mp3_dec.h"
-#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
-#include "sdmmc_cmd.h"
 
 #define TAG "sd_ringtones"
-#define MOUNT_POINT "/sdcard"
-#define FOLDER MOUNT_POINT "/ringtones"
-// Waveshare ESP32-S3-AUDIO-Board TF slot: 1-bit SDMMC (Waveshare BSP demos).
-#define PIN_CLK GPIO_NUM_40
-#define PIN_CMD GPIO_NUM_42
-#define PIN_D0 GPIO_NUM_41
+#define FOLDER DIGITS_SD_MOUNT_POINT "/ringtones"
+#define GREETING_NAME "greeting.mp3"
+#define GREETING_PATH DIGITS_SD_MOUNT_POINT "/voicemail/" GREETING_NAME
+#define GREETING_SLOT RINGTONE_LOCAL_SLOTS // After the ringtone positions.
+#define SLOTS (RINGTONE_LOCAL_SLOTS + 1)
 #define POSITIONS CONFIG_DIGITS_PHONE_SELECTOR_POSITIONS
 #define HEAD_BYTES 8192   // Enough to find the first frame and its Xing header.
 #define READ_BYTES 4096
@@ -39,13 +36,16 @@
 #define ABANDON_MS 2000 // Nobody reading this long (call answered): stop decoding.
 #define FALLBACK_PERIOD (6 * RINGTONE_SAMPLE_RATE) // Standard ring: 2 s on, 4 s off.
 #define FALLBACK_ON (2 * RINGTONE_SAMPLE_RATE)
-// esp_audio_codec 2.6.2 README: about 20 KiB of stack for decoding.
+// esp_audio_codec 2.6.2 README: about 20 KiB of stack for decoding. The
+// stack is in PSRAM (the task never writes flash): call audio needs the
+// internal RAM.
 #define STREAM_STACK_BYTES (24 * 1024)
 
 typedef enum { STATE_STARTING, STATE_NO_CARD, STATE_NO_FOLDER, STATE_READY } state_t;
 static int state = STATE_STARTING;
-static char names[RINGTONE_LOCAL_SLOTS][RINGTONE_NAME_BYTES];
-static uint32_t audio_offsets[RINGTONE_LOCAL_SLOTS]; // After the ID3v2 tag.
+static char names[SLOTS][RINGTONE_NAME_BYTES];
+static uint32_t audio_offsets[SLOTS]; // After the ID3v2 tag.
+static uint32_t greeting_frames;      // 0: no usable greeting file.
 
 static StreamBufferHandle_t pcm_buffer; // Decoder task -> players, 48 kHz mono.
 static TaskHandle_t streamer;
@@ -61,7 +61,8 @@ static struct {
     uint32_t finished;       // This generation reached the end of the file.
 } request;
 
-// Player side. Only one player renders at a time (speaker reservation).
+// Player side. Only one player reads at a time: a ringtone rings before an
+// answer and the greeting plays after it.
 static struct {
     int slot;
     uint32_t generation, next;
@@ -82,7 +83,11 @@ static void fallback_ring(uint32_t position, int16_t *mono, size_t frames)
     }
 }
 
-static void stream(unsigned slot, uint32_t position, int16_t *mono, size_t frames)
+typedef enum { READ_PLAYING, READ_ENDED, READ_FAILED } read_t;
+
+// Reads the next block of slot, restarting it when position is not where
+// the last read stopped. ENDED: the file is done and the buffer drained.
+static read_t read_slot(unsigned slot, uint32_t position, int16_t *mono, size_t frames)
 {
     if ((int)slot != player.slot || position != player.next) {
         if (player.underruns)
@@ -101,16 +106,20 @@ static void stream(unsigned slot, uint32_t position, int16_t *mono, size_t frame
     bool failed = request.failed == player.generation;
     bool finished = request.finished == player.generation;
     portEXIT_CRITICAL(&request_mux);
-    if (failed) {
-        fallback_ring(position, mono, frames);
-        return;
-    }
+    if (failed) return READ_FAILED;
     size_t got = ready ? xStreamBufferReceive(pcm_buffer, mono, frames * sizeof(int16_t), 0) / sizeof(int16_t) : 0;
     if (got < frames) {
         memset(mono + got, 0, (frames - got) * sizeof(int16_t));
-        // The first blocks after a start, and the end of the file, are expected gaps.
-        if (ready && !finished && position > RINGTONE_SAMPLE_RATE / 10) ++player.underruns;
+        if (finished) return READ_ENDED;
+        // The first blocks after a start are expected gaps.
+        if (ready && position > RINGTONE_SAMPLE_RATE / 10) ++player.underruns;
     }
+    return READ_PLAYING;
+}
+
+static void stream(unsigned slot, uint32_t position, int16_t *mono, size_t frames)
+{
+    if (read_slot(slot, position, mono, frames) == READ_FAILED) fallback_ring(position, mono, frames);
 }
 
 // Decoder side: one stream at a time, owned by the streamer task.
@@ -165,7 +174,8 @@ static bool deliver(const int16_t *pcm, size_t frames, uint32_t generation)
 }
 
 // Conditions one decoded block in place and delivers it at 48 kHz.
-static bool condition(decoding_t *d, const char *name, int16_t *pcm, size_t frames, uint32_t generation)
+static bool condition(decoding_t *d, const char *name, unsigned level, int16_t *pcm, size_t frames,
+                      uint32_t generation)
 {
     if (!d->rate) {
         esp_audio_simple_dec_info_t info = {0};
@@ -198,7 +208,7 @@ static bool condition(decoding_t *d, const char *name, int16_t *pcm, size_t fram
         pcm += skip;
         frames -= skip;
     }
-    sd_ringtone_scale(pcm, frames, CONFIG_DIGITS_SD_RINGTONE_LEVEL);
+    sd_ringtone_scale(pcm, frames, level);
     if (!d->resampler) return deliver(pcm, frames, generation);
     uint32_t needed = 0;
     esp_ae_rate_cvt_get_max_out_sample_num(d->resampler, (uint32_t)frames, &needed);
@@ -216,11 +226,19 @@ static bool condition(decoding_t *d, const char *name, int16_t *pcm, size_t fram
 
 // Decodes the whole file into the buffer. Returns false on a failure before
 // any sound (the caller then falls back); a newer request just stops it.
+static void slot_path(unsigned slot, char *path, size_t size)
+{
+    if (slot == GREETING_SLOT) snprintf(path, size, "%s", GREETING_PATH);
+    else snprintf(path, size, "%s/%s", FOLDER, names[slot]);
+}
+
 static bool play(unsigned slot, uint32_t generation)
 {
     const char *name = names[slot];
     char path[sizeof(FOLDER) + RINGTONE_NAME_BYTES + 1];
-    snprintf(path, sizeof(path), "%s/%s", FOLDER, name);
+    slot_path(slot, path, sizeof(path));
+    unsigned level = slot == GREETING_SLOT ? CONFIG_DIGITS_VOICEMAIL_GREETING_LEVEL
+                                           : CONFIG_DIGITS_SD_RINGTONE_LEVEL;
     decoding_t d = {0};
     esp_audio_simple_dec_cfg_t config = {.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3};
     d.file = fopen(path, "rb");
@@ -259,8 +277,8 @@ static bool play(unsigned slot, uint32_t generation)
                 break;
             }
             if (frame.decoded_size) {
-                if (!condition(&d, name, (int16_t *)frame.buffer, frame.decoded_size / sizeof(int16_t),
-                               generation))
+                if (!condition(&d, name, level, (int16_t *)frame.buffer,
+                               frame.decoded_size / sizeof(int16_t), generation))
                     going = false;
                 else
                     sound = sound || d.sounding;
@@ -298,7 +316,10 @@ static void streamer_task(void *arg)
             if (ok) request.finished = generation;
             else request.failed = generation;
             portEXIT_CRITICAL(&request_mux);
-            if (!ok) {
+            if (!ok && slot == GREETING_SLOT) {
+                ESP_LOGE(TAG, "%s unreadable: the built-in greeting plays instead", names[slot]);
+                __atomic_store_n(&greeting_frames, 0, __ATOMIC_RELAXED);
+            } else if (!ok) {
                 ESP_LOGE(TAG, "%s unreadable: standard ring now, mapped ringtone for later calls",
                          names[slot]);
                 ringtones_clear_local(slot);
@@ -307,32 +328,11 @@ static void streamer_task(void *arg)
     }
 }
 
-static esp_err_t mount(void)
+// Reads the file's length in 48 kHz frames from its headers; 0 if unusable.
+static uint32_t measure(unsigned slot, uint32_t *rate_out)
 {
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = 1;
-    slot.clk = PIN_CLK;
-    slot.cmd = PIN_CMD;
-    slot.d0 = PIN_D0;
-    // The defaults name pins this board uses for I2C and I2S.
-    slot.d1 = slot.d2 = slot.d3 = slot.d4 = slot.d5 = slot.d6 = slot.d7 = GPIO_NUM_NC;
-    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-    esp_vfs_fat_sdmmc_mount_config_t config = {
-        .format_if_mount_failed = false, // Never touch the user's card.
-        .max_files = 2,
-        .allocation_unit_size = 16 * 1024,
-    };
-    sdmmc_card_t *card = NULL;
-    return esp_vfs_fat_sdmmc_mount(MOUNT_POINT, &host, &slot, &config, &card);
-}
-
-// Reads the file's length from its headers and registers it.
-static void add(unsigned slot)
-{
-    const char *name = names[slot];
     char path[sizeof(FOLDER) + RINGTONE_NAME_BYTES + 1];
-    snprintf(path, sizeof(path), "%s/%s", FOLDER, name);
+    slot_path(slot, path, sizeof(path));
     struct stat info;
     uint8_t *head = malloc(HEAD_BYTES);
     FILE *file = head && !stat(path, &info) ? fopen(path, "rb") : NULL;
@@ -356,11 +356,19 @@ static void add(unsigned slot)
     }
     free(head);
     uint64_t frames = rate ? samples * RINGTONE_SAMPLE_RATE / rate : 0;
-    if (!ok || frames < RINGTONE_SAMPLE_RATE / 10 || frames > UINT32_MAX) {
+    *rate_out = rate;
+    return ok && frames >= RINGTONE_SAMPLE_RATE / 10 && frames <= UINT32_MAX ? (uint32_t)frames : 0;
+}
+
+static void add(unsigned slot)
+{
+    const char *name = names[slot];
+    uint32_t rate = 0, frames = measure(slot, &rate);
+    if (!frames) {
         ESP_LOGE(TAG, "%s: not a playable MP3; position %u keeps its mapped ringtone", name, slot + 1);
         return;
     }
-    ringtones_set_local(slot, (uint32_t)frames, name, stream);
+    ringtones_set_local(slot, frames, name, stream);
     ESP_LOGI(TAG, "Position %u: %s, %u:%02u at %u Hz", slot + 1, name,
              (unsigned)(frames / RINGTONE_SAMPLE_RATE / 60), (unsigned)(frames / RINGTONE_SAMPLE_RATE % 60),
              (unsigned)rate);
@@ -397,9 +405,40 @@ static void scan(void)
     __atomic_store_n(&state, STATE_READY, __ATOMIC_RELAXED);
 }
 
+static void add_greeting(void)
+{
+    struct stat info;
+    if (stat(GREETING_PATH, &info)) return;
+    snprintf(names[GREETING_SLOT], RINGTONE_NAME_BYTES, "%s", GREETING_NAME);
+    uint32_t rate = 0, frames = measure(GREETING_SLOT, &rate);
+    if (!frames) {
+        ESP_LOGE(TAG, "voicemail/%s: not a playable MP3; the built-in greeting plays", GREETING_NAME);
+        return;
+    }
+    __atomic_store_n(&greeting_frames, frames, __ATOMIC_RELAXED);
+    ESP_LOGI(TAG, "Answering machine greeting: voicemail/%s, %u:%02u at %u Hz", GREETING_NAME,
+             (unsigned)(frames / RINGTONE_SAMPLE_RATE / 60), (unsigned)(frames / RINGTONE_SAMPLE_RATE % 60),
+             (unsigned)rate);
+}
+
+uint32_t digits_sd_greeting_frames(void)
+{
+    return __atomic_load_n(&greeting_frames, __ATOMIC_RELAXED);
+}
+
+vm_prompt_read_t digits_sd_greeting_read(uint32_t position, int16_t *mono, size_t frames)
+{
+    if (!digits_sd_greeting_frames()) return VM_PROMPT_FAILED;
+    switch (read_slot(GREETING_SLOT, position, mono, frames)) {
+    case READ_FAILED: return VM_PROMPT_FAILED;
+    case READ_ENDED: return VM_PROMPT_DONE;
+    default: return VM_PROMPT_MORE;
+    }
+}
+
 esp_err_t digits_sd_ringtones_start(void)
 {
-    esp_err_t err = mount();
+    esp_err_t err = digits_sd_card_mount();
     if (err != ESP_OK) {
         ESP_LOGI(TAG, "No SD card ringtones (%s)", esp_err_to_name(err));
         __atomic_store_n(&state, STATE_NO_CARD, __ATOMIC_RELAXED);
@@ -411,13 +450,14 @@ esp_err_t digits_sd_ringtones_start(void)
     uint8_t *storage = heap_caps_malloc(BUFFER_FRAMES * sizeof(int16_t) + 1, MALLOC_CAP_SPIRAM);
     if (storage)
         pcm_buffer = xStreamBufferCreateStatic(BUFFER_FRAMES * sizeof(int16_t), 1, storage, &buffer_state);
-    if (!pcm_buffer || xTaskCreate(streamer_task, "digits_sd_ring", STREAM_STACK_BYTES, NULL, 3,
-                                   &streamer) != pdPASS) {
+    if (!pcm_buffer || xTaskCreateWithCaps(streamer_task, "digits_sd_ring", STREAM_STACK_BYTES, NULL, 3,
+                                           &streamer, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         __atomic_store_n(&state, STATE_NO_CARD, __ATOMIC_RELAXED);
         return ESP_ERR_NO_MEM;
     }
     esp_mp3_dec_register(); // MP3 only; every codec would add about 600 KB.
     scan();
+    add_greeting();
     return ESP_OK;
 }
 
@@ -435,5 +475,12 @@ const char *digits_sd_ringtones_status(void)
 
 esp_err_t digits_sd_ringtones_start(void) { return ESP_OK; }
 const char *digits_sd_ringtones_status(void) { return "disabled"; }
+uint32_t digits_sd_greeting_frames(void) { return 0; }
+
+vm_prompt_read_t digits_sd_greeting_read(uint32_t position, int16_t *mono, size_t frames)
+{
+    (void)position; (void)mono; (void)frames;
+    return VM_PROMPT_FAILED;
+}
 
 #endif

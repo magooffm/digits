@@ -326,6 +326,25 @@ static void test_tones_lift_during_console_call(void)
     assert(step().tone == TONE_GEN_RINGBACK && fsm.line == PHONE_LINE_CALL);
 }
 
+static void test_lift_takes_over_answering_machine(void)
+{
+    reset(false, PHONE_PHASE_RINGING);
+    in.phase = PHONE_PHASE_CONNECTING; // The machine answered while on hook.
+    assert(step().action == PHONE_ACTION_NONE);
+    in.phase = PHONE_PHASE_CONNECTED;
+    assert(step().action == PHONE_ACTION_NONE && fsm.line == PHONE_LINE_IDLE);
+    in.off_hook = true;
+    phone_output_t out = step();
+    assert(out.action == PHONE_ACTION_ANSWER && fsm.answered && fsm.line == PHONE_LINE_CALL);
+    assert(out.tone == TONE_GEN_NONE);
+    in.off_hook = false;
+    assert(step().action == PHONE_ACTION_HANGUP);
+    // Lifting while a console call still rings out only plays ringback.
+    reset(false, PHONE_PHASE_CALLING);
+    in.off_hook = true;
+    assert(step().action == PHONE_ACTION_NONE);
+}
+
 static void test_boot_off_hook(void)
 {
     reset(true, PHONE_PHASE_IDLE);
@@ -354,6 +373,7 @@ int main(void)
     test_tones_incoming();
     test_tones_foreign_ring_keeps_dial_tone();
     test_tones_lift_during_console_call();
+    test_lift_takes_over_answering_machine();
     test_boot_off_hook();
     puts("phone_fsm_test: all cases passed");
     return 0;

@@ -368,7 +368,7 @@ bool digits_settings_receive(const cJSON *message, uint32_t session)
     return true;
 }
 bool digits_settings_silent(void) { return effective_silent; }
-void digits_incoming_ring_set_silent(bool silent)
+void digits_silence_server(bool silent)
 {
     assert(callback_depth == 1 && silent == effective_silent);
     ++silent_publications;

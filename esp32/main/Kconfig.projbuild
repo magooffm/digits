@@ -161,6 +161,51 @@ menu "Digits development configuration"
                 Songs are mastered near full scale. 12 puts their peaks at
                 the standard ring's level; raise it for louder songs.
     endmenu
+    menu "Answering machine"
+        config DIGITS_VOICEMAIL
+            bool "Answering machine on the SD card"
+            depends on DIGITS_WEBRTC
+            default y
+            help
+                Answers calls the server's per-line voicemail setting asks
+                for, after its ring timeout. Messages are Ogg Opus files in
+                voicemail/new and voicemail/saved on the card. Without a
+                card the phone just keeps ringing, as before.
+        config DIGITS_VOICEMAIL_MAX_MESSAGES
+            int "Messages kept on the card"
+            depends on DIGITS_VOICEMAIL
+            range 1 1000
+            default 50
+            help
+                A new message beyond this removes the oldest heard one, or
+                the oldest unheard one if none was heard. 50 matches the Pi.
+        config DIGITS_VOICEMAIL_MAX_SECONDS
+            int "Longest message (seconds)"
+            depends on DIGITS_VOICEMAIL
+            range 10 3600
+            default 600
+            help
+                The machine hangs up when a message reaches this length.
+                600 matches the Pi. About 4 KB per second at 32 kbit/s.
+        config DIGITS_VOICEMAIL_GREETING_LEVEL
+            int "SD card greeting level (percent of the file's level)"
+            range 1 100
+            default 100
+            help
+                Level of voicemail/greeting.mp3 as sent to the caller.
+    endmenu
+    config DIGITS_SNTP_SERVER
+        string "Time server (empty: no clock)"
+        default "pool.ntp.org"
+        help
+            Sets the clock after Wi-Fi connects, for message dates on
+            the SD card.
+    config DIGITS_TIMEZONE
+        string "Time zone (POSIX TZ)"
+        default "CET-1CEST,M3.5.0,M10.5.0/3"
+        help
+            File dates on a FAT card are local time. The default is
+            Central European time with daylight saving.
     menu "Onboard microphone"
         choice DIGITS_MIC_RECORD_MODE
             prompt "Microphone record/playback diagnostic"

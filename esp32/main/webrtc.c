@@ -16,6 +16,7 @@
 #include "call_tones.h"
 #include "ringtones.h"
 #include "line_settings.h"
+#include "voicemail.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -83,6 +84,9 @@ static struct {
     digits_call_end_t last_end;
     bool last_connected;
     call_audio_packet_t send_packet;
+    uint32_t voicemail_reported_epoch; // 0: not reported on this session yet.
+    int voicemail_reported;
+    int64_t voicemail_retry_us;
     struct {
         esp_peer_handle_t peer;
         call_phase_t phase;
@@ -92,6 +96,8 @@ static struct {
         unsigned ringtone_hint;  // Outgoing: 0 none, otherwise ringtone + 1.
         bool ring_started;       // Incoming: ringer started for this call.
         int64_t ring_hint_deadline_us;
+        int64_t voicemail_at_us; // Incoming: the answering machine picks up.
+        bool voicemail;          // Answered by the answering machine.
         bool remote_sdp;
         bool local_sdp;
         bool closing;
@@ -371,6 +377,7 @@ static void end_call(bool notify, const char *reason)
         send_wire("hangup", rtc.call.remote, NULL, NULL,
                   reason && strcmp(reason, "connect_timeout") == 0 ? reason : NULL);
     rtc.call.closing = true; // Close callbacks must never recursively close.
+    digits_voicemail_end(); // Keeps the message; no-op without one.
     if (rtc.call.audio) {
         digits_call_audio_request_stop(rtc.call.audio);
         rtc.stopping_audio = rtc.call.audio;
@@ -741,6 +748,51 @@ static void clear_ice_servers(void)
     rtc.ice_received = false;
 }
 
+// Handset lifted while the answering machine has the call.
+static void pick_up(void)
+{
+    rtc.call.voicemail = false;
+    if (rtc.call.audio) digits_call_audio_attend(rtc.call.audio);
+    digits_voicemail_end();
+    ESP_LOGI(TAG, "Handset lifted during the answering machine: normal call with %s", rtc.call.remote);
+}
+
+// Arms the answering machine for a new incoming call, using the server's
+// per-line setting at the time the ringing starts.
+static void arm_voicemail(void)
+{
+    digits_line_settings_t settings;
+    digits_settings_get(&settings, NULL);
+    if (!settings.voicemail_enabled) return;
+    if (!digits_voicemail_ready() || rtc.audio_mode != DIGITS_CALL_AUDIO_FULL) {
+        ESP_LOGW(TAG, "Voicemail is on for this line, but the answering machine is unavailable");
+        return;
+    }
+    rtc.call.voicemail_at_us = esp_timer_get_time() + settings.voicemail_ring_timeout_seconds * 1000000LL;
+    ESP_LOGI(TAG, "Answering machine picks up after %u s", (unsigned)settings.voicemail_ring_timeout_seconds);
+}
+
+static void report_voicemail(int64_t now)
+{
+    int count = digits_voicemail_unheard();
+    if (count < 0 || !current_transport() || now < rtc.voicemail_retry_us ||
+        (rtc.voicemail_reported_epoch == rtc.owner_transport.epoch && rtc.voicemail_reported == count))
+        return;
+    // Every new session: the server forgets a device's count on disconnect.
+    cJSON *message = cJSON_CreateObject();
+    esp_err_t result = message && cJSON_AddStringToObject(message, "type", "voicemail_state") &&
+        cJSON_AddNumberToObject(message, "voicemail_unheard_count", count)
+        ? rtc.send(message, rtc.owner_transport.session, rtc.send_context) : ESP_ERR_NO_MEM;
+    cJSON_Delete(message);
+    if (result != ESP_OK) {
+        rtc.voicemail_retry_us = now + 1000000;
+        return;
+    }
+    rtc.voicemail_reported_epoch = rtc.owner_transport.epoch;
+    rtc.voicemail_reported = count;
+    ESP_LOGI(TAG, "Reported %d unheard messages", count);
+}
+
 static void process_event(event_t *event)
 {
     if (event->epoch != rtc.owner_transport.epoch || event->session != rtc.owner_transport.session) return;
@@ -757,7 +809,10 @@ static void process_event(event_t *event)
                  audio_mode_name(rtc.audio_mode), rtc.stopping_audio ||
                  (rtc.call.phase != CALL_RINGING && !digits_incoming_ring_is_stopped()) ? "yes" : "no",
                  rtc.call.max_peer_loop_us, rtc.call.slow_peer_loops);
-        ESP_LOGI(TAG, "Settings: effective_silent=%s voice_style=%s auto_update=%s voicemail=%s timeout=%us (voice/auto/voicemail cached only)",
+        ESP_LOGI(TAG, "Answering machine: %s, %d unheard%s", digits_voicemail_ready() ? "ready" : "off (no SD card)",
+                 digits_voicemail_unheard() > 0 ? digits_voicemail_unheard() : 0,
+                 rtc.call.voicemail ? ", answering this call" : "");
+        ESP_LOGI(TAG, "Settings: effective_silent=%s voice_style=%s auto_update=%s voicemail=%s timeout=%us (voice/auto cached only)",
                  settings.silent_mode ? "yes" : "no",
                  settings.voice_style == DIGITS_VOICE_MODERN ? "modern" : "copper",
                  settings.auto_update ? "yes" : "no", settings.voicemail_enabled ? "yes" : "no",
@@ -823,7 +878,15 @@ static void process_event(event_t *event)
         else ESP_LOGI(TAG, "Outgoing call to %s; local development ringing deadline=60s", rtc.call.remote);
         return;
     }
-    if (event->kind == COMMAND_ANSWER) { answer_incoming(); return; }
+    if (event->kind == COMMAND_ANSWER) {
+        if (rtc.call.phase == CALL_CONNECTING || rtc.call.phase == CALL_CONNECTED) {
+            if (rtc.call.voicemail) pick_up();
+            return; // Otherwise already talking.
+        }
+        rtc.call.voicemail = false; // Answered in person, even if the machine was due.
+        answer_incoming();
+        return;
+    }
     if (event->kind == COMMAND_HANGUP) { end_call(true, "local hangup"); return; }
     if (event->kind == EVENT_RING) {
         if (!event->from[0]) return;
@@ -842,6 +905,7 @@ static void process_event(event_t *event)
                  rtc.call.remote);
         // Ring once the offer reveals the caller's ringtone, or on timeout.
         rtc.call.ring_hint_deadline_us = esp_timer_get_time() + RINGTONE_HINT_WAIT_US;
+        arm_voicemail();
 #if CONFIG_DIGITS_WEBRTC_AUTO_ANSWER
         answer_incoming();
 #endif
@@ -904,7 +968,18 @@ static void service_audio(int64_t now)
     if (!rtc.call.audio) {
         // Same rule for call-progress tones; only the start waits.
         if (!digits_call_tones_is_stopped()) return;
-        esp_err_t err = digits_call_audio_start(rtc.audio_mode, &rtc.call.audio);
+        esp_err_t err;
+        if (rtc.call.voicemail) {
+            // Never start a voicemail call with the room microphone open.
+            const digits_call_audio_unattended_t *hooks = digits_voicemail_begin(rtc.call.remote);
+            if (!hooks) {
+                rtc.call.failure = "answering machine unavailable";
+                return;
+            }
+            err = digits_call_audio_start_unattended(rtc.audio_mode, hooks, &rtc.call.audio);
+        } else {
+            err = digits_call_audio_start(rtc.audio_mode, &rtc.call.audio);
+        }
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Call audio start failed: %s", esp_err_to_name(err));
             rtc.call.failure = "call audio start failed";
@@ -1015,6 +1090,14 @@ static void peer_task(void *context)
         if (rtc.call.phase == CALL_RINGING && !rtc.call.ring_started &&
             esp_timer_get_time() >= rtc.call.ring_hint_deadline_us)
             start_incoming_ring(-1); // No offer yet.
+        if (current_transport() && rtc.call.phase == CALL_RINGING && rtc.call.voicemail_at_us &&
+            !rtc.call.answer_requested && esp_timer_get_time() >= rtc.call.voicemail_at_us) {
+            rtc.call.voicemail_at_us = 0;
+            rtc.call.voicemail = true;
+            ESP_LOGI(TAG, "No answer: the answering machine takes the call from %s", rtc.call.remote);
+            answer_incoming();
+        }
+        if (rtc.call.voicemail && digits_voicemail_full()) end_call(true, "answering machine limit");
         if (rtc.call.peer && current_transport()) {
             int64_t before = esp_timer_get_time();
             bool connected = rtc.call.phase == CALL_CONNECTED;
@@ -1035,6 +1118,7 @@ static void peer_task(void *context)
             end_call(true, rtc.call.phase == CALL_CONNECTING ? "connect_timeout" : "ringing timeout");
         } else {
             service_audio(now);
+            report_voicemail(now);
             if (rtc.call.phase == CALL_CONNECTED && now >= rtc.call.next_report_us) {
                 rtc.call.next_report_us = now + 5000000;
                 ESP_LOGI(TAG, "Encoded media: tx=%" PRIu32 " rx=%" PRIu32 " rx_bytes=%" PRIu32 " tx_pts_skips=%" PRIu32 " send_blocked=%" PRIu32 " peer_loop_max_us=%" PRIu32 " loops_over_20ms=%" PRIu32,

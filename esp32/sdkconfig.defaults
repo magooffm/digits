@@ -26,3 +26,6 @@ CONFIG_MBEDTLS_SSL_DTLS_SRTP=y
 
 # SD card ringtones are named ringtone-NN.mp3: longer than FAT's 8.3 names.
 CONFIG_FATFS_LFN_HEAP=y
+# SD card and answering-machine tasks keep their stacks in PSRAM, leaving
+# internal RAM for the call audio workers.
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y

@@ -9,6 +9,8 @@
 #include "ringtones.h"
 #include "ring_select.h"
 #include "sd_ringtones.h"
+#include "silence.h"
+#include "voicemail.h"
 #include "webrtc.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -426,6 +428,8 @@ static void phone_task(void *arg)
         if (off_hook != previous_hook && source)
             ESP_LOGI(TAG, "Handset %s (%s)", off_hook ? "lifted" : "replaced", source);
         if (off_hook != previous_hook) digits_incoming_ring_set_suppressed(off_hook);
+        if (off_hook && !previous_hook) digits_voicemail_stop(); // Dial tone needs the speaker.
+        digits_silence_poll();
 
         digits_webrtc_call_state_t call;
         digits_webrtc_call_state(&call);
@@ -521,6 +525,11 @@ static void print_status(void)
     printf("Call: %s%s%s, signaling %s, %s\n", phase_names[call.phase],
            call.remote[0] ? " with " : "", call.remote,
            call.online ? "online" : "offline", call.paired ? "paired" : "unpaired");
+    digits_silence_state_t silence = digits_silence_state();
+    printf("Incoming calls: %s (server says %s%s)\n", silence.effective ? "silent" : "ring",
+           silence.server ? "silent" : "ring", silence.overridden ? ", overridden here" : "");
+    if (digits_voicemail_unheard() >= 0)
+        printf("Answering machine: %d new message(s)\n", digits_voicemail_unheard());
     for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {
         printf("Call button %s: %s, rings their phone with %u (%s)\n", target_names[i],
                numbers[i][0] ? numbers[i] : "unset", ringtones[i], ringtones_name(ringtones[i]));
@@ -652,6 +661,19 @@ int digits_phone_console(int argc, char **argv)
                ringtone, ringtones_name(ringtone));
         return 0;
     }
+    if (!strcmp(verb, "silence") && argc == 3) {
+        if (!strcmp(argv[2], "on")) digits_silence_set(true);
+        else if (!strcmp(argv[2], "off")) digits_silence_set(false);
+        else if (!strcmp(argv[2], "toggle")) digits_silence_toggle();
+        else {
+            printf("Usage: phone silence on|off|toggle\n");
+            return 1;
+        }
+        digits_silence_state_t silence = digits_silence_state();
+        printf("Incoming calls now %s%s\n", silence.effective ? "silent" : "ring",
+               silence.overridden ? " until the server setting changes" : "");
+        return 0;
+    }
     if (!strcmp(verb, "positions") && argc == 2) {
         print_positions();
         return 0;
@@ -715,7 +737,7 @@ int digits_phone_console(int argc, char **argv)
     printf("Usage: phone status | phone set a|b|c NUMBER | phone clear a|b|c | "
            "phone ringtones | phone ringtone a|b|c N | phone preview N | "
            "phone positions | phone position P N | phone selector a|b|c P | "
-           "phone hook up|down | phone press a|b|c\n");
+           "phone silence on|off|toggle | phone hook up|down | phone press a|b|c\n");
     return 1;
 }
 

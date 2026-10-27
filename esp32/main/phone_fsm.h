@@ -61,7 +61,7 @@ typedef struct {
 typedef enum {
     PHONE_ACTION_NONE,
     PHONE_ACTION_CALL,   // Dial target.
-    PHONE_ACTION_ANSWER,
+    PHONE_ACTION_ANSWER, // Also: take over from the answering machine.
     PHONE_ACTION_HANGUP,
     PHONE_ACTION_IGNORED_PRESS, // Target pressed while a call is impossible.
 } phone_action_t;

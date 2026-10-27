@@ -141,6 +141,19 @@ int xTaskCreate(void (*entry)(void *),const char *name,unsigned stack,void *arg,
 unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { (void)task; return 9000; }
 void vTaskDelete(TaskHandle_t task) { assert(!task); longjmp(done,1); }
 
+// Answering machine hooks: a recognizable greeting frame and a packet count.
+#define GREETING_SAMPLE 7000
+static unsigned fills, recorded_packets, filled_encodes, live_encodes, attend_at_read;
+static const digits_call_audio_unattended_t *start_hooks;
+static void test_fill(int16_t *mono, size_t frames)
+{
+    assert(frames == DIGITS_MIC_FRAME_SAMPLES);
+    for (size_t i=0;i<frames;++i) mono[i] = (int16_t)(GREETING_SAMPLE + i);
+    ++fills;
+}
+static void test_record(const uint8_t *packet, size_t size) { assert(packet && size == 1); ++recorded_packets; }
+static const digits_call_audio_unattended_t test_hooks = {.fill = test_fill, .record = test_record};
+
 static void inject_packets(void)
 {
     if (!active || !active->rx_packets) return;
@@ -196,6 +209,13 @@ esp_err_t digits_microphone_read(digits_microphone_frame_t *frame,uint32_t wait)
     ++mic_reads;
     *frame = (digits_microphone_frame_t){.sequence=mic_reads,.captured_at_us=now_us};
     for (unsigned i=0;i<DIGITS_MIC_FRAME_SAMPLES;++i) frame->pcm[i] = mic_reads + i;
+    if (attend_at_read && mic_reads == attend_at_read) {
+        uint8_t one=1;
+        assert(digits_call_audio_receive(active,40,&one,1) && recorded_packets == 2);
+        digits_call_audio_attend(active); // Handset lifted mid-call.
+        assert(digits_call_audio_receive(active,60,&one,1) && recorded_packets == 2);
+        assert(active->rx_packets->count == 1);
+    }
     return ESP_OK;
 }
 bool digits_audio_speaker_acquire(uint32_t wait)
@@ -253,7 +273,9 @@ esp_audio_err_t esp_opus_enc_process(void *handle,esp_audio_enc_in_frame_t *in,e
     assert(handle && in->len == 1920 && out->len == 1275);
     int16_t *pcm = (int16_t *)in->buffer;
     assert(pcm[0] > 0 && pcm[959] == pcm[0] + 959); // Live captured PCM, not silence.
-    out->buffer[0] = pcm[0]; out->buffer[1] = 1; out->buffer[2] = 2;
+    if (pcm[0] == GREETING_SAMPLE) ++filled_encodes; // The room microphone was replaced.
+    else { assert(pcm[0] == (int16_t)mic_reads); ++live_encodes; }
+    out->buffer[0] = (uint8_t)mic_reads; out->buffer[1] = 1; out->buffer[2] = 2;
     out->encoded_bytes = 3;
     now_us += 1000;
     return ESP_AUDIO_ERR_OK;
@@ -291,7 +313,7 @@ static void begin(digits_call_audio_mode_t mode)
     stall_injected=false;
     mic_reads=tx_sent=speaker_writes=simulated_underflows=0;
     tasks=0;
-    assert(digits_call_audio_start(mode,&active) == ESP_OK && active);
+    assert(digits_call_audio_start_unattended(mode,start_hooks,&active) == ESP_OK && active);
     ++creates;
 }
 static void run(unsigned index)
@@ -425,8 +447,27 @@ int main(void)
     fail_alloc=true;
     assert(digits_call_audio_start(DIGITS_CALL_AUDIO_FULL,&active) == ESP_ERR_NO_MEM && !active && !queues);
     fail_alloc=false;
+
+    // Answering machine: from the first frame the greeting replaces the room
+    // microphone and received packets are recorded, not played. Attending
+    // (handset lifted) restores both from the next frame.
+    digits_call_audio_unattended_t half = {.fill = test_fill};
+    assert(digits_call_audio_start_unattended(DIGITS_CALL_AUDIO_FULL,&half,&active) == ESP_ERR_INVALID_ARG && !active);
+    filled_encodes=live_encodes=0;
+    start_hooks=&test_hooks;
+    attend_at_read=10;
+    begin(DIGITS_CALL_AUDIO_FULL);
+    start_hooks=NULL;
+    uint8_t one=1;
+    assert(digits_call_audio_receive(active,0,&one,1) && recorded_packets == 1 && !active->rx_packets->count);
+    run(0);
+    assert(filled_encodes == 9 && live_encodes == 21 && fills == 9);
+    digits_call_audio_attend(active); // Repeated attend is harmless.
+    run(1); stats=finish();
+    assert(stats.received_frames == 3 && stats.encoded_frames == 30 && !stats.rx_queue_drops);
+    attend_at_read=0;
     assert(creates == stops && peak_tasks == 2);
-    printf("Call audio workers: PCM/PLC routing, 1000 fixed-clock TX frames, 100 playback cycles, two-DMA cadence and async cleanup/failure paths passed\n");
+    printf("Call audio workers: PCM/PLC routing, 1000 fixed-clock TX frames, 100 playback cycles, two-DMA cadence, unattended answering and async cleanup/failure paths passed\n");
     return 0;
 }
 '''

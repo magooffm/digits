@@ -1,9 +1,11 @@
 #include "credentials.h"
 #include "ring_test.h"
 #include "incoming_ring.h"
+#include "silence.h"
 #include "call_tones.h"
 #include "ringtone_pack.h"
 #include "sd_ringtones.h"
+#include "voicemail.h"
 #include "line_settings.h"
 #include "audio_board.h"
 #include "microphone.h"
@@ -36,13 +38,16 @@ void app_main(void)
         err = digits_incoming_ring_init();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Incoming ringtone unavailable: %s; calls still have logged indication", esp_err_to_name(err));
-        digits_incoming_ring_set_silent(digits_settings_silent());
+        digits_silence_init();
         err = digits_ringtone_pack_load();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Ringtone clips unavailable: %s; built-in ringtones still work", esp_err_to_name(err));
         err = digits_sd_ringtones_start();
         if (err != ESP_OK)
             ESP_LOGE("digits", "SD card ringtones unavailable: %s; built-in ringtones still work", esp_err_to_name(err));
+        err = digits_voicemail_start();
+        if (err != ESP_OK)
+            ESP_LOGE("digits", "Answering machine unavailable: %s; calls keep ringing", esp_err_to_name(err));
         err = digits_call_tones_init();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Call-progress tones unavailable: %s; calls still work", esp_err_to_name(err));

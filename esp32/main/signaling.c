@@ -1,6 +1,7 @@
 #include "signaling.h"
 #include "ring_test.h"
 #include "incoming_ring.h"
+#include "silence.h"
 #include "line_settings.h"
 #include "webrtc.h"
 #include "webrtc_console.h"
@@ -173,7 +174,7 @@ static void dispatch_message(signaling_t *s)
         // persists separately; publishing before the following ring message
         // preserves the server's settings-before-call ordering.
         if (digits_settings_receive(json, s->session))
-            digits_incoming_ring_set_silent(digits_settings_silent());
+            digits_silence_server(digits_settings_silent());
     } else if (strcmp(type, "ring_test") == 0) {
         digits_ring_test_request();
     } else if (strcmp(type, "error") == 0) {

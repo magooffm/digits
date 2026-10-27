@@ -4,6 +4,7 @@
 #ifdef CONFIG_DIGITS_WEBRTC_CONSOLE
 #include "webrtc.h"
 #include "phone.h"
+#include "voicemail.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,17 +55,27 @@ esp_err_t digits_webrtc_console_start(void)
         .command = "phone",
         .help = "Phone controls: status, set/clear a|b|c, ringtones, ringtone a|b|c N (how they "
                 "ring), preview N, positions, position P N, selector a|b|c P (how they ring here); "
+                "silence on|off|toggle (like the silence button); "
                 "hook up|down and press a|b|c simulate inputs.",
-        .hint = "status | set | clear | ringtones | ringtone | preview | positions | position | selector | hook | press",
+        .hint = "status | set | clear | ringtones | ringtone | preview | positions | position | selector | silence | hook | press",
         .func = digits_phone_console,
     };
     err = esp_console_cmd_register(&phone);
     if (err != ESP_OK) return err;
 #endif
+    const esp_console_cmd_t voicemail = {
+        .command = "vm",
+        .help = "Answering machine: status, list, play [N] (all new messages, or message N), "
+                "greeting (hear it), stop, heard N, delete N, delete heard.",
+        .hint = "status | list | play [N] | greeting | stop | heard N | delete N|heard",
+        .func = digits_voicemail_console,
+    };
+    err = esp_console_cmd_register(&voicemail);
+    if (err != ESP_OK) return err;
 
     esp_console_repl_config_t config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     config.prompt = "digits>";
-    config.task_stack_size = 4096;
+    config.task_stack_size = 6144; // vm list reads files on the SD card.
     config.task_priority = 3;
     config.max_cmdline_length = 96;
     config.max_history_len = 8;
@@ -77,6 +88,7 @@ esp_err_t digits_webrtc_console_start(void)
 #ifdef CONFIG_DIGITS_PHONE
         (void)esp_console_cmd_deregister("phone");
 #endif
+        (void)esp_console_cmd_deregister("vm");
         return err;
     }
     err = esp_console_start_repl(console);

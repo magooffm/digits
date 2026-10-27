@@ -15,10 +15,13 @@
 #define TX_QUEUE_LENGTH 3
 #define RX_QUEUE_LENGTH 8
 // esp_audio_codec 2.6.2 README's ESP32-S3 guidance excludes task stacks from
-// codec heap figures: about 40 KiB for encoding, 20 KiB for decoding. Include
-// driver/capture/logging headroom and measure the real binary on hardware.
-#define ENCODER_WORKER_STACK_BYTES (48U * 1024U)
-#define DECODER_WORKER_STACK_BYTES (24U * 1024U)
+// codec heap figures: about 40 KiB for encoding, 20 KiB for decoding. With
+// 48/24 KiB, full calls measured 27,136/16,012 bytes never used (README), so
+// about 22/8.5 KiB in use. These sizes keep a third or more spare; the 32 KiB
+// difference let the internal heap fit both stacks again once more features
+// were running (2026-10-27).
+#define ENCODER_WORKER_STACK_BYTES (36U * 1024U)
+#define DECODER_WORKER_STACK_BYTES (16U * 1024U)
 #define FRAME_US (CALL_AUDIO_FRAME_MS * 1000LL)
 #define CAPTURE_MAX_AGE_US 60000LL
 #define WRITE_TIMEOUT_MS 30
@@ -29,6 +32,8 @@ struct digits_call_audio {
     portMUX_TYPE lock;
     digits_call_audio_stats_t stats;
     digits_call_audio_mode_t mode;
+    digits_call_audio_unattended_t hooks;
+    bool unattended;
     bool stop_requested, tx_ready, rx_ready, tx_done, rx_done;
     QueueHandle_t tx_packets, rx_packets;
     StaticQueue_t tx_queue_control, rx_queue_control;
@@ -52,6 +57,14 @@ static bool stopping(digits_call_audio_t *audio)
     bool stop = audio->stop_requested;
     portEXIT_CRITICAL(&audio->lock);
     return stop;
+}
+
+static bool unattended(digits_call_audio_t *audio)
+{
+    portENTER_CRITICAL(&audio->lock);
+    bool value = audio->unattended;
+    portEXIT_CRITICAL(&audio->lock);
+    return value;
 }
 
 static void failure(digits_call_audio_t *audio, esp_err_t error)
@@ -146,6 +159,8 @@ static void encoder_worker(void *argument)
             portEXIT_CRITICAL(&audio->lock);
             continue;
         }
+        // Capture keeps running for timing; its PCM is replaced, never sent.
+        if (unattended(audio)) audio->hooks.fill(audio->capture->pcm, DIGITS_MIC_FRAME_SAMPLES);
         esp_audio_enc_in_frame_t input = {
             .buffer = (uint8_t *)audio->capture->pcm, .len = sizeof(audio->capture->pcm),
         };
@@ -401,13 +416,25 @@ finished:
 
 esp_err_t digits_call_audio_start(digits_call_audio_mode_t mode, digits_call_audio_t **out)
 {
-    if (!out || mode < DIGITS_CALL_AUDIO_TX || mode > DIGITS_CALL_AUDIO_FULL)
+    return digits_call_audio_start_unattended(mode, NULL, out);
+}
+
+esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
+                                             const digits_call_audio_unattended_t *hooks,
+                                             digits_call_audio_t **out)
+{
+    if (!out || mode < DIGITS_CALL_AUDIO_TX || mode > DIGITS_CALL_AUDIO_FULL ||
+        (hooks && (!hooks->fill || !hooks->record)))
         return ESP_ERR_INVALID_ARG;
     *out = NULL;
     digits_call_audio_t *audio = calloc(1, sizeof(*audio));
     if (!audio) return ESP_ERR_NO_MEM;
     audio->lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     audio->mode = mode;
+    if (hooks) {
+        audio->hooks = *hooks;
+        audio->unattended = true; // Before any worker exists.
+    }
     audio->tx_ready = audio->tx_done = !(mode & DIGITS_CALL_AUDIO_TX);
     audio->rx_ready = audio->rx_done = !(mode & DIGITS_CALL_AUDIO_RX);
     if (mode & DIGITS_CALL_AUDIO_TX) {
@@ -518,6 +545,13 @@ bool digits_call_audio_receive(digits_call_audio_t *audio, uint32_t pts_ms,
         portEXIT_CRITICAL(&audio->lock);
         return false;
     }
+    if (unattended(audio)) {
+        audio->hooks.record(data, size);
+        portENTER_CRITICAL(&audio->lock);
+        ++audio->stats.received_frames;
+        portEXIT_CRITICAL(&audio->lock);
+        return true;
+    }
     // Callback stack holds one bounded packet; no allocator or wait here.
     call_audio_packet_t packet = {
         .pts_ms = pts_ms, .size = size, .captured_at_us = esp_timer_get_time(),
@@ -529,6 +563,14 @@ bool digits_call_audio_receive(digits_call_audio_t *audio, uint32_t pts_ms,
     if (!queued) ++audio->stats.rx_queue_drops;
     portEXIT_CRITICAL(&audio->lock);
     return queued;
+}
+
+void digits_call_audio_attend(digits_call_audio_t *audio)
+{
+    if (!audio) return;
+    portENTER_CRITICAL(&audio->lock);
+    audio->unattended = false;
+    portEXIT_CRITICAL(&audio->lock);
 }
 
 void digits_call_audio_request_stop(digits_call_audio_t *audio)

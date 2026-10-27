@@ -16,10 +16,10 @@ full-duplex acoustic performance. Existing physical evidence remains in
 | --- | --- |
 | Shared settings | Normalize the existing nested `line_settings` snapshot, publish it atomically in RAM, and cache it asynchronously in a separate NVS namespace. |
 | Incoming calls | Logged incoming-call indication plus a repeating 440+480 Hz speaker ringtone, approximately two seconds on / four seconds off, until answer, hangup, timeout or disconnect. |
-| Silent Mode | The effective server flag suppresses only incoming ringing. Enabling it during ringing latches the current call silent; disabling it does not restart that call's ringtone. The next call uses the current flag. |
+| Silent Mode | The effective server flag suppresses only incoming ringing. Enabling it during ringing latches the current call silent; disabling it does not restart that call's ringtone. The next call uses the current flag. Since 2026-10-27 a local choice can override it until the server value changes ([README](../esp32/README.md#silence)). |
 | Quiet Hours | Same effective flag as Silent Mode. All schedule, timezone and DST decisions remain on the server. |
 | Ring Test | Existing explicit one-second diagnostic remains independent of Silent Mode and shares the existing speaker mutex. |
-| Other preferences | Voice Style, Auto Update and voicemail are cached and reported only. No voice DSP, answering timer/recording, updater or remote reboot is activated. |
+| Other preferences | Voice Style and Auto Update are cached and reported only. No voice DSP, updater or remote reboot is activated. Voicemail drives the answering machine since 2026-10-27 ([README](../esp32/README.md#answering-machine)). |
 
 Incoming silent calls remain answerable with `webrtc answer`. No local UI,
 hook-switch or TH-07 wiring was added; serial logs provide the required incoming
@@ -56,7 +56,7 @@ The incoming envelope is unchanged, with no added request or acknowledgement:
   object replaces both: enabled defaults false, timeout defaults 20 seconds.
   Integer timeouts from 5 through 60 are retained; missing, fractional,
   out-of-range or malformed values normalize to 20. A non-object non-null block
-  rejects the whole snapshot. These are cached values, with no voicemail action.
+  rejects the whole snapshot. Since 2026-10-27 they arm the answering machine.
 - Before any valid cache or server settings, defaults are copper, silent off,
   auto-update off, voicemail off, timeout 20 seconds. The server's fresh-line
   defaults may differ; its next snapshot takes precedence.
