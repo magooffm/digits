@@ -52,6 +52,24 @@ void microphone_pcm_convert(const int16_t *stereo, int16_t *mono,
     }
 }
 
+void microphone_pcm_split_tdm(const int16_t *tdm, int16_t *stereo, int16_t *reference,
+                              size_t frames, microphone_pcm_stats_t *stats)
+{
+    for (size_t frame = 0; frame < frames; ++frame) {
+        const int16_t *slots = tdm + frame * MICROPHONE_PCM_TDM_CHANNELS;
+        const int16_t mic1 = slots[MICROPHONE_PCM_TDM_MIC1];
+        const int16_t mic2 = slots[MICROPHONE_PCM_TDM_MIC2];
+        const int16_t echo = slots[MICROPHONE_PCM_TDM_REFERENCE];
+        // Read before writing: in place, frame 0 overwrites its own slots.
+        stereo[2 * frame] = mic1;
+        stereo[2 * frame + 1] = mic2;
+        reference[frame] = echo;
+        if (stats != NULL) {
+            accumulate_sample(&stats->reference, echo);
+        }
+    }
+}
+
 double microphone_pcm_rms(const microphone_pcm_level_t *level)
 {
     if (level->sample_count == 0) {

@@ -16,6 +16,8 @@
 #define FRAME_QUEUE_LENGTH 4
 #define READ_TIMEOUT_MS 100
 #define WARMUP_FRAMES 10 // Discard the first 200 ms after ADC startup.
+#define TDM_BYTES (DIGITS_MIC_FRAME_SAMPLES * MICROPHONE_PCM_TDM_CHANNELS * sizeof(int16_t))
+#define PSRAM (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 typedef struct {
     microphone_pcm_stats_t levels;
@@ -45,8 +47,8 @@ static struct {
     TaskHandle_t report_task;
     SemaphoreHandle_t control_lock;
     SemaphoreHandle_t consumer_lock;
-    int16_t stereo[DIGITS_MIC_FRAME_SAMPLES * 2];
-    digits_microphone_frame_t frame;
+    int16_t *tdm; // PSRAM, like the frames: internal RAM is for calls.
+    digits_microphone_frame_t *frame, *spare;
     microphone_pcm_stats_t levels;
     bool diagnostic;
     uint32_t dma_overruns;
@@ -102,10 +104,11 @@ static void report_levels(const microphone_report_t *report, unsigned silent_win
     if (filled > 20) filled = 20;
     for (unsigned i = 0; i < 20; ++i) meter[i] = i < filled ? '#' : '.';
     meter[20] = '\0';
-    ESP_LOGI("microphone", "mono RMS=%.1f (%.1f dBFS) peak=%u (%.1f%%) [%s]; L RMS=%.1f peak=%u; R RMS=%.1f peak=%u; samples=%u",
+    ESP_LOGI("microphone", "mono RMS=%.1f (%.1f dBFS) peak=%u (%.1f%%) [%s]; L RMS=%.1f peak=%u; R RMS=%.1f peak=%u; speaker reference RMS=%.1f peak=%u; samples=%u",
              rms, db, (unsigned)mono->peak, mono->peak / 327.68, meter,
              microphone_pcm_rms(&levels->left), (unsigned)levels->left.peak,
              microphone_pcm_rms(&levels->right), (unsigned)levels->right.peak,
+             microphone_pcm_rms(&levels->reference), (unsigned)levels->reference.peak,
              (unsigned)mono->sample_count);
     if (!mono->sample_count) {
         memset(silent_windows, 0, 3 * sizeof(*silent_windows));
@@ -161,7 +164,7 @@ static void capture_worker(void *arg)
     i2s_chan_handle_t rx = digits_audio_rx_channel();
     size_t filled = 0;
     unsigned byte_phase = 0, align_skip = 0;
-    uint8_t alignment_bytes[sizeof(int16_t) * 2];
+    uint8_t alignment_bytes[sizeof(int16_t) * MICROPHONE_PCM_TDM_CHANNELS];
     unsigned warmup = WARMUP_FRAMES;
     uint32_t previous_overruns = overflow_count(), window_overruns = 0, errors = 0;
     esp_err_t last_error = ESP_OK;
@@ -201,8 +204,8 @@ static void capture_worker(void *arg)
         }
         size_t bytes = 0;
         bool aligning = align_skip != 0;
-        void *destination = aligning ? alignment_bytes : (uint8_t *)mic.stereo + filled;
-        size_t capacity = aligning ? align_skip : sizeof(mic.stereo) - filled;
+        void *destination = aligning ? alignment_bytes : (uint8_t *)mic.tdm + filled;
+        size_t capacity = aligning ? align_skip : TDM_BYTES - filled;
         esp_err_t err = i2s_channel_read(rx, destination, capacity, &bytes, READ_TIMEOUT_MS);
         // Keep partial bytes, including partial words, so a timeout never
         // changes slot/sample alignment. Convert only a complete stereo frame.
@@ -235,23 +238,23 @@ static void capture_worker(void *arg)
             report_at = esp_timer_get_time() + 1000000;
             was_diagnostic = diagnostic;
         }
-        if (filled == sizeof(mic.stereo)) {
+        if (filled == TDM_BYTES) {
             filled = 0;
             if (warmup) {
                 --warmup;
             } else if (!mic.paused) {
-                microphone_pcm_convert(mic.stereo, mic.frame.pcm, DIGITS_MIC_FRAME_SAMPLES,
-                                       MONO_SLOT, diagnostic ? &mic.levels : NULL);
-                mic.frame.sequence++;
-                mic.frame.flags = discontinuity ? DIGITS_MIC_FRAME_DISCONTINUITY : 0;
-                mic.frame.captured_at_us = esp_timer_get_time();
+                microphone_pcm_stats_t *stats = diagnostic ? &mic.levels : NULL;
+                microphone_pcm_split_tdm(mic.tdm, mic.tdm, mic.frame->reference, DIGITS_MIC_FRAME_SAMPLES, stats);
+                microphone_pcm_convert(mic.tdm, mic.frame->pcm, DIGITS_MIC_FRAME_SAMPLES, MONO_SLOT, stats);
+                mic.frame->sequence++;
+                mic.frame->flags = discontinuity ? DIGITS_MIC_FRAME_DISCONTINUITY : 0;
+                mic.frame->captured_at_us = esp_timer_get_time();
                 // Drop the oldest frame, never wait for a slow/absent consumer.
                 // A reader receives its own copy; no DMA buffer is shared.
-                if (xQueueSend(mic.frames, &mic.frame, 0) != pdTRUE) {
-                    digits_microphone_frame_t discarded;
-                    if (xQueueReceive(mic.frames, &discarded, 0) == pdTRUE)
-                        mic.frame.flags |= DIGITS_MIC_FRAME_DISCONTINUITY;
-                    xQueueSend(mic.frames, &mic.frame, 0);
+                if (xQueueSend(mic.frames, mic.frame, 0) != pdTRUE) {
+                    if (xQueueReceive(mic.frames, mic.spare, 0) == pdTRUE)
+                        mic.frame->flags |= DIGITS_MIC_FRAME_DISCONTINUITY;
+                    xQueueSend(mic.frames, mic.frame, 0);
                 }
                 discontinuity = false;
             }
@@ -278,7 +281,10 @@ static void release_microphone(void)
     if (mic.report_task) vTaskDeleteWithCaps(mic.report_task);
     if (mic.codec) audio_codec_delete_codec_if(mic.codec);
     if (mic.ctrl) audio_codec_delete_ctrl_if(mic.ctrl);
-    if (mic.frames) vQueueDelete(mic.frames);
+    if (mic.frames) vQueueDeleteWithCaps(mic.frames);
+    heap_caps_free(mic.tdm);
+    heap_caps_free(mic.frame);
+    heap_caps_free(mic.spare);
     if (mic.reports) vQueueDelete(mic.reports);
     if (mic.control_lock) vSemaphoreDelete(mic.control_lock);
     if (mic.consumer_lock) vSemaphoreDelete(mic.consumer_lock);
@@ -303,44 +309,49 @@ esp_err_t digits_microphone_init(void)
     if (!mic.ctrl) { err = ESP_ERR_NO_MEM; goto fail; }
     es7210_codec_cfg_t codec = {
         .ctrl_if = mic.ctrl, .master_mode = false,
-        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2,
+        .mic_selected = ES7210_SEL_MIC1 | ES7210_SEL_MIC2 | ES7210_SEL_MIC3,
         .mclk_src = ES7210_MCLK_FROM_PAD, .mclk_div = 256,
     };
-    // MIC3 is the ES8311 echo reference, MIC4 is unused. Exactly two selected
-    // ADCs mean ordinary Philips stereo, not the Waveshare demo's 4-ch TDM.
+    // MIC3 is the ES8311 echo reference, MIC4 is unused. Three or more ADCs
+    // put the ES7210 in TDM: four 16-bit channels per frame on one line,
+    // read as 32-bit stereo (audio_board.c); the driver halves the 32 bits.
     mic.codec = es7210_codec_new(&codec);
     if (!mic.codec) goto fail;
     esp_codec_dev_sample_info_t sample = {
-        .sample_rate = DIGITS_AUDIO_SAMPLE_RATE, .channel = 2, .channel_mask = 3,
-        .bits_per_sample = 16, .mclk_multiple = 256,
+        .sample_rate = DIGITS_AUDIO_SAMPLE_RATE, .channel = 2, .channel_mask = 0,
+        .bits_per_sample = 32, .mclk_multiple = 256,
     };
     // Use checked low-level codec calls: the device convenience wrappers in
     // pinned esp_codec_dev 1.6.2 can discard gain/mute I2C errors.
     if (mic.codec->set_fs(mic.codec, &sample) != ESP_CODEC_DEV_OK ||
         mic.codec->enable(mic.codec, true) != ESP_CODEC_DEV_OK ||
         mic.codec->set_mic_gain(mic.codec, CONFIG_DIGITS_MIC_GAIN_DB) != ESP_CODEC_DEV_OK ||
+        mic.codec->set_mic_channel_gain(mic.codec, 1 << 2, CONFIG_DIGITS_MIC_REFERENCE_GAIN_DB) != ESP_CODEC_DEV_OK ||
         mic.codec->mute_mic(mic.codec, false) != ESP_CODEC_DEV_OK) goto fail;
     // Gain must be applied AFTER enable: ES7210 startup rewrites gain bits.
     int format, routing, mode;
     if (mic.codec->get_reg(mic.codec, 0x11, &format) != ESP_CODEC_DEV_OK ||
         mic.codec->get_reg(mic.codec, 0x12, &routing) != ESP_CODEC_DEV_OK ||
         mic.codec->get_reg(mic.codec, 0x08, &mode) != ESP_CODEC_DEV_OK) goto fail;
-    if (format != 0x60 || routing != 0x00 || (mode & 1)) {
+    if (format != 0x60 || routing != 0x02 || (mode & 1)) {
         ESP_LOGE("microphone", "Unexpected ADC format: SDP1=0x%02x SDP2=0x%02x MODE=0x%02x", format, routing, mode);
         err = ESP_ERR_INVALID_STATE;
         goto fail;
     }
-    mic.frames = xQueueCreate(FRAME_QUEUE_LENGTH, sizeof(digits_microphone_frame_t));
+    mic.frames = xQueueCreateWithCaps(FRAME_QUEUE_LENGTH, sizeof(digits_microphone_frame_t), PSRAM);
     mic.reports = xQueueCreate(1, sizeof(microphone_report_t));
+    mic.tdm = heap_caps_malloc(TDM_BYTES, PSRAM);
+    mic.frame = heap_caps_calloc(1, sizeof(*mic.frame), PSRAM);
+    mic.spare = heap_caps_malloc(sizeof(*mic.spare), PSRAM);
     mic.control_lock = xSemaphoreCreateMutex();
     mic.consumer_lock = xSemaphoreCreateMutex();
-    if (!mic.frames || !mic.reports || !mic.control_lock || !mic.consumer_lock) {
+    if (!mic.frames || !mic.reports || !mic.control_lock || !mic.consumer_lock ||
+        !mic.tdm || !mic.frame || !mic.spare) {
         err = ESP_ERR_NO_MEM;
         goto fail;
     }
     // Logging only, no flash writes: its stack can live in PSRAM.
-    if (xTaskCreateWithCaps(report_worker, "digits_mic_log", 4096, NULL, 3, &mic.report_task,
-                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+    if (xTaskCreateWithCaps(report_worker, "digits_mic_log", 4096, NULL, 3, &mic.report_task, PSRAM) != pdPASS) {
         err = ESP_ERR_NO_MEM;
         goto fail;
     }
@@ -358,8 +369,9 @@ esp_err_t digits_microphone_init(void)
         err = ESP_ERR_NO_MEM;
         goto fail;
     }
-    ESP_LOGI("microphone", "Capture ready: ES7210 MIC1+MIC2, 48000 Hz, 16-bit Philips stereo -> mono %s, gain=%d dB; diagnostics=%s",
-             MONO_NAME, CONFIG_DIGITS_MIC_GAIN_DB, diagnostic_enabled() ? "on" : "off");
+    ESP_LOGI("microphone", "Capture ready: ES7210 TDM MIC1+MIC2+MIC3 (speaker reference), 48000 Hz, 16-bit -> mono %s, "
+             "gain=%d dB, reference gain=%d dB; diagnostics=%s",
+             MONO_NAME, CONFIG_DIGITS_MIC_GAIN_DB, CONFIG_DIGITS_MIC_REFERENCE_GAIN_DB, diagnostic_enabled() ? "on" : "off");
     return ESP_OK;
 fail:
     release_microphone();

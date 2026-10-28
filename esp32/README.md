@@ -62,7 +62,8 @@ bookmarks (`/#messages`):
   uptime and memory, refreshed every few seconds.
 - **Buttons.** Each call button's number and the ringtone the called phone
   rings with; how their calls ring here (knob position, settable here while
-  no physical knob is fitted).
+  no physical knob is fitted). Below, the microphone gain (see "Echo
+  cancellation and microphone gain").
 - **Ringtones.** For every knob position one choice: a built-in ringtone or
   a song from the SD card library (see "Ringtones from the SD card"). Below,
   the library as one scrollable list with a single player for the selected
@@ -130,7 +131,9 @@ The server's per-line **Copper Wire / Modern HD** setting now shapes what the
 other side hears from this phone. Copper Wire (the default for new lines)
 runs the outgoing microphone audio through the Pi's telephone-band chain:
 two 300 Hz high-pass and two 3,400 Hz low-pass Butterworth sections
-(`voice_style.c`). Modern HD sends it unfiltered. A change in the web UI
+(`voice_style.c`, at 16 kHz after echo cancellation since 2026-10-29).
+Modern HD sends it unfiltered: wideband, up to about 7 kHz (the Pi sends
+48 kHz). A change in the web UI
 applies within milliseconds, also mid-call (the status page shows the style
 the phone uses); the answering machine's greeting
 is never filtered, as on the Pi. Measured on the host: 1 kHz -0.1 dB, the
@@ -141,6 +144,44 @@ two counts of the Pi's double-precision filter. The Pi also suppresses noise
 call in each style: Copper minus Modern was -1 dB at 500 Hz, about 0 dB at
 2 kHz, -16 dB at 5 kHz and -28 dB at 7 kHz (single tones in a room vary by a
 few dB). The worst encode time stayed at 13-19 ms, as without the filter.
+
+### Echo cancellation and microphone gain
+
+The speaker no longer comes back to the caller: the ES7210 now also records
+MIC3, the speaker signal looped back from the ES8311, sample for sample with
+the microphones ("Microphone capture"). Per call, `tx_voice.c` runs
+Espressif's ESP-SR echo canceller (`espressif/esp-sr` 2.5.5, full-duplex low
+cost mode, filter length 4) on 16 kHz audio (`decimate.c`: 64-tap lowpass,
+flat to 5 kHz, -78 dB at 9.5 kHz), then a fixed microphone gain with a
+limiter (ESP-SR's WebRTC AGC in fixed mode). Opus now encodes 16 kHz in
+audio mode, which halved its CPU time compared with VoIP mode. The other side
+decodes at 48 kHz as before.
+
+- **Microphone gain.** 18 dB by default (`CONFIG_DIGITS_VOICE_GAIN_DB`),
+  0 to 30 dB in 3 dB steps on the status page (Buttons tab) or any value with
+  `voice gain DB` on the console; saved, applied at once, also mid-call.
+- **Comparison.** `voice aec off|on` switches the canceller until restart.
+- **Cost.** Decimation and cancellation run in a priority-5 task on either
+  core, so the encoder's work stays even; that adds 48 ms of delay (one
+  512-sample chunk plus a frame of slack). About 16 KB internal RAM per call
+  (ESP-SR asks for it; the encoder stack went from 36 to 28 KiB, using about
+  20 KiB); calls kept 32-36 KB internal RAM free. The faster flash (quad)
+  and PSRAM (80 MHz) in `sdkconfig.defaults` are required: at 40 MHz and
+  dual flash the canceller alone took 19 ms per 20 ms frame.
+- **No noise suppression.** ESP-SR's suppressor cost 4-6 ms per frame, more
+  than was left. The canceller's residual-echo stage lowers room noise while
+  the other side speaks.
+
+Measured on the board (2026-10-29) with the interop peer playing speech into
+the phone and recording what came back: without cancellation each phrase
+returned at RMS 100-160 (gain 18 dB); with it, the first phrase leaked
+briefly while the canceller adapted and every later one fell below the room
+noise, more than 30 dB less. Near speech from PC speakers passed unchanged
+(the gain multiplied it by 8 at 18 dB); while both sides spoke, near speech
+passed except during the first seconds of adaptation. Over four 32 s calls
+0 to 7 frames per call went out as silence because the canceller fell
+behind; no capture gaps; sent-frame drops as before. Not yet tested: a real
+voice at a real distance (the right gain), the handset.
 
 ### Remote restart
 
@@ -701,13 +742,16 @@ The manifest and lock file pin:
 
 The initial transport milestone sent validated `f8 ff fe` Opus silence and
 counted received packets. The call audio implementation replaces that source
-with ES7210 PCM: 960 signed 16-bit mono samples at 48 kHz per 20 ms frame.
+with ES7210 PCM: 960 signed 16-bit mono samples at 48 kHz per 20 ms frame,
+encoded at 16 kHz since echo cancellation (see "Echo cancellation and
+microphone gain").
 Dedicated workers encode Opus and decode incoming audio for ES8311 playback;
 the peer worker alone submits encoded packets. Capture sequence determines
 PTS, and stale/backlogged frames are discarded without a catch-up burst.
 The SDP still advertises `opus/48000/2`; local PCM remains mono.
 
-The ESP32 encoder uses 32 kbit/s CBR, VOIP mode, complexity 0 and no FEC/DTX.
+The ESP32 encoder uses 32 kbit/s CBR, VOIP mode, complexity 0 and no FEC/DTX
+(since 2026-10-29: 16 kHz input and audio mode).
 The original Pi/Pion 24 kbit/s FEC/DTX encoder remains unchanged. Playback uses
 a bounded 60 ms initial jitter target, eight slots and half-amplitude PCM.
 Missing frames use Opus PLC; a sustained outage mutes output and waits for a
@@ -1097,7 +1141,9 @@ follows Espressif's official ESP-IDF v5.5.3 ES8311 example:
 The shared `audio_board.c` infrastructure owns I2C and the native I2S0
 full-duplex TX/RX pair. The ESP32 supplies clocks; ES8311 and ES7210 are
 slaves: Philips I2S, signed 16-bit samples in two 16-bit slots, 48 kHz,
-MCLK 256 x sample rate = 12.288 MHz, BCLK = 1.536 MHz. Ring Test sends
+MCLK 256 x sample rate = 12.288 MHz, BCLK = 1.536 MHz. Since 2026-10-29 the
+slots are 32 bits (BCLK 3.072 MHz) so the ES7210 can send four channels in
+TDM; the speaker's 16-bit samples sit at the top of each slot. Ring Test sends
 identical samples to both speaker slots at this rate. Espressif
 `esp_codec_dev` **1.6.2** initializes the ES8311 DAC and ES7210 ADC paths.
 The expander writes preserve every other pin; PA is latched low before
@@ -1171,17 +1217,24 @@ tap near each microphone to confirm its position on your assembled board.
 | --- | --- |
 | Onboard MIC1 | ES7210 MIC1P/MIC1N, ADC channel 1; standard-I2S left/WS-low slot |
 | Onboard MIC2 | ES7210 MIC2P/MIC2N, ADC channel 2; standard-I2S right/WS-high slot |
-| ADC MIC3 | Speaker echo-reference path from ES8311 OUTP/OUTN; disabled |
+| ADC MIC3 | Speaker echo-reference path from ES8311 OUTP/OUTN; enabled for echo cancellation (`CONFIG_DIGITS_MIC_REFERENCE_GAIN_DB`, 24 dB) |
 | ADC MIC4 | Unused input; disabled |
 | ES7210 I2C address | 7-bit `0x40` (A0/A1 low); codec component takes 8-bit `0x80` |
 | Microphone bias | ES7210 MICBIAS12, 2.87 V |
 | Serial input | GPIO15, ES7210 SDOUT1/TDMOUT through schematic R47 |
 | Serial output format | 48 kHz Philips I2S; two signed 16-bit samples per frame, MSB first, one BCLK delay |
-| Native RX buffer layout | Little-endian `int16_t`: `[MIC1, MIC2, MIC1, MIC2, ...]` |
+| Native RX buffer layout | Little-endian `int16_t`: `[MIC1, MIC2, MIC1, MIC2, ...]`; since TDM `[MIC3, MIC1, MIC4, MIC2, ...]` |
 | Application output | 48 kHz signed 16-bit mono; MIC1 by default, selectable MIC2 or average |
 
-The ADC selects only `ES7210_SEL_MIC1 | ES7210_SEL_MIC2`, so the pinned driver
-uses ordinary stereo rather than TDM. It configures native 16-bit samples;
+Since 2026-10-29 the ADC selects MIC1, MIC2 and MIC3: three or more inputs
+put the ES7210 in TDM (`0x12 == 0x02`), read as 32-bit stereo with the
+driver halving the bits, as in the Waveshare demo below. Measured on the
+board: a ringtone raised memory position 0 only when MIC3's gain was up and
+position 1 only with MIC1's, confirming the order `3,1,4,2`.
+`microphone_pcm_split_tdm()` turns it into the stereo below plus the
+reference, which travels in each frame. The rest of this section describes
+the earlier stereo setup: the ADC selected only `ES7210_SEL_MIC1 |
+ES7210_SEL_MIC2`, so the pinned driver used ordinary stereo rather than TDM. It configures native 16-bit samples;
 no arbitrary bit shifts, channel guessing or higher-depth truncation are
 needed. Initialization checks ES7210 interface registers `0x11 == 0x60`,
 `0x12 == 0x00` and slave mode in `0x08`. The board driver checks the native
@@ -1213,7 +1266,8 @@ averages using a signed 32-bit sum before division by two. It also computes
 per-channel and mono statistics when diagnostics are enabled.
 
 The application queue holds four copied mono frames (80 ms, 7,680 bytes of
-PCM plus frame headers). Its producer never waits: a full queue drops the
+PCM plus frame headers; with the reference 15,360 bytes, so the queue and the
+staging buffers moved to PSRAM). Its producer never waits: a full queue drops the
 oldest frame. Capture uses one bounded 3,840-byte stereo staging buffer and
 one 1,920-byte mono staging buffer. Normal capture has no accumulating
 recording or PSRAM requirement; the optional record/playback modes below

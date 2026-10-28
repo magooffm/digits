@@ -34,7 +34,7 @@ static esp_err_t run_record_playback(void)
     }
     bool pause_requested = false;
     esp_err_t err = ESP_OK;
-    digits_microphone_frame_t frame;
+    static digits_microphone_frame_t frame; // One worker; too big for its stack.
     int16_t stereo[DIGITS_AUDIO_DMA_FRAMES * 2];
     uint32_t sequence = 0;
     size_t samples = 0;

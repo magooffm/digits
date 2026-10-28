@@ -6,6 +6,7 @@
 #include "sd_ringtones.h"
 #include "sd_ringtone_util.h"
 #include "status.h"
+#include "tx_voice.h"
 #include "voicemail.h"
 #include "greeting_record.h"
 #include "webrtc.h"
@@ -243,8 +244,10 @@ static esp_err_t config_get(httpd_req_t *req)
     digits_greeting_record_status_t rec = digits_greeting_record_status();
     bool hear_greeting, hear_caller;
     digits_voicemail_listen(&hear_greeting, &hear_caller);
-    at = append(out, at, CONFIG_JSON_BYTES, "],\"listen\":{\"greeting\":%s,\"caller\":%s",
-                hear_greeting ? "true" : "false", hear_caller ? "true" : "false");
+    at = append(out, at, CONFIG_JSON_BYTES, "],\"listen\":{\"greeting\":%s,\"caller\":%s},"
+                "\"mic\":{\"gain_db\":%d,\"max_db\":%d",
+                hear_greeting ? "true" : "false", hear_caller ? "true" : "false", tx_voice_gain_db(),
+                TX_VOICE_GAIN_MAX_DB);
     at = append(out, at, CONFIG_JSON_BYTES,
                 "},\"card\":\"%s\",\"greeting\":{\"kind\":\"%s\",\"seconds\":%u,"
                 "\"recording\":{\"state\":\"%s\",\"seconds\":%u.%u,\"message\":\"%s\"}}}",
@@ -479,6 +482,24 @@ static esp_err_t listen_post(httpd_req_t *req)
     return done(req, run_internal(apply_listen, &change), "Saved");
 }
 
+static esp_err_t apply_mic(const void *arg)
+{
+    return tx_voice_set_gain_db(*(const int *)arg);
+}
+
+static esp_err_t mic_post(httpd_req_t *req)
+{
+    esp_err_t result;
+    if (!may_write(req, &result)) return result;
+    char body[FORM_BYTES];
+    int size = read_form(req, body, sizeof(body));
+    unsigned long gain;
+    if (size < 0 || !form_number(body, (size_t)size, "gain_db", &gain) || gain > TX_VOICE_GAIN_MAX_DB)
+        return done(req, ESP_ERR_INVALID_ARG, "");
+    int db = (int)gain;
+    return done(req, run_internal(apply_mic, &db), "Saved");
+}
+
 // ---- Greeting -------------------------------------------------------------
 
 static esp_err_t greeting_get(httpd_req_t *req)
@@ -579,6 +600,7 @@ void digits_web_config_register(httpd_handle_t server)
         {.uri = "/api/greeting-action", .method = HTTP_POST, .handler = greeting_action_post},
         {.uri = "/api/greeting-new", .method = HTTP_GET, .handler = greeting_new_get},
         {.uri = "/api/listen", .method = HTTP_POST, .handler = listen_post},
+        {.uri = "/api/mic", .method = HTTP_POST, .handler = mic_post},
     };
     for (unsigned i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i)
         httpd_register_uri_handler(server, &handlers[i]);

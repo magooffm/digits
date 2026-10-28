@@ -59,6 +59,11 @@ audio{height:2em;max-width:100%}
 <p class="muted">Who each button calls and how their phone rings. "Rings here" is how their calls
 ring on this phone: the contact's knob picks a position, the Ringtones tab what it plays.</p>
 <table id="buttonlist"></table></section>
+<section><h2>Microphone</h2>
+<p><label>Gain <select id="micgain" class="mwrite" onchange="saveMic()"></select></label></p>
+<p class="muted">How loud the other side hears you. Echo cancellation keeps the speaker out of it.
+Raise the gain if callers find you quiet; lower it if they hear noise or clipping. Applies at once, also during a call.</p>
+</section>
 </div>
 
 <div id="tab-ringtones" hidden>
@@ -192,7 +197,7 @@ function uploadSong(){
   upload('/api/ringtone?name='+encodeURIComponent(f.name),$('songfile'),'songprogress');
 }
 function loadConfig(){
-  fetch('/api/config').then(need).then(function(c){cfg=c;drawButtons();drawPositions();drawGreeting();drawListen()})
+  fetch('/api/config').then(need).then(function(c){cfg=c;drawButtons();drawPositions();drawGreeting();drawListen();drawMic()})
     .catch(function(e){
       if(e!='login'){toast('Could not show the settings');console.error(e);return}
       locked('buttonlist');locked('positions');$('greetingstate').innerHTML='<a href="/login">Log in</a> to see this.'});
@@ -262,6 +267,13 @@ function drawListen(){
   $('heargreeting').checked=cfg.listen.greeting;$('hearcaller').checked=cfg.listen.caller;
   Array.prototype.forEach.call(document.querySelectorAll('.lwrite'),function(e){e.disabled=!cfg.writable});
 }
+function drawMic(){
+  var s=$('micgain'),h='';
+  for(var db=0;db<=cfg.mic.max_db;db+=3)h+='<option value="'+db+'">'+(db?'+'+db+' dB':'Off (0 dB)')+'</option>';
+  if(cfg.mic.gain_db%3)h+='<option value="'+cfg.mic.gain_db+'">+'+cfg.mic.gain_db+' dB</option>'; // Set on the console.
+  s.innerHTML=h;s.value=cfg.mic.gain_db;s.disabled=!cfg.writable;
+}
+function saveMic(){act('/api/mic',{gain_db:$('micgain').value},loadConfig)}
 function saveListen(){act('/api/listen',{greeting:$('heargreeting').checked?1:0,caller:$('hearcaller').checked?1:0},loadConfig)}
 function contact(number){
   if(cfg)for(var i=0;i<cfg.buttons.length;i++)if(cfg.buttons[i].number==number)return 'Button '+cfg.buttons[i].name+' ('+number+')';

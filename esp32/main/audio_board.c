@@ -86,9 +86,9 @@ static esp_err_t verify_format(i2s_chan_handle_t channel, bool enabled)
     const i2s_std_config_t *cfg = info.mode_cfg;
     if (cfg->clk_cfg.sample_rate_hz != DIGITS_AUDIO_SAMPLE_RATE ||
         cfg->clk_cfg.mclk_multiple != I2S_MCLK_MULTIPLE_256 ||
-        cfg->slot_cfg.data_bit_width != I2S_DATA_BIT_WIDTH_16BIT ||
-        cfg->slot_cfg.slot_bit_width != I2S_SLOT_BIT_WIDTH_16BIT ||
-        cfg->slot_cfg.ws_width != 16 ||
+        cfg->slot_cfg.data_bit_width != (info.dir == I2S_DIR_TX ? I2S_DATA_BIT_WIDTH_16BIT : I2S_DATA_BIT_WIDTH_32BIT) ||
+        cfg->slot_cfg.slot_bit_width != I2S_SLOT_BIT_WIDTH_32BIT ||
+        cfg->slot_cfg.ws_width != 32 ||
         cfg->slot_cfg.slot_mode != I2S_SLOT_MODE_STEREO ||
         cfg->slot_cfg.slot_mask != I2S_STD_SLOT_BOTH || !cfg->slot_cfg.bit_shift ||
         cfg->slot_cfg.ws_pol || cfg->slot_cfg.big_endian || cfg->slot_cfg.bit_order_lsb ||
@@ -132,10 +132,15 @@ esp_err_t digits_audio_board_init(void)
         },
     };
     standard.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
-    // Explicit 16-bit slots, not 16-bit values packed into wider words.
-    standard.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
+    // 32-bit slots: the ES7210 sends four 16-bit channels per frame in TDM
+    // (microphone.c), read as two 32-bit words. The speaker keeps 16-bit
+    // samples, sent at the top of each 32-bit slot.
+    standard.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+    standard.slot_cfg.ws_width = 32;
     TRY(i2s_channel_init_std_mode(board.tx, &standard));
-    TRY(i2s_channel_init_std_mode(board.rx, &standard));
+    i2s_std_config_t capture = standard;
+    capture.slot_cfg.data_bit_width = I2S_DATA_BIT_WIDTH_32BIT;
+    TRY(i2s_channel_init_std_mode(board.rx, &capture));
     TRY(i2s_channel_enable(board.tx));
     // The codec adapter owns TX only. Capture owns native RX and never asks
     // this adapter to close/reconfigure either side during operation.
@@ -169,6 +174,11 @@ esp_err_t digits_audio_board_init(void)
         err = ESP_FAIL;
         goto fail;
     }
+    // Opening reset TX to 16-bit slots; restore the 32-bit frame capture needs.
+    TRY(i2s_channel_disable(board.tx));
+    TRY(i2s_channel_reconfig_std_slot(board.tx, &standard.slot_cfg));
+    TRY(i2s_channel_reconfig_std_clock(board.tx, &standard.clk_cfg));
+    TRY(i2s_channel_enable(board.tx));
     TRY(verify_format(board.tx, true));
     TRY(verify_format(board.rx, false));
     board.speaker_lock = xSemaphoreCreateMutex();

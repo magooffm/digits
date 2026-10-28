@@ -86,7 +86,7 @@ static jmp_buf done;
 static digits_call_audio_t *active;
 static void (*task_entry[2])(void *);
 static void *task_args[2];
-static unsigned tasks, queues, codecs, mic_reads, tx_sent, speaker_writes;
+static unsigned tasks, queues, codecs, voices, mic_reads, tx_sent, speaker_writes;
 static unsigned creates, stops, peak_tasks;
 static bool mic_owned, speaker_owned, amplifier, mic_busy, speaker_busy;
 static bool fail_codec, fail_task, fail_alloc, inject_loss, inject_stall, partial_write;
@@ -263,24 +263,45 @@ esp_err_t digits_audio_speaker_write(const int16_t *stereo,size_t bytes,size_t *
         digits_call_audio_request_stop(active);
     return ESP_OK;
 }
+// decimate.c and tx_voice.c have their own tests (and ESP-SR): every third
+// sample keeps the ramps below recognizable.
+void decimate_init(decimate_t *state) { assert(state); }
+void decimate_process(decimate_t *state,const int16_t *in,size_t samples,int16_t *out)
+{
+    assert(state && samples == DIGITS_MIC_FRAME_SAMPLES);
+    for (size_t i=0;i<samples/3;++i) out[i] = in[3*i];
+}
+struct tx_voice { int unused; };
+tx_voice_t *tx_voice_create(void)
+{
+    if (fail_codec) return NULL;
+    ++voices;
+    return malloc(sizeof(struct tx_voice));
+}
+void tx_voice_destroy(tx_voice_t *voice) { if (voice) { assert(voices); --voices; free(voice); } }
+void tx_voice_process(tx_voice_t *voice,const int16_t *mic,const int16_t *reference,int16_t *out)
+{
+    assert(voice && mic && reference);
+    for (unsigned i=0;i<TX_VOICE_SAMPLES;++i) out[i] = mic[3*i];
+}
 esp_audio_err_t esp_opus_enc_open(void *cfg,uint32_t size,void **handle)
 {
     esp_opus_enc_config_t *settings = cfg;
-    assert(size == sizeof(*settings) && settings->sample_rate == 48000 && settings->channel == 1);
+    assert(size == sizeof(*settings) && settings->sample_rate == 16000 && settings->channel == 1);
     assert(settings->frame_duration == ESP_OPUS_ENC_FRAME_DURATION_20_MS && settings->complexity == 0);
     if (fail_codec) return ESP_AUDIO_ERR_MEM_LACK;
     *handle = malloc(1); assert(*handle); ++codecs;
     return ESP_AUDIO_ERR_OK;
 }
 esp_audio_err_t esp_opus_enc_get_frame_size(void *handle,int *input,int *output)
-{ assert(handle); *input=1920; *output=80; return ESP_AUDIO_ERR_OK; }
+{ assert(handle); *input=640; *output=80; return ESP_AUDIO_ERR_OK; }
 esp_audio_err_t esp_opus_enc_process(void *handle,esp_audio_enc_in_frame_t *in,esp_audio_enc_out_frame_t *out)
 {
-    assert(handle && in->len == 1920 && out->len == 1275);
+    assert(handle && in->len == 640 && out->len == 1275);
     int16_t *pcm = (int16_t *)in->buffer;
-    assert(copper_expected || (pcm[0] > 0 && pcm[959] == pcm[0] + 959)); // Live captured PCM, not silence.
+    assert(copper_expected || (pcm[0] > 0 && pcm[319] == pcm[0] + 957)); // Live captured PCM, not silence.
     if (pcm[0] == GREETING_SAMPLE) ++filled_encodes; // The room microphone was replaced.
-    else if (pcm[959] != pcm[0] + 959) ++copper_encodes; // Copper filtered the ramp.
+    else if (pcm[319] != pcm[0] + 957) ++copper_encodes; // Copper filtered the ramp.
     else { assert(pcm[0] == (int16_t)mic_reads); ++live_encodes; }
     out->buffer[0] = (uint8_t)mic_reads; out->buffer[1] = 1; out->buffer[2] = 2;
     out->encoded_bytes = 3;
@@ -335,7 +356,7 @@ static digits_call_audio_stats_t finish(void)
     digits_call_audio_get_stats(active,&stats);
     assert(digits_call_audio_destroy(active) == ESP_OK);
     active=NULL;
-    assert(!queues && !codecs && !mic_owned && !speaker_owned && !amplifier);
+    assert(!queues && !codecs && !voices && !mic_owned && !speaker_owned && !amplifier);
     ++stops;
     return stats;
 }

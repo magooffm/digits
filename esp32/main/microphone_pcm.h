@@ -21,6 +21,7 @@ typedef struct {
     microphone_pcm_level_t left;
     microphone_pcm_level_t right;
     microphone_pcm_level_t mono;
+    microphone_pcm_level_t reference;
 } microphone_pcm_stats_t;
 
 // Begin a fresh statistics window. Reset periodically before counters overflow.
@@ -36,6 +37,20 @@ void microphone_pcm_stats_reset(microphone_pcm_stats_t *stats);
 void microphone_pcm_convert(const int16_t *stereo, int16_t *mono,
                             size_t frames, microphone_pcm_slot_t slot,
                             microphone_pcm_stats_t *stats);
+
+// The ES7210 in TDM sends four 16-bit channels per frame, read as two 32-bit
+// little-endian words: [MIC3, MIC1, MIC4, MIC2] in memory. MIC3 carries the
+// speaker signal (the ES8311 output looped back), the echo reference.
+#define MICROPHONE_PCM_TDM_CHANNELS 4
+#define MICROPHONE_PCM_TDM_MIC1 1
+#define MICROPHONE_PCM_TDM_MIC2 3
+#define MICROPHONE_PCM_TDM_REFERENCE 0
+
+// Splits frames of TDM data into [MIC1, MIC2] stereo for
+// microphone_pcm_convert and the mono reference. stereo may be tdm itself
+// (in place); reference must not overlap. With stats, accumulates reference.
+void microphone_pcm_split_tdm(const int16_t *tdm, int16_t *stereo, int16_t *reference,
+                              size_t frames, microphone_pcm_stats_t *stats);
 
 // RMS in signed 16-bit sample units; empty and all-zero windows return zero.
 double microphone_pcm_rms(const microphone_pcm_level_t *level);

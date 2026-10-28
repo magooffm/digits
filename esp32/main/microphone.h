@@ -13,6 +13,9 @@ typedef struct {
     uint32_t flags;
     int64_t captured_at_us; // Read completion time, not a calibrated ADC timestamp.
     int16_t pcm[DIGITS_MIC_FRAME_SAMPLES]; // Signed 16-bit, 48 kHz, mono.
+    // What the speaker played at the same instants (the codec's loopback),
+    // for echo cancellation.
+    int16_t reference[DIGITS_MIC_FRAME_SAMPLES];
 } digits_microphone_frame_t;
 
 // Boot-time initialization after digits_audio_board_init. ADC failure leaves
@@ -25,7 +28,8 @@ esp_err_t digits_microphone_init(void);
 bool digits_microphone_acquire(uint32_t timeout_ms);
 void digits_microphone_release(void);
 
-// Copy the next frame from a four-frame queue. Reservation holder only; 0 = poll.
+// Copy the next frame from a four-frame queue (in PSRAM; frames are 3.9 KB,
+// keep them off small stacks). Reservation holder only; 0 = poll.
 // timeout_ms is bounded to 1000. Oldest frames are dropped when no consumer
 // keeps up. Sequence gaps/flags identify discontinuities for the encoder.
 esp_err_t digits_microphone_read(digits_microphone_frame_t *frame, uint32_t timeout_ms);

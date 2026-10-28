@@ -1,6 +1,8 @@
 #include "call_audio.h"
 #include "audio_board.h"
+#include "decimate.h"
 #include "microphone.h"
+#include "tx_voice.h"
 #include "voice_style.h"
 #include <stdlib.h>
 #include <string.h>
@@ -20,8 +22,9 @@
 // 48/24 KiB, full calls measured 27,136/16,012 bytes never used (README), so
 // about 22/8.5 KiB in use. These sizes keep a third or more spare; the 32 KiB
 // difference let the internal heap fit both stacks again once more features
-// were running (2026-10-27).
-#define ENCODER_WORKER_STACK_BYTES (36U * 1024U)
+// were running (2026-10-27). Opus at 16 kHz with echo cancellation (tx_voice.h)
+// measured 20.7 KiB in use (2026-10-28): 28 KiB keeps the third spare.
+#define ENCODER_WORKER_STACK_BYTES (28U * 1024U)
 #define DECODER_WORKER_STACK_BYTES (16U * 1024U)
 #define FRAME_US (CALL_AUDIO_FRAME_MS * 1000LL)
 #define CAPTURE_MAX_AGE_US 60000LL
@@ -42,6 +45,8 @@ struct digits_call_audio {
     bool copper;                 // Wanted: set by the peer worker.
     voice_style_copper_t filter; // Encoder task only.
     bool copper_active;
+    decimate_t *greeting_down;   // The greeting to 16 kHz for Opus.
+    int16_t *tx_pcm;             // What Opus encodes: TX_VOICE_SAMPLES.
     bool stop_requested, tx_ready, rx_ready, tx_done, rx_done;
     QueueHandle_t tx_packets, rx_packets;
     StaticQueue_t tx_queue_control, rx_queue_control;
@@ -118,18 +123,29 @@ static void encoder_worker(void *argument)
 {
     digits_call_audio_t *audio = argument;
     void *encoder = NULL;
+    tx_voice_t *voice = NULL;
     bool microphone_owned = digits_microphone_acquire(0);
     if (!microphone_owned) {
         failure(audio, ESP_ERR_INVALID_STATE);
         goto finished;
     }
+    // Echo cancellation runs at 16 kHz only; Opus then encodes wideband,
+    // cheaper than 48 kHz. The remote decodes at 48 kHz as before.
+    voice = tx_voice_create();
+    if (!voice) {
+        failure(audio, ESP_ERR_NO_MEM);
+        goto finished;
+    }
     esp_opus_enc_config_t configuration = ESP_OPUS_ENC_CONFIG_DEFAULT();
-    configuration.sample_rate = DIGITS_AUDIO_SAMPLE_RATE;
+    configuration.sample_rate = TX_VOICE_RATE;
     configuration.channel = 1;
     configuration.bits_per_sample = 16;
     configuration.bitrate = 32000;
     configuration.frame_duration = ESP_OPUS_ENC_FRAME_DURATION_20_MS;
-    configuration.application_mode = ESP_OPUS_ENC_APPLICATION_VOIP;
+    // Audio, not VoIP: at 16 kHz the VoIP mode's SILK coder took 8-9 ms per
+    // frame on average, audio mode 4-5 ms (2026-10-28); with echo
+    // cancellation running too, VoIP left the CPU short.
+    configuration.application_mode = ESP_OPUS_ENC_APPLICATION_AUDIO;
     configuration.complexity = 0;
     configuration.enable_dtx = false;
     configuration.enable_fec = false;
@@ -138,15 +154,15 @@ static void encoder_worker(void *argument)
     int input_size = 0, output_size = 0;
     if (error != ESP_AUDIO_ERR_OK ||
         esp_opus_enc_get_frame_size(encoder, &input_size, &output_size) != ESP_AUDIO_ERR_OK ||
-        input_size != (int)sizeof(audio->capture->pcm) || output_size <= 0 ||
+        input_size != (int)(TX_VOICE_SAMPLES * sizeof(int16_t)) || output_size <= 0 ||
         output_size > (int)CALL_AUDIO_OPUS_MAX_BYTES) {
-        ESP_LOGE("call_audio", "Cannot create 48 kHz mono 20 ms Opus encoder (error=%d, input=%d output=%d)",
+        ESP_LOGE("call_audio", "Cannot create 16 kHz mono 20 ms Opus encoder (error=%d, input=%d output=%d)",
                  error, input_size, output_size);
         failure(audio, error == ESP_AUDIO_ERR_MEM_LACK ? ESP_ERR_NO_MEM : ESP_FAIL);
         goto finished;
     }
     unsigned opened_stack_minimum = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI("call_audio", "Opus encoder opened: stack=%u minimum_free=%u bytes; 48000 Hz mono 20 ms 32000 bps",
+    ESP_LOGI("call_audio", "Opus encoder opened: stack=%u minimum_free=%u bytes; 16000 Hz mono 20 ms 32000 bps",
              (unsigned)ENCODER_WORKER_STACK_BYTES, opened_stack_minimum);
     portENTER_CRITICAL(&audio->lock);
     audio->stats.tx_stack_min_bytes = opened_stack_minimum;
@@ -193,20 +209,25 @@ static void encoder_worker(void *argument)
             continue;
         }
         // Capture keeps running for timing; its PCM is replaced, never sent.
+        int64_t voice_at = esp_timer_get_time();
         if (unattended(audio)) {
             audio->hooks.fill(audio->capture->pcm, DIGITS_MIC_FRAME_SAMPLES);
             if (audio->monitor && !greeting_done(audio)) monitor_push(audio, audio->capture->pcm);
-        } else if (__atomic_load_n(&audio->copper, __ATOMIC_RELAXED)) {
-            // Copper Wire: the voice band only, like the Pi. A fresh start each
-            // time it is chosen; the greeting above is never filtered.
-            if (!audio->copper_active) voice_style_copper_reset(&audio->filter);
-            audio->copper_active = true;
-            voice_style_copper_process(&audio->filter, audio->capture->pcm, DIGITS_MIC_FRAME_SAMPLES);
+            decimate_process(audio->greeting_down, audio->capture->pcm, DIGITS_MIC_FRAME_SAMPLES, audio->tx_pcm);
         } else {
-            audio->copper_active = false;
+            tx_voice_process(voice, audio->capture->pcm, audio->capture->reference, audio->tx_pcm);
+            if (__atomic_load_n(&audio->copper, __ATOMIC_RELAXED)) {
+                // Copper Wire: the voice band only, like the Pi. A fresh start
+                // each time it is chosen; the greeting above is never filtered.
+                if (!audio->copper_active) voice_style_copper_reset(&audio->filter);
+                audio->copper_active = true;
+                voice_style_copper_process(&audio->filter, audio->tx_pcm, TX_VOICE_SAMPLES);
+            } else {
+                audio->copper_active = false;
+            }
         }
         esp_audio_enc_in_frame_t input = {
-            .buffer = (uint8_t *)audio->capture->pcm, .len = sizeof(audio->capture->pcm),
+            .buffer = (uint8_t *)audio->tx_pcm, .len = TX_VOICE_SAMPLES * sizeof(int16_t),
         };
         esp_audio_enc_out_frame_t output = {
             .buffer = audio->encoder_packet->data, .len = CALL_AUDIO_OPUS_MAX_BYTES,
@@ -215,6 +236,7 @@ static void encoder_worker(void *argument)
         error = esp_opus_enc_process(encoder, &input, &output);
         int64_t encoded_at = esp_timer_get_time();
         portENTER_CRITICAL(&audio->lock);
+        maximum(&audio->stats.max_voice_us, encode_at - voice_at);
         maximum(&audio->stats.max_encode_us, encoded_at - encode_at);
         if (error != ESP_AUDIO_ERR_OK || !output.encoded_bytes ||
             output.encoded_bytes > CALL_AUDIO_OPUS_MAX_BYTES) ++audio->stats.encode_errors;
@@ -257,6 +279,7 @@ static void encoder_worker(void *argument)
     }
 finished:
     if (encoder) esp_opus_enc_close(encoder);
+    tx_voice_destroy(voice);
     if (microphone_owned) digits_microphone_release();
     unsigned minimum = uxTaskGetStackHighWaterMark(NULL);
     portENTER_CRITICAL(&audio->lock);
@@ -516,7 +539,7 @@ esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
     if (!audio) return ESP_ERR_NO_MEM;
     audio->lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     audio->mode = mode;
-    voice_style_copper_init(&audio->filter, DIGITS_AUDIO_SAMPLE_RATE);
+    voice_style_copper_init(&audio->filter, TX_VOICE_RATE);
     if (hooks) {
         audio->hooks = *hooks;
         audio->unattended = true; // Before any worker exists.
@@ -531,7 +554,11 @@ esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
         audio->tx_queue_storage = audio_calloc(TX_QUEUE_LENGTH * sizeof(call_audio_packet_t));
         audio->capture = audio_calloc(sizeof(*audio->capture));
         audio->encoder_packet = audio_calloc(sizeof(*audio->encoder_packet));
-        if (!audio->tx_queue_storage || !audio->capture || !audio->encoder_packet) goto no_memory;
+        audio->greeting_down = audio_calloc(sizeof(*audio->greeting_down));
+        audio->tx_pcm = audio_calloc(TX_VOICE_SAMPLES * sizeof(int16_t));
+        if (!audio->tx_queue_storage || !audio->capture || !audio->encoder_packet ||
+            !audio->greeting_down || !audio->tx_pcm) goto no_memory;
+        decimate_init(audio->greeting_down);
         audio->tx_packets = xQueueCreateStatic(TX_QUEUE_LENGTH, sizeof(call_audio_packet_t),
                                               audio->tx_queue_storage, &audio->tx_queue_control);
         if (!audio->tx_packets) goto no_memory;
@@ -698,6 +725,8 @@ esp_err_t digits_call_audio_destroy(digits_call_audio_t *audio)
     free(audio->rx_queue_storage);
     free(audio->capture);
     free(audio->encoder_packet);
+    free(audio->greeting_down);
+    free(audio->tx_pcm);
     free(audio->receive_packet);
     free(audio->playback_packet);
     free(audio->jitter);

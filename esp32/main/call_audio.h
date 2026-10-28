@@ -24,7 +24,7 @@ typedef struct {
     uint32_t capture_timeouts;
     uint32_t encoded_frames, encode_errors, tx_queue_drops, tx_pop_drops;
     uint32_t sent_frames, send_errors, send_blocked;
-    uint32_t max_encode_us, max_capture_age_us, max_send_age_us;
+    uint32_t max_encode_us, max_voice_us, max_capture_age_us, max_send_age_us;
     uint32_t received_frames, rx_invalid, rx_queue_drops;
     uint32_t rx_late, rx_duplicate, rx_missing, rx_discontinuities, rx_local_skips;
     uint32_t rx_jitter_overruns, rx_queue_stale;

@@ -4,6 +4,7 @@
 #ifdef CONFIG_DIGITS_WEBRTC_CONSOLE
 #include "webrtc.h"
 #include "phone.h"
+#include "tx_voice.h"
 #include "voicemail.h"
 #include "wifi.h"
 #include <stdbool.h>
@@ -73,6 +74,15 @@ esp_err_t digits_webrtc_console_start(void)
     };
     err = esp_console_cmd_register(&voicemail);
     if (err != ESP_OK) return err;
+    const esp_console_cmd_t voice = {
+        .command = "voice",
+        .help = "Outgoing voice: status; aec on|off switches echo cancellation until restart (for "
+                "comparison, also mid-call); gain DB saves the microphone gain (0-30 dB).",
+        .hint = "status | aec on|off | gain DB",
+        .func = tx_voice_console,
+    };
+    err = esp_console_cmd_register(&voice);
+    if (err != ESP_OK) return err;
     const esp_console_cmd_t wifi = {
         .command = "wifi",
         .help = "Wi-Fi and server: status, set SSID [PASSWORD] and server URL (save and restart; quote "
@@ -100,6 +110,7 @@ esp_err_t digits_webrtc_console_start(void)
         (void)esp_console_cmd_deregister("phone");
 #endif
         (void)esp_console_cmd_deregister("vm");
+        (void)esp_console_cmd_deregister("voice");
         (void)esp_console_cmd_deregister("wifi");
         return err;
     }

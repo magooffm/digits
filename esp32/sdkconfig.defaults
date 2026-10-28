@@ -12,14 +12,17 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # retaining internal memory for task stacks, DMA, Wi-Fi and DTLS allocations.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_40M=y
+# 80 MHz PSRAM and quad flash: echo cancellation (tx_voice.c) and Opus ran
+# about twice as fast as with 40 MHz and dual flash, and only then kept up.
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 CONFIG_SPIRAM_IGNORE_NOTFOUND=y
 
-# DTLS handshakes are computation-heavy; retain the board's conservative
-# PSRAM clock while using its supported 240 MHz CPU setting.
+# DTLS handshakes and echo cancellation are computation-heavy: the board's
+# supported 240 MHz CPU setting.
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
 CONFIG_MBEDTLS_SSL_DTLS_SRTP=y

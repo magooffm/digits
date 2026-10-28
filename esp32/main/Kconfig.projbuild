@@ -284,6 +284,21 @@ menu "Digits development configuration"
             help
                 Prefer multiples of 3 dB (the ADC gain step). 24 dB is a
                 conservative starting point. Reduce if clipping is reported.
+        config DIGITS_MIC_REFERENCE_GAIN_DB
+            int "ES7210 speaker reference (MIC3) gain (dB)"
+            range 0 36
+            default 24
+            help
+                MIC3 carries the speaker signal looped back from the ES8311 for
+                echo cancellation. At 24 dB a ringtone measured about RMS 80;
+                lower it if the diagnostic reports reference clipping.
+        config DIGITS_VOICE_GAIN_DB
+            int "Outgoing voice: microphone gain until one is saved (dB)"
+            range 0 30
+            default 18
+            help
+                Digital gain after echo cancellation, with a limiter. The
+                status page and the console (voice gain DB) save another value.
         choice DIGITS_MIC_MONO_SLOT
             prompt "Microphone channel for mono PCM"
             default DIGITS_MIC_MONO_LEFT

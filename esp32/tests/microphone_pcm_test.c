@@ -177,13 +177,36 @@ static void test_chunk_continuity(void)
     }
 }
 
+// TDM frames [MIC3, MIC1, MIC4, MIC2] split in place into [MIC1, MIC2]
+// stereo plus the MIC3 echo reference; MIC4 is dropped.
+static void test_tdm_split(void)
+{
+    int16_t tdm[4 * 3] = {
+        100, 1, 9999, -1,
+        INT16_MIN, 2, 9999, -2,
+        INT16_MAX, 3, 9999, -3,
+    };
+    const int16_t stereo[] = {1, -1, 2, -2, 3, -3};
+    const int16_t reference[] = {100, INT16_MIN, INT16_MAX};
+    int16_t echo[3];
+    microphone_pcm_stats_t stats;
+    microphone_pcm_stats_reset(&stats);
+    microphone_pcm_split_tdm(tdm, tdm, echo, 3, &stats);
+    assert(memcmp(tdm, stereo, sizeof(stereo)) == 0);
+    assert(memcmp(echo, reference, sizeof(reference)) == 0);
+    assert(stats.reference.sample_count == 3 && stats.reference.peak == 32768);
+    assert(stats.reference.clipped_count == 2 && stats.left.sample_count == 0);
+    microphone_pcm_split_tdm(tdm, tdm, echo, 0, NULL);
+}
+
 int main(void)
 {
     test_slots_and_extremes();
     test_clipping_threshold();
     test_energy_and_dbfs();
     test_chunk_continuity();
+    test_tdm_split();
     puts("PASS: microphone slot selection, signed extremes, averaging, "
-         "statistics, clipping, dBFS and chunk continuity");
+         "statistics, clipping, dBFS, chunk continuity and TDM split");
     return 0;
 }

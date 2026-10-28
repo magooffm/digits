@@ -9,6 +9,7 @@
 #include "line_settings.h"
 #include "audio_board.h"
 #include "microphone.h"
+#include "tx_voice.h"
 #include "phone.h"
 #include "record_playback_test.h"
 #include "signaling.h"
@@ -57,6 +58,7 @@ void app_main(void)
         err = digits_call_tones_init();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Call-progress tones unavailable: %s; calls still work", esp_err_to_name(err));
+        tx_voice_init();
         err = digits_microphone_init();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Microphone initialization failed: %s; speaker and signaling continue", esp_err_to_name(err));

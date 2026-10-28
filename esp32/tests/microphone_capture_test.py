@@ -67,7 +67,7 @@ static int xQueueReset(QueueHandle_t);
 '''
 
 suffix = r'''
-#define RAW_BYTES (DIGITS_MIC_FRAME_SAMPLES * 2 * sizeof(int16_t))
+#define RAW_BYTES (DIGITS_MIC_FRAME_SAMPLES * MICROPHONE_PCM_TDM_CHANNELS * sizeof(int16_t))
 static struct {
     size_t bytes;
     esp_err_t error;
@@ -75,7 +75,9 @@ static struct {
 } reads[96];
 static int read_count, next_read;
 static size_t source_byte;
-static int16_t input[96 * DIGITS_MIC_FRAME_SAMPLES * 2];
+static int16_t input[96 * DIGITS_MIC_FRAME_SAMPLES * MICROPHONE_PCM_TDM_CHANNELS];
+static int16_t tdm_buffer[DIGITS_MIC_FRAME_SAMPLES * MICROPHONE_PCM_TDM_CHANNELS];
+static digits_microphone_frame_t current_frame, spare_frame;
 static digits_microphone_frame_t queue[FRAME_QUEUE_LENGTH];
 static size_t queue_head, queue_count, maximum_queue_count;
 static unsigned reports_written;
@@ -162,13 +164,13 @@ static esp_err_t i2s_channel_read(i2s_chan_handle_t rx, void *data,
         assert(mic.control_result == (success ? ESP_OK : ESP_FAIL));
         if (success) {
             assert(mic.paused && codec_muted && !queue_count);
-            sequence_at_pause = mic.frame.sequence;
+            sequence_at_pause = mic.frame->sequence;
         } else assert(!mic.paused && queue_count);
     }
     if (mute_result == ESP_CODEC_DEV_OK && mute_read_error == ESP_CODEC_DEV_OK &&
         next_read > pause_at && next_read <= resume_at) {
         assert(mic.paused && codec_muted && !queue_count);
-        assert(mic.frame.sequence == sequence_at_pause);
+        assert(mic.frame->sequence == sequence_at_pause);
     }
     if (next_read == resume_at) {
         mic.requested_pause = false;
@@ -180,7 +182,7 @@ static esp_err_t i2s_channel_read(i2s_chan_handle_t rx, void *data,
     }
     assert(reads[next_read].bytes <= capacity);
     if (reads[next_read].lost_frames) {
-        source_byte += reads[next_read].lost_frames * 2 * sizeof(int16_t);
+        source_byte += reads[next_read].lost_frames * MICROPHONE_PCM_TDM_CHANNELS * sizeof(int16_t);
         receive_overflow(rx, NULL, NULL);
     }
     *bytes = reads[next_read].bytes;
@@ -245,6 +247,10 @@ static void add_read(size_t bytes, esp_err_t error, unsigned lost_frames)
 static void reset(bool diagnostic)
 {
     memset(&mic, 0, sizeof(mic));
+    memset(&current_frame, 0, sizeof(current_frame));
+    mic.tdm = tdm_buffer;
+    mic.frame = &current_frame;
+    mic.spare = &spare_frame;
     mic.frames = (void *)1;
     mic.reports = (void *)2;
     mic.codec = &fake_codec;
@@ -264,10 +270,13 @@ static void reset(bool diagnostic)
     semaphore_available = true;
     memset(report_history, 0, sizeof(report_history));
     memset(&last_report, 0, sizeof(last_report));
-    // Slot signs differ; reordering a sample or swapping slots is observable.
-    for (size_t i = 0; i < sizeof(input) / (2 * sizeof(*input)); ++i) {
-        input[2 * i] = (int16_t)(i + 1);
-        input[2 * i + 1] = (int16_t)-(int)(i + 1);
+    // Slot values differ; reordering a sample or swapping slots is observable.
+    for (size_t i = 0; i < sizeof(input) / (MICROPHONE_PCM_TDM_CHANNELS * sizeof(*input)); ++i) {
+        int16_t *slots = input + MICROPHONE_PCM_TDM_CHANNELS * i;
+        slots[MICROPHONE_PCM_TDM_MIC1] = (int16_t)(i + 1);
+        slots[MICROPHONE_PCM_TDM_MIC2] = (int16_t)-(int)(i + 1);
+        slots[MICROPHONE_PCM_TDM_REFERENCE] = (int16_t)(2 * (i + 1));
+        slots[2] = 0x5a5a; // MIC4, unused.
     }
     for (unsigned i = 0; i < WARMUP_FRAMES; ++i) add_read(RAW_BYTES, ESP_OK, 0);
 }
@@ -284,8 +293,10 @@ static void assert_frame(const digits_microphone_frame_t *frame, unsigned sequen
     assert(frame->sequence == sequence);
     assert(frame->flags == (discontinuous ? DIGITS_MIC_FRAME_DISCONTINUITY : 0));
     assert(frame->captured_at_us > 0);
-    for (size_t i = 0; i < DIGITS_MIC_FRAME_SAMPLES; ++i)
+    for (size_t i = 0; i < DIGITS_MIC_FRAME_SAMPLES; ++i) {
         assert(frame->pcm[i] == (int16_t)(first_sample + i));
+        assert(frame->reference[i] == (int16_t)(2 * (first_sample + i)));
+    }
 }
 
 int main(void)
@@ -327,7 +338,7 @@ int main(void)
     reset(false);
     add_read(1, ESP_ERR_TIMEOUT, 0);
     add_read(2, ESP_ERR_TIMEOUT, DIGITS_AUDIO_DMA_FRAMES);
-    add_read(1, ESP_OK, 0);
+    add_read(5, ESP_OK, 0); // The rest of the damaged 8-byte TDM frame.
     add_read(RAW_BYTES, ESP_OK, 0);
     add_read(RAW_BYTES, ESP_OK, 0);
     run();
@@ -350,7 +361,7 @@ int main(void)
                      first_after_warmup + (sequence - 1) * DIGITS_MIC_FRAME_SAMPLES,
                      sequence > FRAME_QUEUE_LENGTH);
     }
-    assert(!queue_count && mic.frame.sequence == FRAME_QUEUE_LENGTH + 2);
+    assert(!queue_count && mic.frame->sequence == FRAME_QUEUE_LENGTH + 2);
     assert(reports_written > 0 && !last_report.diagnostic);
     assert(!mic.levels.left.sample_count && !mic.levels.right.sample_count &&
            !mic.levels.mono.sample_count && !last_report.levels.mono.sample_count);
@@ -390,7 +401,7 @@ int main(void)
     pause_at = WARMUP_FRAMES;
     resume_at = pause_at + 3;
     add_read(1, ESP_ERR_TIMEOUT, 0);
-    add_read(3, ESP_OK, 0);
+    add_read(7, ESP_OK, 0);
     for (int i = pause_at + 2; i < resume_at + 1 + WARMUP_FRAMES + 2; ++i)
         add_read(RAW_BYTES, ESP_OK, 0);
     run();

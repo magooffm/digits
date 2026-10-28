@@ -163,9 +163,9 @@ static void report_call_audio(digits_call_audio_t *audio)
     ESP_LOGI(TAG, "Call audio state=%u error=%s capture=%" PRIu32 " gaps=%" PRIu32 " discontinuities=%" PRIu32 " stale=%" PRIu32 " timeouts=%" PRIu32 " encoded=%" PRIu32 " encode_errors=%" PRIu32,
              (unsigned)s.state, esp_err_to_name(s.error), s.capture_frames, s.capture_gaps,
              s.capture_discontinuities, s.capture_stale, s.capture_timeouts, s.encoded_frames, s.encode_errors);
-    ESP_LOGI(TAG, "Audio TX sent=%" PRIu32 " queue_drops=%" PRIu32 " pop_drops=%" PRIu32 " blocked=%" PRIu32 " errors=%" PRIu32 " max_encode_us=%" PRIu32 " max_capture_age_us=%" PRIu32 " max_send_age_us=%" PRIu32 " stack_min=%" PRIu32,
+    ESP_LOGI(TAG, "Audio TX sent=%" PRIu32 " queue_drops=%" PRIu32 " pop_drops=%" PRIu32 " blocked=%" PRIu32 " errors=%" PRIu32 " max_voice_us=%" PRIu32 " max_encode_us=%" PRIu32 " max_capture_age_us=%" PRIu32 " max_send_age_us=%" PRIu32 " stack_min=%" PRIu32,
              s.sent_frames, s.tx_queue_drops, s.tx_pop_drops, s.send_blocked, s.send_errors,
-             s.max_encode_us, s.max_capture_age_us, s.max_send_age_us, s.tx_stack_min_bytes);
+             s.max_voice_us, s.max_encode_us, s.max_capture_age_us, s.max_send_age_us, s.tx_stack_min_bytes);
     ESP_LOGI(TAG, "Audio RX received=%" PRIu32 " queue_drops=%" PRIu32 " queue_stale=%" PRIu32 " jitter_overruns=%" PRIu32 " late=%" PRIu32 " duplicate=%" PRIu32 " missing_pts=%" PRIu32 " rebases=%" PRIu32 " local_skips=%" PRIu32,
              s.received_frames, s.rx_queue_drops, s.rx_queue_stale, s.rx_jitter_overruns,
              s.rx_late, s.rx_duplicate, s.rx_missing,

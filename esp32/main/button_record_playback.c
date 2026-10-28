@@ -46,7 +46,7 @@ static esp_err_t run_button_recording(const digits_record_button_state_t *press)
     esp_err_t err = ESP_OK;
     size_t frames = 0;
     uint32_t sequence = 0;
-    digits_microphone_frame_t frame;
+    static digits_microphone_frame_t frame; // One worker; too big for its stack.
     digits_record_button_state_t button;
     // Only record whole frames acquired after the speaker reservation. Older
     // queued frames may contain a Ring Test that ended while KEY1 debounced.
