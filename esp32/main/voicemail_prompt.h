@@ -27,19 +27,23 @@ typedef enum {
 
 typedef struct {
     const uint8_t *builtin; // 16-bit little-endian mono PCM, any alignment.
-    size_t builtin_frames;
+    size_t builtin_frames;  // At 48 kHz, after upsampling.
+    size_t builtin_samples; // As stored.
+    uint32_t builtin_step;  // 48 kHz frames per stored sample (1, 2, 3 or 6).
     vm_prompt_reader_fn custom;
     vm_prompt_phase_t phase;
     uint32_t position; // Within the phase.
     int16_t beep[48];  // One 1 kHz period.
 } vm_prompt_t;
 
-// custom may be NULL. Without either greeting the beep comes first.
-void vm_prompt_start(vm_prompt_t *prompt, const uint8_t *builtin, size_t builtin_frames,
+// builtin: a greeting in memory with samples at rate (dividing 48000; it is
+// upsampled by linear interpolation), or NULL. custom may be NULL. Without
+// either greeting the beep comes first.
+void vm_prompt_start(vm_prompt_t *prompt, const uint8_t *builtin, size_t samples, uint32_t rate,
                      vm_prompt_reader_fn custom);
 
 // Fills frames of 48 kHz mono. True once the beep has ended: recording may start.
 bool vm_prompt_render(vm_prompt_t *prompt, int16_t *mono, size_t frames);
 
-// Finds 48 kHz mono 16-bit PCM in a WAV file.
-bool vm_prompt_wav(const uint8_t *wav, size_t size, const uint8_t **pcm, size_t *frames);
+// Finds mono 16-bit PCM in a WAV file at 8, 16, 24 or 48 kHz.
+bool vm_prompt_wav(const uint8_t *wav, size_t size, const uint8_t **pcm, size_t *samples, uint32_t *rate);

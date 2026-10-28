@@ -27,6 +27,7 @@
 #define WRITE_TIMEOUT_MS 30
 #define DMA_WINDOW_US (2LL * DIGITS_AUDIO_DMA_FRAMES * 1000000 / DIGITS_AUDIO_SAMPLE_RATE)
 #define PLAYBACK_FEED_AHEAD_US 10000LL
+#define MONITOR_FRAMES 6 // Greeting frames on their way from the encoder to the speaker.
 
 struct digits_call_audio {
     portMUX_TYPE lock;
@@ -34,6 +35,9 @@ struct digits_call_audio {
     digits_call_audio_mode_t mode;
     digits_call_audio_unattended_t hooks;
     bool unattended;
+    // Greeting for the speaker: the encoder writes, the playback worker reads.
+    int16_t *monitor;
+    uint32_t monitor_head, monitor_tail;
     bool stop_requested, tx_ready, rx_ready, tx_done, rx_done;
     QueueHandle_t tx_packets, rx_packets;
     StaticQueue_t tx_queue_control, rx_queue_control;
@@ -65,6 +69,31 @@ static bool unattended(digits_call_audio_t *audio)
     bool value = audio->unattended;
     portEXIT_CRITICAL(&audio->lock);
     return value;
+}
+
+static bool greeting_done(digits_call_audio_t *audio)
+{
+    return !audio->hooks.greeting_done || audio->hooks.greeting_done();
+}
+
+// Single producer (encoder), single consumer (playback): no lock needed.
+static void monitor_push(digits_call_audio_t *audio, const int16_t *mono)
+{
+    uint32_t head = __atomic_load_n(&audio->monitor_head, __ATOMIC_RELAXED);
+    if (head - __atomic_load_n(&audio->monitor_tail, __ATOMIC_ACQUIRE) >= MONITOR_FRAMES) return; // Full: drop.
+    memcpy(audio->monitor + (head % MONITOR_FRAMES) * DIGITS_MIC_FRAME_SAMPLES, mono,
+           DIGITS_MIC_FRAME_SAMPLES * sizeof(int16_t));
+    __atomic_store_n(&audio->monitor_head, head + 1, __ATOMIC_RELEASE);
+}
+
+static bool monitor_pop(digits_call_audio_t *audio, int16_t *mono)
+{
+    uint32_t tail = __atomic_load_n(&audio->monitor_tail, __ATOMIC_RELAXED);
+    if (tail == __atomic_load_n(&audio->monitor_head, __ATOMIC_ACQUIRE)) return false;
+    memcpy(mono, audio->monitor + (tail % MONITOR_FRAMES) * DIGITS_MIC_FRAME_SAMPLES,
+           DIGITS_MIC_FRAME_SAMPLES * sizeof(int16_t));
+    __atomic_store_n(&audio->monitor_tail, tail + 1, __ATOMIC_RELEASE);
+    return true;
 }
 
 static void failure(digits_call_audio_t *audio, esp_err_t error)
@@ -160,7 +189,10 @@ static void encoder_worker(void *argument)
             continue;
         }
         // Capture keeps running for timing; its PCM is replaced, never sent.
-        if (unattended(audio)) audio->hooks.fill(audio->capture->pcm, DIGITS_MIC_FRAME_SAMPLES);
+        if (unattended(audio)) {
+            audio->hooks.fill(audio->capture->pcm, DIGITS_MIC_FRAME_SAMPLES);
+            if (audio->monitor && !greeting_done(audio)) monitor_push(audio, audio->capture->pcm);
+        }
         esp_audio_enc_in_frame_t input = {
             .buffer = (uint8_t *)audio->capture->pcm, .len = sizeof(audio->capture->pcm),
         };
@@ -282,6 +314,25 @@ static bool decode_frame(digits_call_audio_t *audio, void *decoder,
     return valid;
 }
 
+// One 20 ms mono frame of the greeting to the speaker. False on a write error.
+static bool play_monitor_frame(digits_call_audio_t *audio, bool *amplifier_enabled)
+{
+    call_audio_pcm_stereo(audio->mono, audio->stereo, DIGITS_MIC_FRAME_SAMPLES);
+    if (!*amplifier_enabled) {
+        if (digits_audio_speaker_start() != ESP_OK) return false;
+        *amplifier_enabled = true;
+    }
+    for (unsigned block = 0; block < 2 && !stopping(audio); ++block) {
+        size_t written = 0;
+        if (digits_audio_speaker_write(audio->stereo + block * DIGITS_AUDIO_DMA_FRAMES * 2,
+                                       DIGITS_AUDIO_DMA_FRAMES * 2 * sizeof(int16_t), &written,
+                                       WRITE_TIMEOUT_MS) != ESP_OK ||
+            written != DIGITS_AUDIO_DMA_FRAMES * 2 * sizeof(int16_t))
+            return false;
+    }
+    return true;
+}
+
 static void playback_worker(void *argument)
 {
     digits_call_audio_t *audio = argument;
@@ -313,6 +364,28 @@ static void playback_worker(void *argument)
     int64_t previous_write_at = 0;
     int64_t stack_report_at = 0;
     while (!stopping(audio)) {
+        // Answering machine: the greeting, then the caller, or silence.
+        if (unattended(audio)) {
+            bool greeting = !greeting_done(audio);
+            if (greeting && audio->monitor) {
+                if (!monitor_pop(audio, audio->mono)) {
+                    vTaskDelay(1);
+                } else if (!play_monitor_frame(audio, &amplifier_enabled)) {
+                    digits_audio_speaker_silence();
+                    amplifier_enabled = false;
+                }
+                continue;
+            }
+            if (greeting || !audio->hooks.hear_caller) {
+                if (amplifier_enabled) {
+                    digits_audio_speaker_silence();
+                    amplifier_enabled = false;
+                }
+                vTaskDelay(1);
+                continue;
+            }
+            // After the greeting the caller plays like a normal call.
+        }
         for (unsigned i = 0; i < RX_QUEUE_LENGTH; ++i) {
             if (xQueueReceive(audio->rx_packets, audio->receive_packet, 0) != pdTRUE) break;
             int64_t received_at = esp_timer_get_time();
@@ -434,6 +507,10 @@ esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
     if (hooks) {
         audio->hooks = *hooks;
         audio->unattended = true; // Before any worker exists.
+        if (hooks->hear_greeting && (mode & DIGITS_CALL_AUDIO_RX)) {
+            audio->monitor = audio_calloc(MONITOR_FRAMES * DIGITS_MIC_FRAME_SAMPLES * sizeof(int16_t));
+            if (!audio->monitor) goto no_memory;
+        }
     }
     audio->tx_ready = audio->tx_done = !(mode & DIGITS_CALL_AUDIO_TX);
     audio->rx_ready = audio->rx_done = !(mode & DIGITS_CALL_AUDIO_RX);
@@ -547,10 +624,13 @@ bool digits_call_audio_receive(digits_call_audio_t *audio, uint32_t pts_ms,
     }
     if (unattended(audio)) {
         audio->hooks.record(data, size);
-        portENTER_CRITICAL(&audio->lock);
-        ++audio->stats.received_frames;
-        portEXIT_CRITICAL(&audio->lock);
-        return true;
+        if (!audio->hooks.hear_caller || !greeting_done(audio)) {
+            portENTER_CRITICAL(&audio->lock);
+            ++audio->stats.received_frames;
+            portEXIT_CRITICAL(&audio->lock);
+            return true;
+        }
+        // Also to the speaker, below.
     }
     // Callback stack holds one bounded packet; no allocator or wait here.
     call_audio_packet_t packet = {
@@ -605,6 +685,7 @@ esp_err_t digits_call_audio_destroy(digits_call_audio_t *audio)
     free(audio->jitter);
     free(audio->mono);
     free(audio->stereo);
+    free(audio->monitor);
     free(audio);
     return ESP_OK;
 }

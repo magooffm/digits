@@ -7,6 +7,7 @@
 #include "sd_ringtone_util.h"
 #include "status.h"
 #include "voicemail.h"
+#include "greeting_record.h"
 #include "webrtc.h"
 #include "wifi_setup_form.h"
 #include <stdarg.h>
@@ -238,9 +239,18 @@ static esp_err_t config_get(httpd_req_t *req)
                     name, (unsigned)(ringtones_melody_frames(id) / RINGTONE_SAMPLE_RATE));
         first = false;
     }
-    at = append(out, at, CONFIG_JSON_BYTES, "],\"card\":\"%s\",\"greeting\":{\"custom\":%s,\"seconds\":%u}}",
-                digits_sd_ringtones_status(), digits_sd_greeting_frames() ? "true" : "false",
-                (unsigned)(digits_sd_greeting_frames() / RINGTONE_SAMPLE_RATE));
+    static const char *const states[] = {"idle", "starting", "recording", "ready", "failed"};
+    digits_greeting_record_status_t rec = digits_greeting_record_status();
+    bool hear_greeting, hear_caller;
+    digits_voicemail_listen(&hear_greeting, &hear_caller);
+    at = append(out, at, CONFIG_JSON_BYTES, "],\"listen\":{\"greeting\":%s,\"caller\":%s",
+                hear_greeting ? "true" : "false", hear_caller ? "true" : "false");
+    at = append(out, at, CONFIG_JSON_BYTES,
+                "},\"card\":\"%s\",\"greeting\":{\"kind\":\"%s\",\"seconds\":%u,"
+                "\"recording\":{\"state\":\"%s\",\"seconds\":%u.%u,\"message\":\"%s\"}}}",
+                digits_sd_ringtones_status(), digits_voicemail_greeting_kind(), digits_voicemail_greeting_seconds(),
+                states[rec.state], (unsigned)rec.tenths / 10, (unsigned)rec.tenths % 10,
+                rec.message ? rec.message : "");
     esp_err_t err = at < CONFIG_JSON_BYTES ? (httpd_resp_set_type(req, "application/json"),
                                               httpd_resp_send(req, out, (ssize_t)at))
                                            : reply(req, "500 Internal Server Error", "Too much to list");
@@ -447,12 +457,43 @@ static esp_err_t message_post(httpd_req_t *req)
     return done(req, ESP_ERR_INVALID_ARG, "");
 }
 
+typedef struct { bool greeting, caller; } listen_change_t;
+
+static esp_err_t apply_listen(const void *arg)
+{
+    const listen_change_t *c = arg;
+    return digits_voicemail_set_listen(c->greeting, c->caller);
+}
+
+static esp_err_t listen_post(httpd_req_t *req)
+{
+    esp_err_t result;
+    if (!may_write(req, &result)) return result;
+    char body[FORM_BYTES];
+    int size = read_form(req, body, sizeof(body));
+    unsigned long greeting, caller;
+    if (size < 0 || !form_number(body, (size_t)size, "greeting", &greeting) ||
+        !form_number(body, (size_t)size, "caller", &caller))
+        return done(req, ESP_ERR_INVALID_ARG, "");
+    listen_change_t change = {.greeting = greeting != 0, .caller = caller != 0};
+    return done(req, run_internal(apply_listen, &change), "Saved");
+}
+
 // ---- Greeting -------------------------------------------------------------
 
 static esp_err_t greeting_get(httpd_req_t *req)
 {
     if (!may_read(req)) return digits_status_challenge(req);
+    if (!strcmp(digits_voicemail_greeting_kind(), "recorded"))
+        return send_file(req, DIGITS_VOICEMAIL_GREETING_WAV, "audio/wav");
     return send_file(req, DIGITS_SD_GREETING_PATH, "audio/mpeg");
+}
+
+// The recording waiting for keep or discard.
+static esp_err_t greeting_new_get(httpd_req_t *req)
+{
+    if (!may_read(req)) return digits_status_challenge(req);
+    return send_file(req, DIGITS_GREETING_NEW_PATH, "audio/wav");
 }
 
 static esp_err_t greeting_post(httpd_req_t *req)
@@ -474,6 +515,9 @@ static esp_err_t greeting_post(httpd_req_t *req)
     if (err == ESP_ERR_INVALID_RESPONSE) {
         unlink(DIGITS_SD_GREETING_PATH);
         digits_sd_greeting_reload();
+    } else {
+        unlink(DIGITS_VOICEMAIL_GREETING_WAV); // One greeting: the upload replaces a recording.
+        digits_voicemail_greeting_reload();
     }
     return done(req, err, "Greeting uploaded");
 }
@@ -487,10 +531,22 @@ static esp_err_t greeting_action_post(httpd_req_t *req)
     if (size < 0 || !wifi_setup_field(body, (size_t)size, "action", action, sizeof(action)))
         return done(req, ESP_ERR_INVALID_ARG, "");
     if (!strcmp(action, "play")) return done(req, digits_voicemail_play_greeting(), "Playing on the phone");
+    if (!strcmp(action, "record")) return done(req, digits_greeting_record_start(), "Recording after the beep");
+    if (!strcmp(action, "stop")) {
+        digits_greeting_record_stop();
+        return reply(req, "200 OK", "Stopped");
+    }
+    if (!strcmp(action, "keep")) return done(req, digits_greeting_record_keep(), "This is the greeting now");
+    if (!strcmp(action, "discard")) {
+        digits_greeting_record_discard();
+        return reply(req, "200 OK", "Discarded");
+    }
     if (!strcmp(action, "delete")) {
         if (!line_idle()) return done(req, ESP_ERR_INVALID_STATE, "");
         unlink(DIGITS_SD_GREETING_PATH);
-        return done(req, digits_sd_greeting_reload(), "The built-in greeting is back");
+        unlink(DIGITS_VOICEMAIL_GREETING_WAV);
+        digits_sd_greeting_reload();
+        return done(req, digits_voicemail_greeting_reload(), "The built-in greeting is back");
     }
     return done(req, ESP_ERR_INVALID_ARG, "");
 }
@@ -521,6 +577,8 @@ void digits_web_config_register(httpd_handle_t server)
         {.uri = "/api/greeting", .method = HTTP_GET, .handler = greeting_get},
         {.uri = "/api/greeting", .method = HTTP_POST, .handler = greeting_post},
         {.uri = "/api/greeting-action", .method = HTTP_POST, .handler = greeting_action_post},
+        {.uri = "/api/greeting-new", .method = HTTP_GET, .handler = greeting_new_get},
+        {.uri = "/api/listen", .method = HTTP_POST, .handler = listen_post},
     };
     for (unsigned i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i)
         httpd_register_uri_handler(server, &handlers[i]);

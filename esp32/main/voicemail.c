@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "esp_opus_dec.h"
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
@@ -61,6 +62,67 @@ static bool ready;
 
 static const uint8_t *builtin_pcm;
 static size_t builtin_frames;
+static uint32_t builtin_rate;
+
+// A greeting recorded on the phone (voicemail/greeting.wav), kept in PSRAM.
+// Swapped only while no call or playback uses it (callers check the line).
+static uint8_t *recorded_wav;
+static const uint8_t *recorded_pcm;
+static size_t recorded_samples;
+static uint32_t recorded_rate;
+#define MAX_RECORDED_BYTES (4 * 1024 * 1024)
+
+// Recorded greeting first, then an uploaded MP3, then the built-in one.
+static void start_greeting(vm_prompt_t *p)
+{
+    if (recorded_pcm) vm_prompt_start(p, recorded_pcm, recorded_samples, recorded_rate, NULL);
+    else vm_prompt_start(p, builtin_pcm, builtin_frames, builtin_rate,
+                         digits_sd_greeting_frames() ? digits_sd_greeting_read : NULL);
+}
+
+const char *digits_voicemail_greeting_kind(void)
+{
+    return recorded_pcm ? "recorded" : digits_sd_greeting_frames() ? "uploaded" : "built-in";
+}
+
+unsigned digits_voicemail_greeting_seconds(void)
+{
+    if (recorded_pcm) return (unsigned)(recorded_samples / recorded_rate);
+    if (digits_sd_greeting_frames()) return (unsigned)(digits_sd_greeting_frames() / VM_PROMPT_RATE);
+    return (unsigned)(builtin_frames / (builtin_rate ? builtin_rate : VM_PROMPT_RATE));
+}
+
+esp_err_t digits_voicemail_greeting_reload(void)
+{
+    digits_voicemail_stop();
+    uint8_t *old = recorded_wav;
+    recorded_wav = NULL;
+    recorded_pcm = NULL;
+    recorded_samples = 0;
+    free(old);
+    struct stat info;
+    if (stat(DIGITS_VOICEMAIL_GREETING_WAV, &info)) return ESP_OK; // None: the next choice plays.
+    if (info.st_size <= 44 || info.st_size > MAX_RECORDED_BYTES) return ESP_ERR_INVALID_SIZE;
+    uint8_t *wav = heap_caps_malloc((size_t)info.st_size, PSRAM);
+    FILE *file = wav ? fopen(DIGITS_VOICEMAIL_GREETING_WAV, "rb") : NULL;
+    bool read = file && fread(wav, 1, (size_t)info.st_size, file) == (size_t)info.st_size;
+    if (file) fclose(file);
+    const uint8_t *pcm;
+    size_t samples;
+    uint32_t rate;
+    if (!read || !vm_prompt_wav(wav, (size_t)info.st_size, &pcm, &samples, &rate) || !samples) {
+        free(wav);
+        ESP_LOGE(TAG, "voicemail/greeting.wav is not a usable recording");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    recorded_samples = samples;
+    recorded_rate = rate;
+    recorded_pcm = pcm;
+    recorded_wav = wav;
+    ESP_LOGI(TAG, "Recorded greeting: %u.%u s at %u Hz", (unsigned)(samples / rate),
+             (unsigned)(samples % rate * 10 / rate), (unsigned)rate);
+    return ESP_OK;
+}
 
 // Answering session. id, scratch and dropped belong to the peer task;
 // gate is set by the encoder task, full_session by the recorder.
@@ -133,7 +195,44 @@ static void record(const uint8_t *packet, size_t size)
         ++session.dropped;
 }
 
-static const digits_call_audio_unattended_t hooks = {.fill = fill, .record = record};
+static bool greeting_over(void) { return __atomic_load_n(&session.gate, __ATOMIC_ACQUIRE); }
+
+static digits_call_audio_unattended_t hooks = {.fill = fill, .record = record, .greeting_done = greeting_over};
+
+// Classic answering machine: hear the greeting and the caller on the speaker.
+#define LISTEN_NAMESPACE "digits_vm"
+static bool hear_greeting = true, hear_caller = true;
+
+static void load_listen(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(LISTEN_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return;
+    uint8_t value;
+    if (nvs_get_u8(nvs, "hear_greeting", &value) == ESP_OK) hear_greeting = value;
+    if (nvs_get_u8(nvs, "hear_caller", &value) == ESP_OK) hear_caller = value;
+    nvs_close(nvs);
+}
+
+void digits_voicemail_listen(bool *greeting, bool *caller)
+{
+    if (greeting) *greeting = __atomic_load_n(&hear_greeting, __ATOMIC_RELAXED);
+    if (caller) *caller = __atomic_load_n(&hear_caller, __ATOMIC_RELAXED);
+}
+
+esp_err_t digits_voicemail_set_listen(bool greeting, bool caller)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(LISTEN_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(nvs, "hear_greeting", greeting);
+    if (err == ESP_OK) err = nvs_set_u8(nvs, "hear_caller", caller);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK) return err;
+    __atomic_store_n(&hear_greeting, greeting, __ATOMIC_RELAXED);
+    __atomic_store_n(&hear_caller, caller, __ATOMIC_RELAXED);
+    return ESP_OK;
+}
 
 const digits_call_audio_unattended_t *digits_voicemail_begin(const char *caller)
 {
@@ -144,8 +243,8 @@ const digits_call_audio_unattended_t *digits_voicemail_begin(const char *caller)
     session.dropped = 0;
     __atomic_store_n(&session.gate, false, __ATOMIC_RELEASE);
     // No encoder runs yet: the previous call's workers were reaped first.
-    vm_prompt_start(&prompt, builtin_pcm, builtin_frames,
-                    digits_sd_greeting_frames() ? digits_sd_greeting_read : NULL);
+    start_greeting(&prompt);
+    digits_voicemail_listen(&hooks.hear_greeting, &hooks.hear_caller); // For this call.
     size_t length = caller ? strnlen(caller, VM_STORE_CALLER_BYTES - 1) : 0;
     uint8_t name[VM_STORE_CALLER_BYTES] = {0};
     memcpy(name, caller, length);
@@ -154,7 +253,7 @@ const digits_call_audio_unattended_t *digits_voicemail_begin(const char *caller)
         return NULL;
     }
     ESP_LOGI(TAG, "Answering call from %s with the %s greeting", caller ? caller : "unknown",
-             digits_sd_greeting_frames() ? "SD card" : "built-in");
+             digits_voicemail_greeting_kind());
     return &hooks;
 }
 
@@ -349,8 +448,7 @@ static bool play_message(player_buffers_t *b, const char *path)
 static bool play_greeting(player_buffers_t *b)
 {
     vm_prompt_t local;
-    vm_prompt_start(&local, builtin_pcm, builtin_frames,
-                    digits_sd_greeting_frames() ? digits_sd_greeting_read : NULL);
+    start_greeting(&local);
     bool open = false;
     while (!open) {
         open = vm_prompt_render(&local, b->mono, 960);
@@ -390,7 +488,7 @@ static void player_task(void *arg)
             ESP_LOGW(TAG, "Speaker busy; nothing played");
         } else if (digits_audio_speaker_start() == ESP_OK) {
             if (kind == PLAY_GREETING) {
-                ESP_LOGI(TAG, "Playing the %s greeting", digits_sd_greeting_frames() ? "SD card" : "built-in");
+                ESP_LOGI(TAG, "Playing the %s greeting", digits_voicemail_greeting_kind());
                 play_greeting(b);
             } else {
                 char path[VM_STORE_PATH_BYTES];
@@ -452,7 +550,7 @@ void digits_voicemail_stop(void)
 esp_err_t digits_voicemail_start(void)
 {
     if (!vm_prompt_wav(greeting_wav_start, (size_t)(greeting_wav_end - greeting_wav_start), &builtin_pcm,
-                       &builtin_frames))
+                       &builtin_frames, &builtin_rate))
         ESP_LOGE(TAG, "Built-in greeting unreadable; only the beep plays");
     if (!digits_sd_card_mounted()) {
         ESP_LOGI(TAG, "No SD card: the answering machine is off");
@@ -476,9 +574,11 @@ esp_err_t digits_voicemail_start(void)
     if (xTaskCreateWithCaps(recorder_task, "digits_vm_rec", RECORDER_STACK_BYTES, NULL, 4, NULL, PSRAM) != pdPASS ||
         xTaskCreateWithCaps(player_task, "digits_vm_play", PLAYER_STACK_BYTES, NULL, 3, &player, PSRAM) != pdPASS)
         return ESP_ERR_NO_MEM;
+    digits_voicemail_greeting_reload();
+    load_listen();
     __atomic_store_n(&ready, true, __ATOMIC_RELAXED);
     ESP_LOGI(TAG, "Ready: %u messages, %d unheard, %s greeting", store.count, digits_voicemail_unheard(),
-             digits_sd_greeting_frames() ? "SD card" : "built-in");
+             digits_voicemail_greeting_kind());
     return ESP_OK;
 }
 
@@ -590,13 +690,24 @@ int digits_voicemail_console(int argc, char **argv)
         unlock();
         printf("Answering machine: ready, %u messages (%d new, limit %u, %u s each)\n", count,
                digits_voicemail_unheard(), (unsigned)CAPACITY, (unsigned)CONFIG_DIGITS_VOICEMAIL_MAX_SECONDS);
-        printf("Greeting: %s\n", digits_sd_greeting_frames() ? "SD card voicemail/greeting.mp3" : "built-in");
+        printf("Greeting: %s, %u s\n", digits_voicemail_greeting_kind(), digits_voicemail_greeting_seconds());
+        printf("Speaker while answering: greeting %s, caller %s\n", hear_greeting ? "on" : "off",
+               hear_caller ? "on" : "off");
         printf("Whether and when it answers is set per line on the server (see 'webrtc status')\n");
         return 0;
     }
     if (!digits_voicemail_ready()) {
         printf("Answering machine is off: no usable SD card\n");
         return 1;
+    }
+    if (!strcmp(verb, "listen") && argc == 4 && (!strcmp(argv[2], "greeting") || !strcmp(argv[2], "caller")) &&
+        (!strcmp(argv[3], "on") || !strcmp(argv[3], "off"))) {
+        bool on = !strcmp(argv[3], "on"), greeting = hear_greeting, caller = hear_caller;
+        if (!strcmp(argv[2], "greeting")) greeting = on;
+        else caller = on;
+        esp_err_t err = digits_voicemail_set_listen(greeting, caller);
+        printf(err == ESP_OK ? "Saved\n" : "Saving failed\n");
+        return err != ESP_OK;
     }
     if (!strcmp(verb, "list") && argc == 2) {
         uint8_t *tail = malloc(TAIL_BYTES);
@@ -647,7 +758,7 @@ int digits_voicemail_console(int argc, char **argv)
         return !ok;
     }
     printf("Usage: vm [status] | vm list | vm play [N] | vm greeting | vm stop | vm heard N | "
-           "vm delete N | vm delete heard\n");
+           "vm delete N | vm delete heard | vm listen greeting|caller on|off\n");
     return 1;
 }
 
@@ -669,6 +780,15 @@ esp_err_t digits_voicemail_play(uint32_t number)
     return ESP_ERR_NOT_SUPPORTED;
 }
 esp_err_t digits_voicemail_play_greeting(void) { return ESP_ERR_NOT_SUPPORTED; }
+const char *digits_voicemail_greeting_kind(void) { return "built-in"; }
+unsigned digits_voicemail_greeting_seconds(void) { return 0; }
+esp_err_t digits_voicemail_greeting_reload(void) { return ESP_ERR_NOT_SUPPORTED; }
+void digits_voicemail_listen(bool *greeting, bool *caller)
+{
+    if (greeting) *greeting = false;
+    if (caller) *caller = false;
+}
+esp_err_t digits_voicemail_set_listen(bool greeting, bool caller) { return ESP_ERR_NOT_SUPPORTED; }
 void digits_voicemail_stop(void) {}
 unsigned digits_voicemail_list(digits_voicemail_message_t *out, unsigned max) { return 0; }
 bool digits_voicemail_file(uint32_t number, char *path, size_t capacity) { return false; }

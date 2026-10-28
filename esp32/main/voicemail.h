@@ -32,7 +32,21 @@ bool digits_voicemail_full(void);
 // the end is marked heard.
 esp_err_t digits_voicemail_play(uint32_t number);
 esp_err_t digits_voicemail_play_greeting(void);
+
+// The greeting callers hear: one recorded on the phone (greeting.wav), else
+// an uploaded MP3 (greeting.mp3), else the built-in one.
+#define DIGITS_VOICEMAIL_GREETING_WAV "/sdcard/voicemail/greeting.wav"
+const char *digits_voicemail_greeting_kind(void); // "recorded", "uploaded" or "built-in".
+unsigned digits_voicemail_greeting_seconds(void);
+// Re-reads greeting.wav after it changed. Only while the line is idle.
+esp_err_t digits_voicemail_greeting_reload(void);
 void digits_voicemail_stop(void);
+
+// Like a classic answering machine, the speaker plays the greeting and then
+// the caller while a message is recorded; both on by default. Saved in NVS
+// (set from an internal-RAM task); used from the next call the machine takes.
+void digits_voicemail_listen(bool *greeting, bool *caller);
+esp_err_t digits_voicemail_set_listen(bool greeting, bool caller);
 
 // Messages for the web page, oldest first. Store changes take a lock and
 // touch only the SD card (no flash), so any task may call them.

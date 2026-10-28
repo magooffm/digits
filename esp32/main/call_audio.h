@@ -44,10 +44,15 @@ esp_err_t digits_call_audio_start(digits_call_audio_mode_t mode, digits_call_aud
 // Answering machine. While unattended the room microphone is never sent:
 // fill supplies every transmitted 20 ms frame instead (encoder task, must
 // not block). Received packets go to record (caller's context, must not
-// block) instead of the speaker. Hooks must stay valid for the call.
+// block). The speaker plays, like a classic answering machine, the filled
+// frames until greeting_done() (hear_greeting), then the caller
+// (hear_caller); otherwise it stays silent. Hooks must stay valid for the call.
 typedef struct {
     void (*fill)(int16_t *mono, size_t frames);
     void (*record)(const uint8_t *packet, size_t size);
+    bool (*greeting_done)(void); // Greeting and beep are over; NULL: from the start.
+    bool hear_greeting;
+    bool hear_caller;
 } digits_call_audio_unattended_t;
 esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
                                              const digits_call_audio_unattended_t *hooks,

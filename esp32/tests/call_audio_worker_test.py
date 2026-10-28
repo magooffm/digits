@@ -153,6 +153,8 @@ static void test_fill(int16_t *mono, size_t frames)
 }
 static void test_record(const uint8_t *packet, size_t size) { assert(packet && size == 1); ++recorded_packets; }
 static const digits_call_audio_unattended_t test_hooks = {.fill = test_fill, .record = test_record};
+static unsigned greeting_writes, caller_writes;
+static bool greeting_over(void) { return now_us >= 300000; }
 
 static void inject_packets(void)
 {
@@ -241,6 +243,9 @@ esp_err_t digits_audio_speaker_write(const int16_t *stereo,size_t bytes,size_t *
     ++speaker_writes;
     for (unsigned i=0;i<480;++i) assert(stereo[2*i] == stereo[2*i+1]);
     last_pcm = (unsigned)(stereo[0] >= 0 ? stereo[0] : -stereo[0]);
+    // Playback halves samples (call_audio_pcm_stereo headroom).
+    if (stereo[0] >= GREETING_SAMPLE / 2) ++greeting_writes;
+    else if (stereo[0] == 1000) ++caller_writes;
     assert(last_pcm > 0 && last_pcm <= 16384);
     if (partial_write && speaker_writes == 5) { *written = 20; return ESP_ERR_TIMEOUT; }
     // Hardware holds exactly two 10 ms descriptors. Wait until one is free;
@@ -466,6 +471,34 @@ int main(void)
     run(1); stats=finish();
     assert(stats.received_frames == 3 && stats.encoded_frames == 30 && !stats.rx_queue_drops);
     attend_at_read=0;
+
+    // Classic answering machine: the speaker plays the greeting until it is
+    // over, then the caller; the recorder gets every packet regardless.
+    digits_call_audio_unattended_t classic = {.fill = test_fill, .record = test_record,
+        .greeting_done = greeting_over, .hear_greeting = true, .hear_caller = true};
+    start_hooks=&classic;
+    begin(DIGITS_CALL_AUDIO_FULL);
+    start_hooks=NULL;
+    assert(active->monitor);
+    int16_t greeting_frame[DIGITS_MIC_FRAME_SAMPLES];
+    test_fill(greeting_frame, DIGITS_MIC_FRAME_SAMPLES);
+    for (unsigned i=0;i<MONITOR_FRAMES+2;++i) monitor_push(active,greeting_frame); // Two dropped: full.
+    now_us=0; next_arrival_us=0; recorded_packets=0; greeting_writes=caller_writes=0;
+    run(1); // Playback until the fixture stops at 600 ms.
+    assert(greeting_writes == 2 * MONITOR_FRAMES);       // Every queued greeting frame, both halves.
+    assert(caller_writes > 0 && recorded_packets >= 29);  // Caller after 300 ms; all packets recorded.
+    run(0); stats=finish();
+    assert(stats.decoded_frames > 0 && !stats.decode_errors);
+
+    // Both off: silence on the speaker, recording unchanged.
+    digits_call_audio_unattended_t quiet = {.fill = test_fill, .record = test_record, .greeting_done = greeting_over};
+    start_hooks=&quiet;
+    begin(DIGITS_CALL_AUDIO_FULL);
+    start_hooks=NULL;
+    assert(!active->monitor);
+    now_us=0; next_arrival_us=0; recorded_packets=0; speaker_writes=0;
+    run(1); run(0); stats=finish();
+    assert(!speaker_writes && recorded_packets >= 29 && !stats.decoded_frames);
     assert(creates == stops && peak_tasks == 2);
     printf("Call audio workers: PCM/PLC routing, 1000 fixed-clock TX frames, 100 playback cycles, two-DMA cadence, unattended answering and async cleanup/failure paths passed\n");
     return 0;

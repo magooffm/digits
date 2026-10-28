@@ -69,11 +69,20 @@ bookmarks (`/#messages`):
   song: play on the phone, delete, or upload an MP3 (up to 20 MB, kept under
   its file name). Changes work at once. Without the password these buttons
   stay visible but greyed out.
-- **Messages.** Grouped by caller (named after the call button with that
+- **Messages.** Switches for hearing the greeting and the caller on the
+  speaker while the machine answers (see "Answering machine"). Then the
+  messages, grouped by caller (named after the call button with that
   number): play in the browser (Ogg Opus; current Chrome, Firefox and
   Safari), play on the phone, mark heard, delete.
-- **Greeting.** Built-in or your own: upload an MP3 (up to 5 MB), listen,
-  play on the phone, delete to go back to the built-in one.
+- **Greeting.** What callers hear: the built-in greeting, an uploaded MP3
+  (up to 5 MB) or one recorded on the phone. **Record** beeps, then records
+  with the phone's microphone (today the board's, the handset's once it is
+  wired) until **Stop** or 60 seconds; an incoming call cancels it. The take
+  is stored as 16 kHz WAV, level-normalized (up to 8x), and waits for
+  **Keep** or **Discard** with a player; the current greeting stays until
+  kept. Recording and uploading replace each other; **Delete** returns to
+  the built-in one. A kept recording sits in PSRAM (32 KB per second) and is
+  upsampled to 48 kHz for callers.
 - **Log.** Opens the live log after a warning: following it keeps the
   network busy and can cost a little call quality.
 
@@ -107,8 +116,12 @@ an MP3 uploaded to an empty position, downloaded unchanged, previewed on the
 phone and deleted, a junk file refused and removed, a greeting uploaded,
 played and deleted, an answering-machine message listed with caller, date
 and length, downloaded (a valid Ogg Opus file per `opusinfo`), marked heard,
-played and deleted. Not yet verified: playing messages in Safari, and
-uploads from a phone's browser.
+played and deleted. On 2026-10-28 also: a greeting recorded through the page (a 440 Hz tone
+from the PC speakers reached the board microphone and was normalized), kept,
+heard by a caller of the answering machine before the beep, played on the
+phone, a too-short take refused, a take discarded, and the built-in greeting
+restored. Not yet verified: playing messages in Safari, uploads from a
+phone's browser, and recording with the handset microphone.
 
 ### Version
 
@@ -454,7 +467,15 @@ stored on the SD card. It needs a card; without one the phone keeps ringing.
 
 - **Privacy.** From the moment it answers, the room microphone is never
   sent: every transmitted frame comes from the greeting, then silence. The
-  Pi only mutes after the beep. Nothing is played on the speaker meanwhile.
+  Pi only mutes after the beep.
+- **Listening in.** Like a classic answering machine, the speaker plays the
+  greeting with its beep, then the caller while they leave the message. Two
+  switches, both on by default: on the status page's Messages tab or
+  `vm listen greeting|caller on|off` (saved; used from the next call). The
+  speaker carries the greeting until the beep and the caller after it, never
+  both mixed. Recording is the same either way. Measured with the board
+  microphone during a 10 s message: room level RMS 30-49 with the caller on
+  the speaker, about 6-20 with both switches off.
 - **Pickup.** Lifting the handset keeps what was recorded and continues as a
   normal call. Replacing it hangs up.
 - **Files.** `voicemail/new/000012-1002.opus` (number, caller) holds unheard
@@ -464,9 +485,11 @@ stored on the SD card. It needs a card; without one the phone keeps ringing.
   10 minutes each, as on the Pi (**Answering machine** in menuconfig); a new
   one beyond that removes the oldest heard message first. Messages under half
   a second (a hang-up at the beep) are discarded.
-- **Greeting.** The Pi's default greeting is built in. Put your own as
-  `voicemail/greeting.mp3` on the card (any MP3; it streams like the SD
-  ringtones and is sent at full level, see **SD card greeting level**).
+- **Greeting.** The Pi's default greeting is built in. Your own replaces it:
+  recorded on the phone (`voicemail/greeting.wav`, see the status page's
+  Greeting tab) or an MP3 (`voicemail/greeting.mp3`, uploaded there or
+  copied to the card; it streams like the SD ringtones and is sent at full
+  level, see **SD card greeting level**).
 - **Badge.** The number of unheard messages goes to the server on every
   connection and whenever it changes, so the web page shows it.
 

@@ -82,17 +82,35 @@ If a chosen song is deleted, the position goes back to its built-in ringtone.</p
 </div>
 
 <div id="tab-messages" hidden>
+<section><h2>While the machine answers</h2>
+<p><label><input type="checkbox" id="heargreeting" class="lwrite" onchange="saveListen()"> Play the greeting on the speaker</label><br>
+<label><input type="checkbox" id="hearcaller" class="lwrite" onchange="saveListen()"> Play the caller on the speaker while they leave a message</label></p>
+<p class="muted">Like a classic answering machine: lift the handset to take the call. Messages are recorded the same either way.</p>
+</section>
 <section><h2>Messages</h2><div id="messages"></div></section>
 </div>
 
 <div id="tab-greeting" hidden>
 <section><h2>Greeting</h2>
 <p id="greetingstate"></p>
-<p><button class="btn light" onclick="act('/api/greeting-action',{action:'play'})">Play on the phone</button>
-<span id="greetingactions"></span></p>
-<p class="muted">Upload your own (MP3, up to 5 MB, sent at full level to callers):</p>
-<input type="file" id="greetingfile" accept=".mp3,audio/mpeg">
-<button class="btn" onclick="upload('/api/greeting',$('greetingfile'),'greetingprogress')">Upload</button>
+<p><audio id="greetingplayer" controls preload="none"></audio></p>
+<p><button class="btn light gwrite" onclick="act('/api/greeting-action',{action:'play'})">Play on the phone</button>
+<button class="btn light gwrite" id="greetingdelete" onclick="if(confirm('Use the built-in greeting again?'))act('/api/greeting-action',{action:'delete'},loadConfig)">Delete</button></p>
+</section>
+<section><h2>Record a new one</h2>
+<p class="muted">Records with the phone's microphone after a beep, up to a minute. Speak close to the
+phone (the handset, once fitted). Your current greeting stays until you keep the new one.</p>
+<p><button class="btn gwrite" id="recordstart" onclick="act('/api/greeting-action',{action:'record'},loadConfig)">Record</button>
+<button class="btn light gwrite" id="recordstop" onclick="act('/api/greeting-action',{action:'stop'},loadConfig)">Stop</button>
+<span id="recordstate"></span></p>
+<div id="recordready" hidden><p><audio id="recordplayer" controls preload="none"></audio></p>
+<p><button class="btn gwrite" onclick="act('/api/greeting-action',{action:'keep'},loadConfig)">Keep</button>
+<button class="btn light gwrite" onclick="act('/api/greeting-action',{action:'discard'},loadConfig)">Discard</button></p></div>
+</section>
+<section><h2>Upload one</h2>
+<p class="muted">An MP3 up to 5 MB, sent at full level to callers; it replaces a recorded greeting.</p>
+<input type="file" id="greetingfile" class="gwrite" accept=".mp3,audio/mpeg">
+<button class="btn gwrite" onclick="upload('/api/greeting',$('greetingfile'),'greetingprogress')">Upload</button>
 <progress id="greetingprogress" max="100" value="0" hidden></progress>
 </section>
 </div>
@@ -172,7 +190,7 @@ function uploadSong(){
   upload('/api/ringtone?name='+encodeURIComponent(f.name),$('songfile'),'songprogress');
 }
 function loadConfig(){
-  fetch('/api/config').then(need).then(function(c){cfg=c;drawButtons();drawPositions();drawGreeting()})
+  fetch('/api/config').then(need).then(function(c){cfg=c;drawButtons();drawPositions();drawGreeting();drawListen()})
     .catch(function(e){
       if(e!='login'){toast('Could not show the settings');console.error(e);return}
       locked('buttonlist');locked('positions');$('greetingstate').innerHTML='<a href="/login">Log in</a> to see this.'});
@@ -218,13 +236,31 @@ function deleteSong(){
   var r=cfg.library.filter(function(x){return x.id==$('songs').value})[0];
   if(r&&confirm('Delete '+r.name+'?'))act('/api/ringtone-delete',{id:r.id},loadConfig);
 }
+var recordPoll=null;
 function drawGreeting(){
-  $('greetingstate').textContent=cfg.greeting.custom?'Your greeting from the SD card ('+cfg.greeting.seconds+' s).':'The built-in greeting.';
-  $('greetingactions').innerHTML=cfg.greeting.custom?'<audio controls preload="none" src="/api/greeting"></audio> '+
-    (cfg.writable?'<button class="btn light" onclick="if(confirm(\'Use the built-in greeting again?\'))act(\'/api/greeting-action\',{action:\'delete\'},loadConfig)">Delete</button>':''):'';
+  var g=cfg.greeting,r=g.recording,custom=g.kind!='built-in';
+  $('greetingstate').textContent='Callers hear '+(g.kind=='recorded'?'your recorded greeting':g.kind=='uploaded'?'your uploaded greeting':'the built-in greeting')+' ('+g.seconds+' s).';
+  var src=custom?'/api/greeting?v='+g.kind+g.seconds:'';
+  if($('greetingplayer').getAttribute('src')!=src){if(src)$('greetingplayer').src=src;else $('greetingplayer').removeAttribute('src')}
+  $('greetingplayer').hidden=!custom;
+  var busy=r.state=='starting'||r.state=='recording';
+  $('recordstate').textContent=r.state=='starting'?'Beep...':r.state=='recording'?'Recording: '+r.seconds+' s':
+    r.state=='ready'?'New recording: '+r.seconds+' s':r.state=='failed'?'Not recorded: '+r.message:'';
+  $('recordready').hidden=r.state!='ready';
+  if(r.state=='ready'){var n='/api/greeting-new?s='+r.seconds;if($('recordplayer').getAttribute('src')!=n)$('recordplayer').src=n}
+  Array.prototype.forEach.call(document.querySelectorAll('#tab-greeting .gwrite'),function(e){e.disabled=!cfg.writable});
+  $('greetingdelete').disabled=!cfg.writable||!custom;
+  $('recordstart').disabled=!cfg.writable||busy;
+  $('recordstop').disabled=!cfg.writable||!busy;
+  clearTimeout(recordPoll);
+  if(busy)recordPoll=setTimeout(loadConfig,700);
 }
-
 // ---- Messages
+function drawListen(){
+  $('heargreeting').checked=cfg.listen.greeting;$('hearcaller').checked=cfg.listen.caller;
+  Array.prototype.forEach.call(document.querySelectorAll('.lwrite'),function(e){e.disabled=!cfg.writable});
+}
+function saveListen(){act('/api/listen',{greeting:$('heargreeting').checked?1:0,caller:$('hearcaller').checked?1:0},loadConfig)}
 function contact(number){
   if(cfg)for(var i=0;i<cfg.buttons.length;i++)if(cfg.buttons[i].number==number)return 'Button '+cfg.buttons[i].name+' ('+number+')';
   return number;

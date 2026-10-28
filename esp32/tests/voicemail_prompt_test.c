@@ -63,15 +63,18 @@ static void test_wav(void)
     static uint8_t wav[4096];
     const uint8_t *pcm;
     size_t frames;
+    uint32_t rate;
     size_t size = make_wav(wav, VM_PROMPT_RATE, 1, 100, 1234);
-    assert(vm_prompt_wav(wav, size, &pcm, &frames) && frames == 100);
+    assert(vm_prompt_wav(wav, size, &pcm, &frames, &rate) && frames == 100 && rate == VM_PROMPT_RATE);
     assert(pcm[0] == (1234 & 0xff) && pcm[1] == 1234 >> 8);
-    assert(!vm_prompt_wav(wav, size - 50, &pcm, &frames)); // Truncated data chunk.
+    assert(!vm_prompt_wav(wav, size - 50, &pcm, &frames, &rate)); // Truncated data chunk.
     size = make_wav(wav, 44100, 1, 10, 0);
-    assert(!vm_prompt_wav(wav, size, &pcm, &frames));
+    assert(!vm_prompt_wav(wav, size, &pcm, &frames, &rate));
     size = make_wav(wav, VM_PROMPT_RATE, 2, 10, 0);
-    assert(!vm_prompt_wav(wav, size, &pcm, &frames));
-    assert(!vm_prompt_wav(wav, 8, &pcm, &frames));
+    assert(!vm_prompt_wav(wav, size, &pcm, &frames, &rate));
+    assert(!vm_prompt_wav(wav, 8, &pcm, &frames, &rate));
+    size = make_wav(wav, 16000, 1, 10, 0); // A recorded greeting.
+    assert(vm_prompt_wav(wav, size, &pcm, &frames, &rate) && rate == 16000 && frames == 10);
 }
 
 static uint8_t *load_pi_greeting(size_t *size)
@@ -97,12 +100,13 @@ static void test_builtin(void)
     uint8_t *wav = load_pi_greeting(&size);
     const uint8_t *pcm;
     size_t frames;
-    assert(vm_prompt_wav(wav, size, &pcm, &frames));
+    uint32_t rate;
+    assert(vm_prompt_wav(wav, size, &pcm, &frames, &rate) && rate == VM_PROMPT_RATE);
     assert(frames > VM_PROMPT_RATE && frames < 3 * VM_PROMPT_RATE); // About 2.2 s.
     // Shorten it so the whole sequence fits the output buffer.
     size_t greeting = 30000;
     vm_prompt_t prompt;
-    vm_prompt_start(&prompt, pcm + 1, greeting, NULL); // Odd address on purpose.
+    vm_prompt_start(&prompt, pcm + 1, greeting, VM_PROMPT_RATE, NULL); // Odd address on purpose.
     size_t open_at;
     render_in_blocks(&prompt, TOTAL, 960, &open_at);
     assert(!memcmp(out, pcm + 1, greeting * 2));
@@ -126,34 +130,51 @@ static void test_custom(void)
     size_t open_at;
     // Ends inside a block: the rest of that block is silence, then the pause.
     custom_frames = 10000;
-    vm_prompt_start(&prompt, builtin, 4, custom);
+    vm_prompt_start(&prompt, builtin, 4, VM_PROMPT_RATE, custom);
     render_in_blocks(&prompt, TOTAL, 960, &open_at);
     assert(out[0] == 777 && out[9999] == 777 && out[10000] == 0);
     check_beep_after(10560, open_at, 960); // 11 blocks of greeting.
     // Fails at once: the built-in greeting plays.
     custom_fail_at = 0;
-    vm_prompt_start(&prompt, builtin, 4, custom);
+    vm_prompt_start(&prompt, builtin, 4, VM_PROMPT_RATE, custom);
     render_in_blocks(&prompt, TOTAL, 7, &open_at);
     assert(out[0] == 1 && out[3] == 4);
     check_beep_after(4, open_at, 7);
     // Fails later: straight to the beep.
     custom_fail_at = 1920;
     custom_frames = 100000;
-    vm_prompt_start(&prompt, builtin, 4, custom);
+    vm_prompt_start(&prompt, builtin, 4, VM_PROMPT_RATE, custom);
     render_in_blocks(&prompt, TOTAL, 960, &open_at);
     assert(out[1919] == 777);
     check_beep_after(1920, open_at, 960);
     custom_fail_at = -1;
     // Nothing at all: beep first.
-    vm_prompt_start(&prompt, NULL, 0, NULL);
+    vm_prompt_start(&prompt, NULL, 0, VM_PROMPT_RATE, NULL);
     assert(prompt.phase == VM_PROMPT_BEEP);
     assert(!vm_prompt_render(&prompt, out, VM_PROMPT_BEEP_FRAMES - 1));
     assert(vm_prompt_render(&prompt, out, 1));
     assert(vm_prompt_render(&prompt, out, 960) && out[959] == 0);
 }
 
+static void test_upsampling(void)
+{
+    // 16 kHz: three output frames per sample, interpolated, the last held.
+    static const uint8_t pcm[] = {0, 0, 0x2c, 0x01, 0x58, 0x02}; // 0, 300, 600.
+    vm_prompt_t prompt;
+    vm_prompt_start(&prompt, pcm, 3, 16000, NULL);
+    assert(prompt.builtin_frames == 9);
+    int16_t out[9];
+    vm_prompt_render(&prompt, out, 4);
+    vm_prompt_render(&prompt, out + 4, 5); // Across a block boundary.
+    static const int16_t expected[9] = {0, 100, 200, 300, 400, 500, 600, 600, 600};
+    assert(!memcmp(out, expected, sizeof(out)) && prompt.phase == VM_PROMPT_PAUSE);
+    vm_prompt_start(&prompt, pcm, 3, 44100, NULL); // Not a divisor of 48 kHz: no greeting.
+    assert(prompt.phase == VM_PROMPT_BEEP);
+}
+
 int main(void)
 {
+    test_upsampling();
     test_wav();
     test_builtin();
     test_custom();
