@@ -13,6 +13,7 @@
 #include "record_playback_test.h"
 #include "signaling.h"
 #include "wifi.h"
+#include "setup.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
@@ -23,11 +24,13 @@ void app_main(void)
     esp_err_t settings_err = digits_settings_init();
     if (settings_err != ESP_OK)
         ESP_LOGE("digits", "Settings initialization: %s; pairing storage is retained", esp_err_to_name(settings_err));
-    digits_wifi_start();
     digits_credentials_t credentials;
     ESP_ERROR_CHECK(credentials_load(&credentials));
     ESP_LOGI("digits", "Boot hardware_id=%s number=%s", credentials.hardware_id,
              credentials.device_token[0] ? credentials.number : "unpaired");
+    digits_setup_init();
+    digits_setup_report_number(credentials.device_token[0] ? credentials.number : NULL);
+    digits_wifi_start();
     esp_err_t err = digits_audio_board_init();
     if (err != ESP_OK)
         ESP_LOGE("digits", "Speaker initialization failed: %s; signaling continues", esp_err_to_name(err));

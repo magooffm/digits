@@ -29,3 +29,8 @@ CONFIG_FATFS_LFN_HEAP=y
 # SD card and answering-machine tasks keep their stacks in PSRAM, leaving
 # internal RAM for the call audio workers.
 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+# The Wi-Fi setup page (HTTP server and DNS) needs sockets besides signaling and calls.
+CONFIG_LWIP_MAX_SOCKETS=16
+# Two firmware slots (partitions.csv): roll back an update that fails before
+# marking itself valid.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

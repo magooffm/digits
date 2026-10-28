@@ -1,13 +1,43 @@
 menu "Digits development configuration"
     config DIGITS_WIFI_SSID
-        string "Wi-Fi SSID"
+        string "Wi-Fi SSID (fallback)"
         default ""
+        help
+            Used only until a network is saved from the setup page or the
+            console ('wifi set'). Empty: the phone opens its setup network.
     config DIGITS_WIFI_PASSWORD
-        string "Wi-Fi password"
+        string "Wi-Fi password (fallback)"
         default ""
+    config DIGITS_WIFI_SETUP_AFTER_S
+        int "Open the setup network after this long without Wi-Fi or server (seconds)"
+        range 30 3600
+        default 120
+        help
+            The phone keeps retrying while the setup network is open and
+            closes it once everything works again. Long enough for a
+            router that restarts after a power cut.
+    config DIGITS_SETUP_PASSWORD
+        string "Setup network password (8-63 characters)"
+        default ""
+        help
+            WPA2 password of Digits-Setup-XXXX, which guards the setup page
+            (Wi-Fi, server, firmware upload, restart). The same on every
+            phone built with it. Empty leaves the network open: anyone
+            nearby could then reconfigure or reflash the phone while it is
+            in setup.
+    config DIGITS_SETUP_FORCED_MINUTES
+        int "Setup network on request stays open (minutes)"
+        range 5 240
+        default 30
+        help
+            After a long button press, the server's recovery command or
+            'wifi setup', while the phone is otherwise working.
     config DIGITS_SERVER_URL
-        string "Digits WebSocket URL (ws://host:port/ws)"
+        string "Digits WebSocket URL (fallback, ws://host:port/ws)"
         default ""
+        help
+            Used only until a server is saved from the setup page or the
+            console ('wifi server').
     menu "WebRTC interoperability"
         config DIGITS_WEBRTC
             bool "Enable one-to-one WebRTC interoperability"

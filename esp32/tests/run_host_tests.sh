@@ -51,11 +51,12 @@ c_sources() {
         voicemail_store) echo "$main/voicemail_store.c $tests/voicemail_store_test.c" ;;
         voicemail_prompt) echo "$main/voicemail_prompt.c $tests/voicemail_prompt_test.c" ;;
         silence_policy) echo "$tests/silence_policy_test.c" ;;
+        wifi_setup_form) echo "$main/wifi_setup_form.c $tests/wifi_setup_form_test.c" ;;
     esac
 }
 
 for name in phone_fsm tone_gen ringtones ring_select sd_ringtone_util call_audio_jitter ring_tone microphone_pcm record_playback_pcm \
-    ogg_opus voicemail_store voicemail_prompt silence_policy; do
+    ogg_opus voicemail_store voicemail_prompt silence_policy wifi_setup_form; do
     # shellcheck disable=SC2046 # word splitting of the source list is intended.
     run "$name" sh -c 'out="$1"; shift; cc -std=c11 -Wall -Wextra -Werror -I "$0" "$@" -lm -o "$out" && "$out"' \
         "$main" "$work/$name" $(c_sources "$name")

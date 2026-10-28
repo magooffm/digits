@@ -10,6 +10,8 @@
 #include "ring_select.h"
 #include "sd_ringtones.h"
 #include "silence.h"
+#include "setup.h"
+#include "ring_test.h"
 #include "voicemail.h"
 #include "webrtc.h"
 #include <ctype.h>
@@ -29,6 +31,7 @@
 #define NUMBER_CAPACITY 32
 #define NVS_NAMESPACE "digits_phone"
 #define ERROR_LOG_INTERVAL_US 1000000LL
+#define SETUP_HOLD_US 8000000LL // Hold a call button this long, on hook, to open the setup network.
 #define TASK_STACK_BYTES 4096
 #define TASK_PRIORITY 3
 
@@ -372,6 +375,8 @@ static void phone_task(void *arg)
     bool previewing = false;
     int selector_previous[PHONE_CALL_TARGETS] = {-1, -1, -1};
     unsigned polls = 0;
+    int64_t held_since[PHONE_CALL_TARGETS] = {0};
+    bool hold_used[PHONE_CALL_TARGETS] = {false};
     TickType_t poll_ticks = pdMS_TO_TICKS(POLL_MS) ? pdMS_TO_TICKS(POLL_MS) : 1;
     for (;;) {
         int64_t now = esp_timer_get_time();
@@ -463,6 +468,21 @@ static void phone_task(void *arg)
             if (!off_hook) digits_call_tones_stop();
         }
         digits_call_tones_play(out.tone); // Idempotent; keeps cadence.
+        // Long press on hook with an idle line: open the setup network.
+        for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {
+            bool holding = err == ESP_OK && buttons[i].stable && !off_hook && call.phase == DIGITS_CALL_IDLE;
+            if (!holding) {
+                held_since[i] = 0;
+                hold_used[i] = false;
+            } else if (!held_since[i]) {
+                held_since[i] = now;
+            } else if (!hold_used[i] && now - held_since[i] >= SETUP_HOLD_US) {
+                hold_used[i] = true;
+                ESP_LOGI(TAG, "Call button %s held: opening the setup network", target_names[i]);
+                digits_setup_open("call button held", true);
+                digits_ring_test_request(); // Short ring as confirmation.
+            }
+        }
         if (++polls % SELECTOR_POLL_DIVIDER == 0) selectors_poll(selector_previous);
         vTaskDelay(poll_ticks);
     }

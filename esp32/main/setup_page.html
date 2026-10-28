@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Digits phone setup</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:28em;margin:1.5em auto;padding:0 1em;background:#f6f1e7;color:#2b2620}
+h1{font-size:1.4em;margin-bottom:.2em}h2{font-size:1.1em;margin:0 0 .6em}
+section{background:#fffdf8;border:1px solid #ddd3c2;border-radius:6px;padding:1em;margin:1em 0}
+label{display:block;margin:.8em 0 .3em}
+input,button{font-size:1em;width:100%;box-sizing:border-box;padding:.6em}
+button{margin-top:1em;background:#2b2620;color:#f6f1e7;border:0;border-radius:4px}
+button.plain{background:#e7dfd1;color:#2b2620}
+dl{display:grid;grid-template-columns:auto 1fr;gap:.3em .8em;margin:0}dt{color:#6b6257}dd{margin:0;word-break:break-all}
+.code{font-size:2.2em;letter-spacing:.15em;font-family:ui-monospace,monospace;margin:.2em 0}
+.muted{color:#6b6257;font-size:.9em}.ok{color:#3c6e3c}.bad{color:#9b3b2b}
+progress{width:100%;margin-top:.8em}
+</style>
+</head>
+<body>
+<h1>Digits phone</h1>
+<p class="muted" id="firmware"></p>
+
+<section>
+<h2>Status</h2>
+<dl>
+<dt>Wi-Fi</dt><dd id="wifi">...</dd>
+<dt>Server</dt><dd id="server">...</dd>
+<dt>Number</dt><dd id="number">...</dd>
+</dl>
+</section>
+
+<section id="pairing" hidden>
+<h2>Pairing</h2>
+<p>Note this code:</p>
+<p class="code" id="code"></p>
+<p>Switch your phone back to your home Wi-Fi, open <a id="pairlink" href="#"></a>,
+choose <b>Pair a new handset</b>, enter the code and pick a 7-digit number
+(or add this phone to an existing line). The code is valid for 10 minutes;
+this page shows a new one when it expires.</p>
+</section>
+
+<section>
+<h2>Wi-Fi and server</h2>
+<form id="wifiform" method="post" action="/wifi">
+<label for="ssid">Network</label>
+<input id="ssid" name="ssid" list="nets" required maxlength="32" autocomplete="off">
+<datalist id="nets"></datalist>
+<label for="password">Password</label>
+<input id="password" name="password" type="password" maxlength="64" autocomplete="off">
+<p class="muted">Empty: keep the saved password for this network, or an open network.</p>
+<label for="url">Digits server</label>
+<input id="url" name="url" required maxlength="127" placeholder="ws://192.168.1.50:8080/ws">
+<button>Save and restart</button>
+</form>
+<p class="muted"><a href="/scan">Search for networks again</a></p>
+</section>
+
+<section>
+<h2>Update firmware</h2>
+<p class="muted">A <code>digits_signaling.bin</code> from <code>esp32/build</code>. If the new
+firmware fails to start, the phone goes back to the current one.</p>
+<input id="file" type="file" accept=".bin">
+<button id="upload" class="plain">Upload and restart</button>
+<progress id="progress" max="100" value="0" hidden></progress>
+<p id="uploadresult"></p>
+</section>
+
+<section>
+<h2>Restart</h2>
+<form method="post" action="/restart"><button class="plain">Restart the phone</button></form>
+</section>
+
+<script>
+function $(id){return document.getElementById(id)}
+var filled=false;
+function show(s){
+  $('firmware').textContent='Firmware '+s.firmware;
+  $('wifi').innerHTML='';$('wifi').textContent=s.wifi.ssid?(s.wifi.ssid+(s.wifi.connected?' (connected, '+s.wifi.rssi+' dBm)':' (not connected)')):'not configured';
+  $('wifi').className=s.wifi.connected?'ok':'bad';
+  $('server').textContent=s.server.url?(s.server.url+(s.server.connected?' (connected)':' (not connected)')):'not configured';
+  $('server').className=s.server.connected?'ok':'bad';
+  $('number').textContent=s.number||'not paired yet';
+  var pairing=!s.number&&s.code;
+  $('pairing').hidden=!pairing;
+  if(pairing){$('code').textContent=s.code;$('pairlink').textContent=s.pairing_page;$('pairlink').href=s.pairing_page}
+  if(!filled){filled=true;$('ssid').value=s.wifi.ssid;$('url').value=s.server.url;
+    s.networks.forEach(function(n){var o=document.createElement('option');o.value=n;$('nets').appendChild(o)})}
+}
+function poll(){fetch('/status').then(function(r){return r.json()}).then(show).catch(function(){})}
+poll();setInterval(poll,4000);
+$('upload').onclick=function(){
+  var f=$('file').files[0];if(!f){$('uploadresult').textContent='Choose a file first.';return}
+  var x=new XMLHttpRequest();x.open('POST','/update');
+  $('progress').hidden=false;$('uploadresult').textContent='Uploading...';
+  x.upload.onprogress=function(e){if(e.lengthComputable)$('progress').value=100*e.loaded/e.total};
+  x.onload=function(){$('uploadresult').textContent=x.responseText};
+  x.onerror=function(){$('uploadresult').textContent='Upload failed; the phone keeps its current firmware.'};
+  x.setRequestHeader('Content-Type','application/octet-stream');x.send(f);
+};
+</script>
+</body>
+</html>

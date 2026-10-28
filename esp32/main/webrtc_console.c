@@ -5,6 +5,7 @@
 #include "webrtc.h"
 #include "phone.h"
 #include "voicemail.h"
+#include "wifi.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -72,6 +73,16 @@ esp_err_t digits_webrtc_console_start(void)
     };
     err = esp_console_cmd_register(&voicemail);
     if (err != ESP_OK) return err;
+    const esp_console_cmd_t wifi = {
+        .command = "wifi",
+        .help = "Wi-Fi and server: status, set SSID [PASSWORD] and server URL (save and restart; quote "
+                "names with spaces), forget (back to the build defaults), setup [lan] (open the setup "
+                "network now; lan also serves the page on the home network), close.",
+        .hint = "status | set SSID [PASSWORD] | server URL | forget | setup [lan] | close",
+        .func = digits_wifi_console,
+    };
+    err = esp_console_cmd_register(&wifi);
+    if (err != ESP_OK) return err;
 
     esp_console_repl_config_t config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     config.prompt = "digits>";
@@ -89,6 +100,7 @@ esp_err_t digits_webrtc_console_start(void)
         (void)esp_console_cmd_deregister("phone");
 #endif
         (void)esp_console_cmd_deregister("vm");
+        (void)esp_console_cmd_deregister("wifi");
         return err;
     }
     err = esp_console_start_repl(console);

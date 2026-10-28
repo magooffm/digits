@@ -374,6 +374,15 @@ void digits_silence_server(bool silent)
     ++silent_publications;
 }
 void digits_wifi_wait_connected(void) { assert(!callback_depth); ++wifi_waits; }
+const char *digits_wifi_server_url(void) { return CONFIG_DIGITS_SERVER_URL; }
+// Setup network reports: callbacks may only record state.
+static bool server_reported;
+static unsigned setup_opens;
+static char reported_code[8], reported_number[32];
+void digits_setup_report_server(bool connected) { server_reported = connected; }
+void digits_setup_report_pairing_code(const char *code) { snprintf(reported_code, sizeof(reported_code), "%s", code); }
+void digits_setup_report_number(const char *number) { snprintf(reported_number, sizeof(reported_number), "%s", number ? number : ""); }
+void digits_setup_open(const char *reason, bool forced) { assert(reason && forced); ++setup_opens; }
 esp_err_t digits_webrtc_console_start(void) { ++console_starts; return ESP_OK; }
 esp_err_t digits_webrtc_init(digits_webrtc_send_fn send, void *context)
 {
@@ -446,6 +455,9 @@ static void reset(void)
     assert(!json_live && !outbound.queue && !critical_depth && !callback_depth);
     memset(clients, 0, sizeof(clients));
     client_count = stops = destroys = waits = wait_begin = wifi_waits = 0;
+    server_reported = false;
+    setup_opens = 0;
+    reported_code[0] = reported_number[0] = '\0';
     atomic_publications = peer_up = peer_down = peer_received = ring_requests = saves = console_starts = 0;
     settings_receives = silent_publications = settings_session = 0;
     settings_ready = effective_silent = false;
@@ -502,6 +514,7 @@ static void test_registration_and_pairing(void)
     assert(queue_message("call", s.session) == ESP_ERR_INVALID_STATE);
     connect(&s);
     assert(sent_count == 1 && peer_up == 1 && !last_paired && !outbound.registered);
+    assert(server_reported); // Registered: the setup network may close.
     cJSON *json = cJSON_Parse(sends[0].wire);
     assert(cJSON_GetArraySize(json) == 3);
     assert(!strcmp(string_field(json, "number"), "unpaired"));
@@ -511,12 +524,16 @@ static void test_registration_and_pairing(void)
     assert(queue_message("call", s.session) == ESP_ERR_INVALID_STATE);
     text_event(s.client, "{\"type\":\"pairing_code\",\"pairing_code\":\"004201\",\"pairing_code_ttl\":300}");
     assert(strstr(logs, "PAIRING CODE: 004201 (TTL: 300 seconds)") && !peer_received);
+    assert(!strcmp(reported_code, "004201") && !reported_number[0]);
     text_event(s.client, "{\"type\":\"paired\",\"number\":\"1001\",\"device_token\":\"original-test-token\"}");
     assert(saves == 1 && !strcmp(c.device_token, stored.device_token));
     assert(!strcmp(c.number, "1001") && (s.events->bits & CREDENTIALS_CHANGED));
+    assert(!strcmp(reported_number, "1001") && !server_reported);
     assert(!stops && !destroys); // Deliberate reconnect belongs to the owner.
     text_event(s.client, "{\"type\":\"paired\",\"number\":\"1001\",\"device_token\":\"original-test-token\"}");
     assert(saves == 1);
+    text_event(s.client, "{\"type\":\"factory_reset\"}");
+    assert(setup_opens == 1 && saves == 1); // Recovery opens setup; nothing is erased.
     cleanup(&s);
 
     c = credentials(true);

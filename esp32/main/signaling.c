@@ -6,6 +6,7 @@
 #include "webrtc.h"
 #include "webrtc_console.h"
 #include "wifi.h"
+#include "setup.h"
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
@@ -86,6 +87,7 @@ static void discard_outbound(void)
 
 static void transport_down(signaling_t *s)
 {
+    digits_setup_report_server(false);
     outbound_set(s->session, false);
     digits_settings_transport(s->session, false);
     digits_webrtc_transport(s->session, false, NULL, false);
@@ -143,8 +145,10 @@ static void dispatch_message(signaling_t *s)
     if (strcmp(type, "pairing_code") == 0) {
         const char *code = string_field(json, "pairing_code");
         cJSON *ttl = cJSON_GetObjectItemCaseSensitive(json, "pairing_code_ttl");
-        if (code && cJSON_IsNumber(ttl))
+        if (code && cJSON_IsNumber(ttl)) {
             ESP_LOGI("signaling", "PAIRING CODE: %s (TTL: %d seconds)", code, ttl->valueint);
+            digits_setup_report_pairing_code(code); // Shown on the setup page.
+        }
         else ESP_LOGW("signaling", "Invalid pairing_code fields");
     } else if (strcmp(type, "paired") == 0 || strcmp(type, "line_renumber") == 0) {
         bool paired = strcmp(type, "paired") == 0;
@@ -160,6 +164,7 @@ static void dispatch_message(signaling_t *s)
             esp_err_t err = credentials_save(&next);
             if (err == ESP_OK) {
                 *s->credentials = next;
+                digits_setup_report_number(next.number);
                 ESP_LOGI("signaling", "%s persisted: number=%s; reconnecting", type, next.number);
                 transport_down(s);
                 xEventGroupSetBits(s->events, CREDENTIALS_CHANGED);
@@ -175,6 +180,10 @@ static void dispatch_message(signaling_t *s)
         // preserves the server's settings-before-call ordering.
         if (digits_settings_receive(json, s->session))
             digits_silence_server(digits_settings_silent());
+    } else if (strcmp(type, "factory_reset") == 0) {
+        // The web UI's "Recovery mode": open the setup network; nothing is erased.
+        ESP_LOGW("signaling", "Recovery requested by the server: opening the setup network");
+        digits_setup_open("server recovery request", true);
     } else if (strcmp(type, "ring_test") == 0) {
         digits_ring_test_request();
     } else if (strcmp(type, "error") == 0) {
@@ -230,6 +239,7 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t id, void *
             // is no server register acknowledgement in the Digits protocol.
             // Pairing messages still arrive on the unpaired registration, but
             // peer call traffic requires a registration with a stored token.
+            digits_setup_report_server(true);
             outbound_set(s->session, s->credentials->device_token[0] != 0);
             digits_settings_transport(s->session, s->credentials->device_token[0] != 0);
             digits_webrtc_transport(s->session, true, s->credentials->number,
@@ -274,10 +284,12 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t id, void *
 
 void digits_signaling_run(digits_credentials_t *credentials)
 {
-    const char *url = CONFIG_DIGITS_SERVER_URL;
-    size_t length = strlen(url);
-    ESP_ERROR_CHECK(length > 8 && strncmp(url, "ws://", 5) == 0 &&
-                    strcmp(url + length - 3, "/ws") == 0 ? ESP_OK : ESP_ERR_INVALID_ARG);
+    const char *url = digits_wifi_server_url();
+    if (!url[0]) {
+        // The setup network is open for entering one; it restarts the phone.
+        ESP_LOGW("signaling", "No server configured; waiting for the setup page");
+        for (;;) vTaskDelay(portMAX_DELAY);
+    }
     signaling_t *s = calloc(1, sizeof(*s));
     ESP_ERROR_CHECK(s ? ESP_OK : ESP_ERR_NO_MEM);
     s->credentials = credentials;

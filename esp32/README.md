@@ -39,9 +39,9 @@ cd esp32
 idf.py set-target esp32s3
 idf.py menuconfig
 # Digits development configuration:
-#   Wi-Fi SSID
-#   Wi-Fi password
-#   Digits WebSocket URL: ws://192.168.1.50:8080/ws (use your LAN server)
+#   Wi-Fi SSID / password and server URL: optional fallbacks, see "Setup network and page"
+#   Setup network password: 8-63 characters
+#   (server URL like ws://192.168.1.50:8080/ws)
 idf.py build
 idf.py -p /dev/cu.usbmodemYOUR_DEVICE flash monitor
 ```
@@ -49,7 +49,78 @@ idf.py -p /dev/cu.usbmodemYOUR_DEVICE flash monitor
 Exit the monitor with Ctrl+]. Linux ports are usually `/dev/ttyACM0`.
 If using a USB-UART bridge instead of native USB, select UART under
 Component config -> ESP System Settings -> Channel for console output.
-Empty or oversized Wi-Fi settings and URLs other than `ws://.../ws` fail fast.
+URLs other than `ws://.../ws` fail fast.
+
+### Setup network and page
+
+Wi-Fi network and Digits server are saved on the phone (NVS namespace
+`digits_wifi`) and survive flashing. The menuconfig SSID, password and
+server URL are only fallbacks until something is saved; they may stay empty.
+
+The phone opens its setup network `Digits-Setup-XXXX` (the last digits of
+its MAC address) only when needed:
+
+- no network or server configured (a fresh phone),
+- not paired yet: the page shows the pairing code,
+- 2 minutes without reaching the Wi-Fi or the server (meanwhile it retries
+  every 30 seconds and closes the setup network once both work again, so a
+  router that boots slower than the phone after a power cut needs nothing),
+- on request, for 30 minutes: hold call button A or B for 8 seconds with the
+  handset down (a short ring confirms), press **Recovery mode** on the
+  phone's page in the web UI (nothing is erased; the web UI calls the
+  network "Digits-Recovery"), or type `wifi setup`.
+
+**Password.** The setup network uses WPA2 with the built-in **Setup network
+password** (menuconfig, 8-63 characters), the same on every phone you build.
+That password is the login: the page answers only on the setup network,
+never on the home network, and WPA2 also encrypts the home Wi-Fi password
+while you type it. Without a password the network is open and the log warns.
+
+**The page.** Joining the network opens it by itself, as on hotel Wi-Fi;
+otherwise go to `http://192.168.4.1`.
+
+- **Status.** Wi-Fi, server and number, refreshed every few seconds.
+- **Pairing.** While unpaired, the server's 6-digit code. Note it, switch
+  back to the home Wi-Fi, open the server's Phones page (the link is shown),
+  enter the code and choose the number. The server has no automatic number
+  assignment: the number is always chosen there.
+- **Wi-Fi and server.** Network (nearby ones are suggested), password (empty
+  keeps the saved one of the same network) and `ws://HOST:PORT/ws`. Saving
+  restarts the phone.
+- **Update firmware.** Upload `build/digits_signaling.bin`. It goes to the
+  idle firmware slot, is checked (image checksum and project name) and the
+  phone restarts into it. The new firmware confirms itself once the server
+  answers, or after 5 minutes; if it restarts before that, the bootloader
+  goes back to the previous one.
+- **Restart.**
+
+```text
+wifi                         # network, server, setup network state
+wifi set "My Home" password  # save and restart; omit the password for an open network
+wifi server ws://192.168.1.50:8080/ws
+wifi forget                  # back to the build defaults
+wifi setup                   # open the setup network for 30 minutes
+wifi setup lan               # same, page also on the home network until restart (testing)
+wifi close
+```
+
+The page uses ESP-IDF's HTTP server and the DNS server from ESP-IDF's
+captive portal example, copied unchanged to `components/dns_server` (public
+domain). ESP-IDF's own `wifi_provisioning` was not used: it needs
+Espressif's phone app instead of a web page. Form parsing, address checks and
+HTML escaping are in `wifi_setup_form.c`, tested by
+`tests/wifi_setup_form_test.c`; the page is `main/setup_page.html`.
+
+Verified on the board on 2026-10-28 (page fetched over the LAN with `wifi
+setup lan`): the new partition layout kept pairing, the setup network stays
+closed in normal operation, status and network list, invalid forms and junk
+uploads refused, a 1.9 MB firmware uploaded in 7 s, booted from the other
+slot and confirmed itself once the server answered, and without `lan` the
+page refuses the home network. Earlier: opening after 120 s offline, saving
+and `wifi forget`. Not yet verified: the page opening by itself on a phone
+that joins the setup network, the 8-second button hold, the web UI's
+Recovery button, a rollback after a failing update, and pairing a fresh
+phone through the page.
 
 Wi-Fi scans all channels and joins the strongest access point of the
 configured name. With the default fast scan, a mesh network sometimes handed
@@ -544,10 +615,13 @@ and **CPU frequency â†’ 240 MHz**. Call audio also needs **FreeRTOS tick rate â†
 1,000 Hz**; older configurations may retain 100 Hz despite the new default.
 These changes leave Wi-Fi/server settings alone.
 
-The 4 MiB factory app begins at `0x10000`. NVS remains at `0x9000`, size `0x6000`,
-and PHY remains at `0xf000`, size `0x1000`. Regular flashing writes the new
-partition table and app without erasing the saved identity/token. No OTA
-partition or procedure is added.
+NVS remains at `0x9000`, size `0x6000`, and PHY at `0xf000`, size `0x1000`.
+Since 2026-10-28 two 3 MiB firmware slots (`ota_0` at `0x20000`, `ota_1` at
+`0x320000`, with `otadata` at `0x10000`) replace the single 4 MiB factory app,
+for updates from the setup page with rollback; the ringtone pack partition
+shrank to the remaining 9.9 MiB (SD card ringtones are the main way now).
+Regular flashing writes the partition table and app without erasing the
+saved identity/token; the change to this layout needs one USB flash.
 
 The peer worker uses a 20 KiB internal stack on core 1 at priority 6, above
 microphone capture and codec workers (5) and Ring Test/recorded playback (4).
