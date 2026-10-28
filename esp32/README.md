@@ -123,6 +123,17 @@ phone, a too-short take refused, a take discarded, and the built-in greeting
 restored. Not yet verified: playing messages in Safari, uploads from a
 phone's browser, and recording with the handset microphone.
 
+### Remote restart
+
+**Restart service** and **Reboot device** on the phone's page in the server's
+web UI both restart the board (it has one program, no separate service).
+The phone first reports `restarting` or `rebooting` like the Pi, so the page
+shows the right text, then waits half a second for that to leave. A running
+call is hung up first, and an answering-machine message being recorded is
+saved; then the board restarts and is back online in about five seconds,
+within the page's wait. Host test: `test_remote_restart` in
+`tests/signaling_webrtc_test.py`.
+
 ### Version
 
 The firmware version comes from git tags named `esp32/vX.Y.Z` (other tags

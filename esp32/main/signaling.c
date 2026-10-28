@@ -12,11 +12,13 @@
 #include "cJSON.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 #include "sdkconfig.h"
 
 #define RETRY BIT0
@@ -133,6 +135,8 @@ static bool copy_field(char *dest, size_t capacity, const char *value)
     return true;
 }
 
+static void handle_restart(signaling_t *s, const char *mode);
+
 static void dispatch_message(signaling_t *s)
 {
     const char *end = NULL;
@@ -181,6 +185,8 @@ static void dispatch_message(signaling_t *s)
         // preserves the server's settings-before-call ordering.
         if (digits_settings_receive(json, s->session))
             digits_silence_server(digits_settings_silent());
+    } else if (strcmp(type, "restart") == 0) {
+        handle_restart(s, string_field(json, "restart_mode"));
     } else if (strcmp(type, "factory_reset") == 0) {
         // The web UI's "Recovery mode": open the setup network; nothing is erased.
         ESP_LOGW("signaling", "Recovery requested by the server: opening the setup network");
@@ -220,6 +226,57 @@ static bool send_register(signaling_t *s)
     cJSON_free(wire);
     cJSON_Delete(json);
     return registered;
+}
+
+// ---- Remote restart ("Restart service" / "Reboot device" in the web UI) ----
+
+#define RESTART_REPORT_MS 500   // Lets the status report leave first.
+#define RESTART_CALL_WAIT_MS 3000
+#define RESTART_SAVE_MS 1500    // An answering-machine message is saved after the hangup.
+static bool restart_pending;
+
+static void restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(RESTART_REPORT_MS));
+    digits_webrtc_call_state_t call;
+    digits_webrtc_call_state(&call);
+    if (call.phase != DIGITS_CALL_IDLE) {
+        ESP_LOGW("signaling", "Restart ends the %s call with %s", call.phase == DIGITS_CALL_RINGING ? "ringing" : "current",
+                 call.remote);
+        digits_webrtc_command("hangup", NULL);
+        for (unsigned waited = 0; waited < RESTART_CALL_WAIT_MS && call.phase != DIGITS_CALL_IDLE; waited += 100) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            digits_webrtc_call_state(&call);
+        }
+        vTaskDelay(pdMS_TO_TICKS(RESTART_SAVE_MS));
+    }
+    ESP_LOGW("signaling", "Restarting as requested by the server");
+    esp_restart();
+}
+
+// The ESP32 has one program: "service" and "reboot" both restart the board.
+// The status report matches the Pi's, so the web UI shows the right text.
+static void handle_restart(signaling_t *s, const char *mode)
+{
+    bool reboot = mode && !strcmp(mode, "reboot");
+    if (!reboot && (!mode || strcmp(mode, "service"))) {
+        ESP_LOGW("signaling", "Ignoring restart with unknown mode %s", mode ? mode : "(none)");
+        return;
+    }
+    if (restart_pending) return;
+    cJSON *json = cJSON_CreateObject();
+    if (json && cJSON_AddStringToObject(json, "type", "update_status") &&
+        cJSON_AddStringToObject(json, "update_status", reboot ? "rebooting" : "restarting") &&
+        cJSON_AddStringToObject(json, "update_detail", reboot ? "Device reboot requested" : "Service restart requested"))
+        enqueue_peer_message(json, s->session, NULL);
+    cJSON_Delete(json);
+    if (xTaskCreate(restart_task, "digits_restart", 3072, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE("signaling", "Cannot start the restart; restarting at once");
+        esp_restart();
+    }
+    restart_pending = true;
+    ESP_LOGW("signaling", "Restart requested by the server (%s)", reboot ? "reboot" : "service");
 }
 
 // What the web UI shows as the phone's software version (the Pi's field

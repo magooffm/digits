@@ -71,6 +71,10 @@ void fake_exit(void);
 #define portENTER_CRITICAL(lock) fake_enter()
 #define portEXIT_CRITICAL(lock) fake_exit()
 void vTaskDelay(TickType_t ticks);
+typedef void (*TaskFunction_t)(void *);
+#define pdPASS 1
+int xTaskCreate(TaskFunction_t entry, const char *name, unsigned stack, void *arg, unsigned priority, void *handle);
+void esp_restart(void);
 EventGroupHandle_t xEventGroupCreate(void);
 EventBits_t xEventGroupSetBits(EventGroupHandle_t group, EventBits_t bits);
 EventBits_t xEventGroupClearBits(EventGroupHandle_t group, EventBits_t bits);
@@ -384,6 +388,32 @@ const esp_app_desc_t *esp_app_get_description(void)
     return &app;
 }
 bool digits_wifi_address(char *out, size_t capacity) { snprintf(out, capacity, "192.168.1.66"); return true; }
+// Remote restart: the task is run by the test, never from the callback.
+static TaskFunction_t restart_entry;
+static unsigned task_creates, restarts, hangups;
+static digits_call_phase_t fake_phase = DIGITS_CALL_IDLE;
+int xTaskCreate(TaskFunction_t entry, const char *name, unsigned stack, void *arg, unsigned priority, void *handle)
+{
+    (void)name; (void)stack; (void)arg; (void)priority; (void)handle;
+    restart_entry = entry;
+    ++task_creates;
+    return pdPASS;
+}
+void esp_restart(void) { assert(!callback_depth); ++restarts; }
+esp_err_t digits_webrtc_command(const char *verb, const char *number)
+{
+    (void)number;
+    assert(!callback_depth && !strcmp(verb, "hangup"));
+    ++hangups;
+    fake_phase = DIGITS_CALL_IDLE; // The worker ends the call.
+    return ESP_OK;
+}
+void digits_webrtc_call_state(digits_webrtc_call_state_t *state)
+{
+    memset(state, 0, sizeof(*state));
+    state->phase = fake_phase;
+    snprintf(state->remote, sizeof(state->remote), "3140002");
+}
 // Setup network reports: callbacks may only record state.
 static bool server_reported;
 static unsigned setup_opens;
@@ -791,6 +821,41 @@ static void test_owner(enum owner_case scenario)
     assert(!outbound.queue->count && logs_used && strstr(logs, "No deliberate reconnect"));
     cleanup(NULL);
 }
+static void test_remote_restart(void)
+{
+    signaling_t s;
+    digits_credentials_t c = credentials(true);
+    setup(&s, &c);
+    connect(&s);
+    restart_pending = false;
+    task_creates = restarts = hangups = 0;
+    text_event(s.client, "{\"type\":\"restart\",\"restart_mode\":\"bogus\"}");
+    assert(!task_creates && !outbound.queue->count);
+    text_event(s.client, "{\"type\":\"restart\",\"restart_mode\":\"reboot\"}");
+    text_event(s.client, "{\"type\":\"restart\",\"restart_mode\":\"reboot\"}"); // Already on its way.
+    assert(task_creates == 1 && !restarts); // Nothing restarts inside the callback.
+    unsigned before = sent_count;
+    drain_outbound(&s);
+    assert(sent_count == before + 1);
+    cJSON *json = cJSON_Parse(sends[before].wire);
+    assert(!strcmp(string_field(json, "type"), "update_status"));
+    assert(!strcmp(string_field(json, "update_status"), "rebooting"));
+    cJSON_Delete(json);
+    fake_phase = DIGITS_CALL_CONNECTED; // A call is running: it is ended first.
+    restart_entry(NULL);
+    assert(hangups == 1 && restarts == 1 && fake_phase == DIGITS_CALL_IDLE);
+    restart_pending = false;
+    text_event(s.client, "{\"type\":\"restart\",\"restart_mode\":\"service\"}");
+    drain_outbound(&s);
+    json = cJSON_Parse(sends[sent_count - 1].wire);
+    assert(!strcmp(string_field(json, "update_status"), "restarting"));
+    cJSON_Delete(json);
+    restart_entry(NULL); // Idle: no hangup.
+    assert(hangups == 1 && restarts == 2);
+    restart_pending = false;
+    cleanup(&s);
+}
+
 static void test_settings_dispatch_and_session(void)
 {
     signaling_t s;
@@ -833,6 +898,7 @@ int main(void)
     test_dispatch_preserves_existing_paths();
     test_bad_messages_and_callback_ownership();
     test_settings_dispatch_and_session();
+    test_remote_restart();
     test_owner(OWNER_RECONNECT);
     test_owner(OWNER_START_FAIL);
     test_owner(OWNER_INIT_FAIL);
@@ -844,7 +910,7 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix="digits-signaling-webrtc-") as temporary:
     directory = Path(temporary)
     (directory / "fake_idf.h").write_text(fake_header)
-    for name in ("esp_app_desc.h", "esp_err.h", "esp_log.h", "esp_timer.h", "esp_websocket_client.h", "sdkconfig.h",
+    for name in ("esp_app_desc.h", "esp_system.h", "freertos/task.h", "esp_err.h", "esp_log.h", "esp_timer.h", "esp_websocket_client.h", "sdkconfig.h",
                  "freertos/FreeRTOS.h", "freertos/event_groups.h", "freertos/queue.h"):
         header = directory / name
         header.parent.mkdir(parents=True, exist_ok=True)
