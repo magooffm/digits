@@ -34,3 +34,7 @@ CONFIG_LWIP_MAX_SOCKETS=16
 # Two firmware slots (partitions.csv): roll back an update that fails before
 # marking itself valid.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# DTLS (mbedTLS) buffers in PSRAM: doubles the internal RAM left during calls
+# (measured 27-29 KB -> 54 KB free) without audio cost. Wi-Fi/lwIP buffers
+# stay internal: in PSRAM they made outgoing audio skip 2-5% of frames.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y

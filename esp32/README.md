@@ -641,7 +641,13 @@ both at priority 5 (48/24 KiB until 2026-10-27; at those sizes 27,136 and
 16,012 bytes stayed unused, and once more features ran, the internal heap
 had no 48 KiB block left after peer creation). Tasks that never write flash
 (SD streamer, answering-machine recorder and player, microphone level log)
-keep their stacks in PSRAM;
+keep their stacks in PSRAM, and so do mbedTLS's DTLS buffers
+(`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC`, 2026-10-28). Measured over two 60 s calls
+each: free internal RAM during a call 27-29 KB before, 54 KB after (lowest
+20-22 KB before, 46 KB after), with no more skipped or late audio frames.
+Moving Wi-Fi/lwIP buffers to PSRAM as well (`SPIRAM_TRY_ALLOCATE_WIFI_LWIP`)
+gave 60 KB but skipped 49-136 outgoing frames per minute, so they stay
+internal;
 bounded PCM, packet queues and jitter storage prefer PSRAM. The microphone
 single-consumer reservation excludes recording diagnostics from call capture,
 and the shared speaker mutex excludes overlapping playback. The peer receive
