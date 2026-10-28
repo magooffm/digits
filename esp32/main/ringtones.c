@@ -179,7 +179,7 @@ bool ringtones_set_local(unsigned slot, uint32_t frames, const char *name, ringt
 {
     if (slot >= RINGTONE_LOCAL_SLOTS || !frames || !stream) return false;
     local_t *local = &locals[slot];
-    if (__atomic_load_n(&local->frames, __ATOMIC_ACQUIRE) || local->stream) return false;
+    if (__atomic_load_n(&local->frames, __ATOMIC_ACQUIRE) || (local->stream && local->stream != stream)) return false;
     local->stream = stream;
     strncpy(local->name, name ? name : "", RINGTONE_NAME_BYTES - 1);
     local->name[RINGTONE_NAME_BYTES - 1] = '\0';

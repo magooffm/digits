@@ -156,6 +156,7 @@ static void supervisor(void *arg)
         const char *reason = !configured ? "no network or server configured"
                            : !digits_setup_paired() ? "not paired yet"
                            : stuck ? (online ? "server unreachable" : "network unreachable") : NULL;
+        if (!reason) reason = digits_setup_requested();
         bool running = digits_setup_running();
         if (reason && !running) digits_setup_open(reason, false);
         else if (!reason && running && !digits_setup_forced()) digits_setup_close();
@@ -255,7 +256,7 @@ int digits_wifi_console(int argc, char **argv)
         err = forget();
     } else if (!strcmp(verb, "setup") && (argc == 2 || (argc == 3 && !strcmp(argv[2], "lan")))) {
         if (argc == 3) digits_setup_allow_lan();
-        digits_setup_open("console", true);
+        digits_setup_request("console");
         printf("Setup network open%s\n", argc == 3 ? "; the page also answers on the home network until restart" : "");
         return 0;
     } else if (!strcmp(verb, "close") && argc == 2) {

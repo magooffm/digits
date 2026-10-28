@@ -113,3 +113,14 @@ void sd_ringtone_scale(int16_t *pcm, size_t count, unsigned percent)
     if (percent >= 100) return;
     for (size_t i = 0; i < count; ++i) pcm[i] = (int16_t)((int32_t)pcm[i] * (int32_t)percent / 100);
 }
+
+bool sd_ringtone_name_valid(const char *name, size_t max_length)
+{
+    size_t length = strlen(name);
+    if (length < 5 || length >= max_length || name[0] == '.' || name[length - 1] == ' ') return false;
+    const char *ext = name + length - 4;
+    if (ext[0] != '.' || (ext[1] | 0x20) != 'm' || (ext[2] | 0x20) != 'p' || ext[3] != '3') return false;
+    for (const char *p = name; *p; ++p)
+        if ((unsigned char)*p < 0x20 || strchr("/\\:*?\"<>|", *p)) return false;
+    return true;
+}

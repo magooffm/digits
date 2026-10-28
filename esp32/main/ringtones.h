@@ -20,8 +20,8 @@
 #define RINGTONE_LAST_CLIP 99
 #define RINGTONE_MAX_CLIPS 32
 #define RINGTONE_NAME_BYTES 52
-#define RINGTONE_FIRST_LOCAL 101 // Selector position 1; position N is 100 + N.
-#define RINGTONE_LOCAL_SLOTS 12
+#define RINGTONE_FIRST_LOCAL 101 // SD card library song 1; song N is 100 + N.
+#define RINGTONE_LOCAL_SLOTS 32  // Songs in the SD card library.
 
 typedef struct {
     uint16_t id;          // RINGTONE_FIRST_CLIP..RINGTONE_LAST_CLIP
@@ -46,10 +46,11 @@ typedef void (*ringtones_stream_fn)(unsigned slot, uint32_t position, int16_t *m
 // Registers local ringtone slot 0..RINGTONE_LOCAL_SLOTS-1 (id
 // RINGTONE_FIRST_LOCAL + slot), `frames` long at 48 kHz. Rendering fades its
 // first and last RINGTONE_LOCAL_FADE_FRAMES. Safe while players render: a
-// slot becomes valid only once complete. A slot can be set once.
+// slot becomes valid only once complete. Only an empty (or cleared) slot can
+// be set; all slots must share one stream function.
 #define RINGTONE_LOCAL_FADE_FRAMES 240 // 5 ms.
 bool ringtones_set_local(unsigned slot, uint32_t frames, const char *name, ringtones_stream_fn stream);
-// Withdraws a slot (its file became unreadable); later calls fall back.
+// Withdraws a slot (file deleted or unreadable); later calls fall back.
 void ringtones_clear_local(unsigned slot);
 
 // Parses the song table and builds the shared waveform tables. Returns false

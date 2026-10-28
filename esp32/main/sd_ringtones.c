@@ -8,6 +8,8 @@
 #include "sd_card.h"
 #include "sd_ringtone_util.h"
 #include <dirent.h>
+#include <strings.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,10 +26,9 @@
 #define TAG "sd_ringtones"
 #define FOLDER DIGITS_SD_MOUNT_POINT "/ringtones"
 #define GREETING_NAME "greeting.mp3"
-#define GREETING_PATH DIGITS_SD_MOUNT_POINT "/voicemail/" GREETING_NAME
+#define GREETING_PATH DIGITS_SD_GREETING_PATH
 #define GREETING_SLOT RINGTONE_LOCAL_SLOTS // After the ringtone positions.
 #define SLOTS (RINGTONE_LOCAL_SLOTS + 1)
-#define POSITIONS CONFIG_DIGITS_PHONE_SELECTOR_POSITIONS
 #define HEAD_BYTES 8192   // Enough to find the first frame and its Xing header.
 #define READ_BYTES 4096
 #define FIRST_OUTPUT_BYTES (1152 * 2 * 2) // One stereo MP3 frame; grows if needed.
@@ -360,20 +361,24 @@ static uint32_t measure(unsigned slot, uint32_t *rate_out)
     return ok && frames >= RINGTONE_SAMPLE_RATE / 10 && frames <= UINT32_MAX ? (uint32_t)frames : 0;
 }
 
-static void add(unsigned slot)
+// Registers library slot from names[slot]; false if it is not a playable MP3.
+static bool add(unsigned slot)
 {
     const char *name = names[slot];
     uint32_t rate = 0, frames = measure(slot, &rate);
-    if (!frames) {
-        ESP_LOGE(TAG, "%s: not a playable MP3; position %u keeps its mapped ringtone", name, slot + 1);
-        return;
+    if (!frames || !ringtones_set_local(slot, frames, name, stream)) {
+        ESP_LOGE(TAG, "%s: not a playable MP3; not in the library", name);
+        return false;
     }
-    ringtones_set_local(slot, frames, name, stream);
-    ESP_LOGI(TAG, "Position %u: %s, %u:%02u at %u Hz", slot + 1, name,
+    ESP_LOGI(TAG, "Song %u: %s, %u:%02u at %u Hz", slot + 1, name,
              (unsigned)(frames / RINGTONE_SAMPLE_RATE / 60), (unsigned)(frames / RINGTONE_SAMPLE_RATE % 60),
              (unsigned)rate);
+    return true;
 }
 
+static int by_name(const void *a, const void *b) { return strcasecmp(a, b); }
+
+// Every MP3 in the folder, alphabetically, under its own name.
 static void scan(void)
 {
     DIR *dir = opendir(FOLDER);
@@ -382,26 +387,28 @@ static void scan(void)
         __atomic_store_n(&state, STATE_NO_FOLDER, __ATOMIC_RELAXED);
         return;
     }
+    enum { FOUND_MAX = 2 * RINGTONE_LOCAL_SLOTS };
+    char (*found)[RINGTONE_NAME_BYTES] = heap_caps_calloc(FOUND_MAX, RINGTONE_NAME_BYTES, MALLOC_CAP_SPIRAM);
+    unsigned count = 0;
     struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        if (entry->d_type == DT_DIR) continue;
-        int position = sd_ringtone_position(entry->d_name, POSITIONS);
-        if (position < 0) {
-            if (entry->d_name[0] != '.')
-                ESP_LOGW(TAG, "Ignored %s: expected ringtone-01.mp3 to ringtone-%02u.mp3",
-                         entry->d_name, (unsigned)POSITIONS);
+    while (found && (entry = readdir(dir))) {
+        if (entry->d_type == DT_DIR || entry->d_name[0] == '.') continue;
+        if (!sd_ringtone_name_valid(entry->d_name, RINGTONE_NAME_BYTES)) {
+            ESP_LOGW(TAG, "Ignored %s: not an .mp3 name of up to %u characters", entry->d_name,
+                     RINGTONE_NAME_BYTES - 1);
             continue;
         }
-        if (names[position][0]) {
-            ESP_LOGW(TAG, "Ignored %s: %s already covers position %d", entry->d_name,
-                     names[position], position + 1);
-            continue;
-        }
-        snprintf(names[position], RINGTONE_NAME_BYTES, "%.*s", RINGTONE_NAME_BYTES - 1, entry->d_name);
+        if (count < FOUND_MAX) snprintf(found[count++], RINGTONE_NAME_BYTES, "%.*s", RINGTONE_NAME_BYTES - 1, entry->d_name);
     }
     closedir(dir);
-    for (unsigned slot = 0; slot < RINGTONE_LOCAL_SLOTS; ++slot)
-        if (names[slot][0]) add(slot);
+    if (found) qsort(found, count, RINGTONE_NAME_BYTES, by_name);
+    if (count > RINGTONE_LOCAL_SLOTS)
+        ESP_LOGW(TAG, "%u songs on the card; the library keeps the first %u", count, RINGTONE_LOCAL_SLOTS);
+    for (unsigned slot = 0; slot < count && slot < RINGTONE_LOCAL_SLOTS; ++slot) {
+        memcpy(names[slot], found[slot], RINGTONE_NAME_BYTES);
+        if (!add(slot)) names[slot][0] = '\0';
+    }
+    heap_caps_free(found);
     __atomic_store_n(&state, STATE_READY, __ATOMIC_RELAXED);
 }
 
@@ -419,6 +426,78 @@ static void add_greeting(void)
     ESP_LOGI(TAG, "Answering machine greeting: voicemail/%s, %u:%02u at %u Hz", GREETING_NAME,
              (unsigned)(frames / RINGTONE_SAMPLE_RATE / 60), (unsigned)(frames / RINGTONE_SAMPLE_RATE % 60),
              (unsigned)rate);
+}
+
+// Stops whatever the streamer decodes, so a file can change under it.
+static void cancel_stream(void)
+{
+    portENTER_CRITICAL(&request_mux);
+    ++request.generation;
+    portEXIT_CRITICAL(&request_mux);
+    player.slot = -1;
+    if (streamer) xTaskNotifyGive(streamer);
+    vTaskDelay(pdMS_TO_TICKS(50)); // Let the decoder see it and close the file.
+}
+
+int digits_sd_ringtone_find(const char *name)
+{
+    for (unsigned slot = 0; slot < RINGTONE_LOCAL_SLOTS; ++slot)
+        if (names[slot][0] && !strcasecmp(names[slot], name) && ringtones_valid(RINGTONE_FIRST_LOCAL + slot))
+            return (int)(RINGTONE_FIRST_LOCAL + slot);
+    return -1;
+}
+
+bool digits_sd_ringtone_file(unsigned id, char *out, size_t capacity)
+{
+    unsigned slot = id - RINGTONE_FIRST_LOCAL;
+    if (id < RINGTONE_FIRST_LOCAL || slot >= RINGTONE_LOCAL_SLOTS || !names[slot][0]) return false;
+    int n = snprintf(out, capacity, "%s/%s", FOLDER, names[slot]);
+    return n > 0 && (size_t)n < capacity;
+}
+
+esp_err_t digits_sd_ringtone_added(const char *name, unsigned *id)
+{
+    if (!pcm_buffer || !sd_ringtone_name_valid(name, RINGTONE_NAME_BYTES)) return ESP_ERR_INVALID_ARG;
+    int slot = -1;
+    for (unsigned i = 0; i < RINGTONE_LOCAL_SLOTS && slot < 0; ++i)
+        if (names[i][0] && !strcasecmp(names[i], name)) slot = (int)i; // Replaced: same number.
+    for (unsigned i = 0; i < RINGTONE_LOCAL_SLOTS && slot < 0; ++i)
+        if (!names[i][0]) slot = (int)i;
+    if (slot < 0) return ESP_ERR_NO_MEM;
+    cancel_stream();
+    ringtones_clear_local((unsigned)slot);
+    snprintf(names[slot], RINGTONE_NAME_BYTES, "%s", name);
+    if (!add((unsigned)slot)) {
+        names[slot][0] = '\0';
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    __atomic_store_n(&state, STATE_READY, __ATOMIC_RELAXED);
+    if (id) *id = RINGTONE_FIRST_LOCAL + (unsigned)slot;
+    return ESP_OK;
+}
+
+esp_err_t digits_sd_ringtone_delete(unsigned id)
+{
+    char path[sizeof(FOLDER) + RINGTONE_NAME_BYTES + 1];
+    if (!digits_sd_ringtone_file(id, path, sizeof(path))) return ESP_ERR_NOT_FOUND;
+    unsigned slot = id - RINGTONE_FIRST_LOCAL;
+    cancel_stream();
+    ringtones_clear_local(slot);
+    names[slot][0] = '\0';
+    ESP_LOGI(TAG, "Deleted %s", path);
+    return unlink(path) ? ESP_FAIL : ESP_OK;
+}
+
+esp_err_t digits_sd_greeting_reload(void)
+{
+    if (!pcm_buffer) return ESP_ERR_INVALID_STATE;
+    cancel_stream();
+    __atomic_store_n(&greeting_frames, 0, __ATOMIC_RELAXED);
+    names[GREETING_SLOT][0] = '\0';
+    struct stat info;
+    if (stat(GREETING_PATH, &info)) return ESP_OK;
+    add_greeting();
+    return digits_sd_greeting_frames() ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
 }
 
 uint32_t digits_sd_greeting_frames(void)
@@ -475,6 +554,11 @@ const char *digits_sd_ringtones_status(void)
 
 esp_err_t digits_sd_ringtones_start(void) { return ESP_OK; }
 const char *digits_sd_ringtones_status(void) { return "disabled"; }
+int digits_sd_ringtone_find(const char *name) { return -1; }
+bool digits_sd_ringtone_file(unsigned id, char *out, size_t capacity) { return false; }
+esp_err_t digits_sd_ringtone_added(const char *name, unsigned *id) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t digits_sd_ringtone_delete(unsigned id) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t digits_sd_greeting_reload(void) { return ESP_ERR_NOT_SUPPORTED; }
 uint32_t digits_sd_greeting_frames(void) { return 0; }
 
 vm_prompt_read_t digits_sd_greeting_read(uint32_t position, int16_t *mono, size_t frames)

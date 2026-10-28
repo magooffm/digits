@@ -9,6 +9,7 @@
 #include "ringtones.h"
 #include "ring_select.h"
 #include "sd_ringtones.h"
+#include "sd_ringtone_util.h"
 #include "silence.h"
 #include "setup.h"
 #include "ring_test.h"
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
@@ -48,6 +50,7 @@ static const int selector_gpios[PHONE_CALL_TARGETS] = {
     CONFIG_DIGITS_PHONE_SELECTOR_C_GPIO,
 };
 #define MAP_KEY "posmap"
+#define FILES_KEY "posfiles"
 #define SELECTOR_POSITIONS CONFIG_DIGITS_PHONE_SELECTOR_POSITIONS
 #define SELECTOR_POLL_DIVIDER 5 // Read analog selectors every 50 ms.
 #define SELECTOR_SAMPLES 4
@@ -62,7 +65,10 @@ static struct {
     uint8_t ringtones[PHONE_CALL_TARGETS]; // How the callee's phone rings.
     uint8_t selector[PHONE_CALL_TARGETS];  // Local selector position, 0-based.
     bool selector_hardware[PHONE_CALL_TARGETS];
-    ring_select_map_t map;                 // Position -> ringtone on this phone.
+    ring_select_map_t map;                 // Position -> built-in ringtone on this phone.
+    // Position -> SD card library song by file name ("" none). A song that
+    // exists wins over the built-in one; numbers change, names do not.
+    char files[RING_SELECT_MAX_POSITIONS][RINGTONE_NAME_BYTES];
     int preview_request; // Ringtone to preview, or -1.
     int sim_hook; // -1 none pending, 0 replace, 1 lift.
     uint32_t sim_presses[PHONE_CALL_TARGETS];
@@ -129,6 +135,8 @@ static bool valid_number(const char *number)
     return true;
 }
 
+static esp_err_t store_files(void);
+
 static void load_numbers(void)
 {
     char numbers[PHONE_CALL_TARGETS][NUMBER_CAPACITY] = {{0}};
@@ -166,15 +174,31 @@ static void load_numbers(void)
             map = stored;
         }
     }
+    static char files[RING_SELECT_MAX_POSITIONS][RINGTONE_NAME_BYTES];
+    size_t files_length = sizeof(files);
+    bool files_stored = err == ESP_OK && nvs_get_blob(nvs, FILES_KEY, files, &files_length) == ESP_OK &&
+                        files_length == sizeof(files);
     if (err == ESP_OK) nvs_close(nvs);
     else if (err != ESP_ERR_NVS_NOT_FOUND)
         ESP_LOGW(TAG, "Call button storage unavailable: %s; using build defaults", esp_err_to_name(err));
+    if (!files_stored) {
+        // Before the library, ringtone-NN.mp3 played on position NN: keep that once.
+        memset(files, 0, sizeof(files));
+        for (unsigned id = RINGTONE_FIRST_LOCAL; id < RINGTONE_FIRST_LOCAL + RINGTONE_LOCAL_SLOTS; ++id) {
+            const char *name = ringtones_valid(id) ? ringtones_name(id) : NULL;
+            int position = name ? sd_ringtone_position(name, map.positions) : -1;
+            if (position >= 0 && !files[position][0]) snprintf(files[position], RINGTONE_NAME_BYTES, "%s", name);
+        }
+    }
+    for (unsigned i = 0; i < RING_SELECT_MAX_POSITIONS; ++i) files[i][RINGTONE_NAME_BYTES - 1] = '\0';
     portENTER_CRITICAL(&shared_mux);
     memcpy(shared.numbers, numbers, sizeof(numbers));
     memcpy(shared.ringtones, ringtones, sizeof(ringtones));
     memcpy(shared.selector, selector, sizeof(selector));
     shared.map = map;
+    memcpy(shared.files, files, sizeof(files));
     portEXIT_CRITICAL(&shared_mux);
+    if (!files_stored && store_files() != ESP_OK) ESP_LOGW(TAG, "Saving ringtone choices failed");
 }
 
 static esp_err_t store_u8(const char *key, uint8_t value)
@@ -186,6 +210,37 @@ static esp_err_t store_u8(const char *key, uint8_t value)
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     return err;
+}
+
+static esp_err_t store_files(void)
+{
+    static char files[RING_SELECT_MAX_POSITIONS][RINGTONE_NAME_BYTES];
+    portENTER_CRITICAL(&shared_mux);
+    memcpy(files, shared.files, sizeof(files));
+    portEXIT_CRITICAL(&shared_mux);
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(nvs, FILES_KEY, files, sizeof(files));
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+// The map with library songs filled in where their files exist.
+static void effective_map(ring_select_map_t *map)
+{
+    portENTER_CRITICAL(&shared_mux);
+    *map = shared.map;
+    portEXIT_CRITICAL(&shared_mux);
+    for (unsigned p = 0; p < map->positions; ++p) {
+        char name[RINGTONE_NAME_BYTES];
+        portENTER_CRITICAL(&shared_mux);
+        memcpy(name, shared.files[p], sizeof(name));
+        portEXIT_CRITICAL(&shared_mux);
+        int id = name[0] ? digits_sd_ringtone_find(name) : -1;
+        if (id >= 0) map->ringtone[p] = (uint8_t)id;
+    }
 }
 
 static esp_err_t store_map(const ring_select_map_t *map)
@@ -210,8 +265,8 @@ static unsigned resolve_ringtone(const char *caller, int offered)
             position = shared.selector[i];
             break;
         }
-    map = shared.map;
     portEXIT_CRITICAL(&shared_mux);
+    effective_map(&map);
     return ring_select_resolve(&map, position, offered, ringtones_valid);
 }
 
@@ -479,7 +534,7 @@ static void phone_task(void *arg)
             } else if (!hold_used[i] && now - held_since[i] >= SETUP_HOLD_US) {
                 hold_used[i] = true;
                 ESP_LOGI(TAG, "Call button %s held: opening the setup network", target_names[i]);
-                digits_setup_open("call button held", true);
+                digits_setup_request("call button held");
                 digits_ring_test_request(); // Short ring as confirmation.
             }
         }
@@ -517,6 +572,118 @@ esp_err_t digits_phone_start(void)
     return ESP_OK;
 }
 
+// ---- Settings API (console and web page) ----------------------------------
+
+void digits_phone_config(digits_phone_config_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->buttons = HOOK_IS_TOGGLE ? 2 : PHONE_CALL_TARGETS; // Board keys: KEY2 and KEY3 only.
+    portENTER_CRITICAL(&shared_mux);
+    for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {
+        memcpy(out->button[i].number, shared.numbers[i], NUMBER_CAPACITY);
+        out->button[i].ringtone = shared.ringtones[i];
+        out->button[i].selector = shared.selector[i];
+        out->button[i].selector_hardware = shared.selector_hardware[i];
+    }
+    out->map = shared.map;
+    memcpy(out->file, shared.files, sizeof(out->file));
+    out->off_hook = shared.off_hook;
+    portEXIT_CRITICAL(&shared_mux);
+    ring_select_map_t effective;
+    effective_map(&effective);
+    memcpy(out->effective, effective.ringtone, sizeof(out->effective));
+    for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i)
+        out->button[i].rings_here = effective.ringtone[out->button[i].selector];
+}
+
+esp_err_t digits_phone_set_number(unsigned button, const char *number)
+{
+    if (button >= PHONE_CALL_TARGETS || !number || (number[0] && !valid_number(number))) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = store_number(button, number[0] ? number : NULL);
+    if (err != ESP_OK) return err;
+    portENTER_CRITICAL(&shared_mux);
+    snprintf(shared.numbers[button], NUMBER_CAPACITY, "%s", number[0] ? number : default_numbers[button]);
+    portEXIT_CRITICAL(&shared_mux);
+    return ESP_OK;
+}
+
+esp_err_t digits_phone_set_ringtone(unsigned button, unsigned ringtone)
+{
+    if (button >= PHONE_CALL_TARGETS || !ringtones_sendable(ringtone)) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = store_ringtone(button, (uint8_t)ringtone);
+    if (err != ESP_OK) return err;
+    portENTER_CRITICAL(&shared_mux);
+    shared.ringtones[button] = (uint8_t)ringtone;
+    portEXIT_CRITICAL(&shared_mux);
+    return ESP_OK;
+}
+
+esp_err_t digits_phone_set_selector(unsigned button, unsigned position)
+{
+    portENTER_CRITICAL(&shared_mux);
+    bool hardware = button < PHONE_CALL_TARGETS && shared.selector_hardware[button];
+    unsigned positions = shared.map.positions;
+    portEXIT_CRITICAL(&shared_mux);
+    if (button >= PHONE_CALL_TARGETS || position >= positions) return ESP_ERR_INVALID_ARG;
+    if (hardware) return ESP_ERR_NOT_SUPPORTED;
+    esp_err_t err = store_u8(selector_keys[button], (uint8_t)position);
+    if (err != ESP_OK) return err;
+    portENTER_CRITICAL(&shared_mux);
+    shared.selector[button] = (uint8_t)position;
+    portEXIT_CRITICAL(&shared_mux);
+    return ESP_OK;
+}
+
+esp_err_t digits_phone_set_position(unsigned position, unsigned ringtone)
+{
+    portENTER_CRITICAL(&shared_mux);
+    ring_select_map_t map = shared.map;
+    portEXIT_CRITICAL(&shared_mux);
+    bool song = ringtone >= RINGTONE_FIRST_LOCAL;
+    if (position >= map.positions || (song ? !ringtones_valid(ringtone) : !ringtones_sendable(ringtone)))
+        return ESP_ERR_INVALID_ARG;
+    if (song) { // Saved by name; the built-in choice stays underneath as the fallback.
+        portENTER_CRITICAL(&shared_mux);
+        snprintf(shared.files[position], RINGTONE_NAME_BYTES, "%s", ringtones_name(ringtone));
+        portEXIT_CRITICAL(&shared_mux);
+        return store_files();
+    }
+    map.ringtone[position] = (uint8_t)ringtone;
+    esp_err_t err = store_map(&map);
+    if (err != ESP_OK) return err;
+    portENTER_CRITICAL(&shared_mux);
+    shared.map = map;
+    bool had_song = shared.files[position][0];
+    shared.files[position][0] = '\0';
+    portEXIT_CRITICAL(&shared_mux);
+    return had_song ? store_files() : ESP_OK;
+}
+
+esp_err_t digits_phone_forget_song(const char *name)
+{
+    bool changed = false;
+    portENTER_CRITICAL(&shared_mux);
+    for (unsigned p = 0; p < RING_SELECT_MAX_POSITIONS; ++p)
+        if (shared.files[p][0] && !strcasecmp(shared.files[p], name)) {
+            shared.files[p][0] = '\0';
+            changed = true;
+        }
+    portEXIT_CRITICAL(&shared_mux);
+    return changed ? store_files() : ESP_OK;
+}
+
+esp_err_t digits_phone_preview(unsigned ringtone)
+{
+    if (!ringtones_valid(ringtone)) return ESP_ERR_INVALID_ARG;
+    digits_webrtc_call_state_t call;
+    digits_webrtc_call_state(&call);
+    portENTER_CRITICAL(&shared_mux);
+    bool idle = !shared.off_hook && call.phase == DIGITS_CALL_IDLE;
+    if (idle) shared.preview_request = (int)ringtone;
+    portEXIT_CRITICAL(&shared_mux);
+    return idle ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
 static int parse_target(const char *text)
 {
     if (!text || strlen(text) != 1) return -1;
@@ -537,6 +704,8 @@ static void print_status(void)
     memcpy(hardware, shared.selector_hardware, sizeof(hardware));
     ring_select_map_t map = shared.map;
     portEXIT_CRITICAL(&shared_mux);
+    ring_select_map_t effective;
+    effective_map(&effective);
     digits_webrtc_call_state_t call;
     digits_webrtc_call_state(&call);
     printf("Phone: %s, handset %s, inputs %s (%s)\n", started ? "running" : "stopped",
@@ -554,8 +723,7 @@ static void print_status(void)
         printf("Call button %s: %s, rings their phone with %u (%s)\n", target_names[i],
                numbers[i][0] ? numbers[i] : "unset", ringtones[i], ringtones_name(ringtones[i]));
         unsigned position = selector[i];
-        unsigned local = map.ringtone[position];
-        if (ringtones_valid(RINGTONE_FIRST_LOCAL + position)) local = RINGTONE_FIRST_LOCAL + position;
+        unsigned local = effective.ringtone[position];
         printf("  their calls ring here: selector %u/%u (%s) = %u (%s%s)\n", position + 1,
                map.positions, hardware[i] ? "switch" : "console", local,
                local >= RINGTONE_FIRST_LOCAL ? "SD card: " : "",
@@ -568,12 +736,18 @@ static void print_positions(void)
     portENTER_CRITICAL(&shared_mux);
     ring_select_map_t map = shared.map;
     portEXIT_CRITICAL(&shared_mux);
+    ring_select_map_t effective;
+    effective_map(&effective);
     for (unsigned p = 0; p < map.positions; ++p) {
         uint8_t ringtone = map.ringtone[p];
         printf("%2u  %u %s", p + 1, ringtone,
                ringtones_name(ringtone) ? ringtones_name(ringtone) : "(missing: falls back)");
-        if (ringtones_valid(RINGTONE_FIRST_LOCAL + p))
-            printf("  -> plays SD card %s instead", ringtones_name(RINGTONE_FIRST_LOCAL + p));
+        char file[RINGTONE_NAME_BYTES];
+        portENTER_CRITICAL(&shared_mux);
+        memcpy(file, shared.files[p], sizeof(file));
+        portEXIT_CRITICAL(&shared_mux);
+        if (effective.ringtone[p] >= RINGTONE_FIRST_LOCAL) printf("  -> plays SD card %s instead", file);
+        else if (file[0]) printf("  (SD card %s is missing)", file);
         printf("\n");
     }
 }
@@ -611,26 +785,20 @@ int digits_phone_console(int argc, char **argv)
             printf("Number must be 1-%d digits\n", NUMBER_CAPACITY - 1);
             return 1;
         }
-        esp_err_t err = store_number((unsigned)target, argv[3]);
+        esp_err_t err = digits_phone_set_number((unsigned)target, argv[3]);
         if (err != ESP_OK) {
             printf("Saving failed: %s\n", esp_err_to_name(err));
             return 1;
         }
-        portENTER_CRITICAL(&shared_mux);
-        snprintf(shared.numbers[target], NUMBER_CAPACITY, "%s", argv[3]);
-        portEXIT_CRITICAL(&shared_mux);
         printf("Call button %s now calls %s (saved)\n", target_names[target], argv[3]);
         return 0;
     }
     if (!strcmp(verb, "clear") && argc == 3 && target >= 0) {
-        esp_err_t err = store_number((unsigned)target, NULL);
+        esp_err_t err = digits_phone_set_number((unsigned)target, "");
         if (err != ESP_OK) {
             printf("Clearing failed: %s\n", esp_err_to_name(err));
             return 1;
         }
-        portENTER_CRITICAL(&shared_mux);
-        snprintf(shared.numbers[target], NUMBER_CAPACITY, "%s", default_numbers[target]);
-        portEXIT_CRITICAL(&shared_mux);
         printf("Call button %s reset to build default: %s\n", target_names[target],
                default_numbers[target][0] ? default_numbers[target] : "unset");
         return 0;
@@ -658,8 +826,7 @@ int digits_phone_console(int argc, char **argv)
         printf("SD card: %s\n", digits_sd_ringtones_status());
         for (unsigned id = RINGTONE_FIRST_LOCAL; id < RINGTONE_FIRST_LOCAL + RINGTONE_LOCAL_SLOTS; ++id)
             if (ringtones_valid(id))
-                printf("%3u  %s  (SD card, position %u, %.1f s)\n", id, ringtones_name(id),
-                       id - RINGTONE_FIRST_LOCAL + 1,
+                printf("%3u  %s  (SD card, %.1f s)\n", id, ringtones_name(id),
                        (double)ringtones_melody_frames(id) / RINGTONE_SAMPLE_RATE);
         return 0;
     }
@@ -669,14 +836,11 @@ int digits_phone_console(int argc, char **argv)
             printf("Unknown ringtone; see 'phone ringtones'\n");
             return 1;
         }
-        esp_err_t err = store_ringtone((unsigned)target, (uint8_t)ringtone);
+        esp_err_t err = digits_phone_set_ringtone((unsigned)target, ringtone);
         if (err != ESP_OK) {
             printf("Saving failed: %s\n", esp_err_to_name(err));
             return 1;
         }
-        portENTER_CRITICAL(&shared_mux);
-        shared.ringtones[target] = (uint8_t)ringtone;
-        portEXIT_CRITICAL(&shared_mux);
         printf("Calls from button %s now ring with %u (%s) (saved)\n", target_names[target],
                ringtone, ringtones_name(ringtone));
         return 0;
@@ -707,19 +871,15 @@ int digits_phone_console(int argc, char **argv)
             printf("Position must be 1-%u\n", map.positions);
             return 1;
         }
-        if (!parse_ringtone(argv[3], false, &ringtone)) {
+        if (!parse_ringtone(argv[3], true, &ringtone)) {
             printf("Unknown ringtone; see 'phone ringtones'\n");
             return 1;
         }
-        map.ringtone[position] = (uint8_t)ringtone;
-        esp_err_t err = store_map(&map);
+        esp_err_t err = digits_phone_set_position(position, ringtone);
         if (err != ESP_OK) {
             printf("Saving failed: %s\n", esp_err_to_name(err));
             return 1;
         }
-        portENTER_CRITICAL(&shared_mux);
-        shared.map = map;
-        portEXIT_CRITICAL(&shared_mux);
         printf("Selector position %u now rings with %u (%s) (saved)\n", position + 1, ringtone,
                ringtones_name(ringtone));
         return 0;
@@ -729,21 +889,15 @@ int digits_phone_console(int argc, char **argv)
             printf("Position must be 1-%u\n", map.positions);
             return 1;
         }
-        portENTER_CRITICAL(&shared_mux);
-        bool hardware = shared.selector_hardware[target];
-        portEXIT_CRITICAL(&shared_mux);
-        if (hardware) {
+        esp_err_t err = digits_phone_set_selector((unsigned)target, position);
+        if (err == ESP_ERR_NOT_SUPPORTED) {
             printf("Selector %s is a physical switch; turn it instead\n", target_names[target]);
             return 1;
         }
-        esp_err_t err = store_u8(selector_keys[target], (uint8_t)position);
         if (err != ESP_OK) {
             printf("Saving failed: %s\n", esp_err_to_name(err));
             return 1;
         }
-        portENTER_CRITICAL(&shared_mux);
-        shared.selector[target] = (uint8_t)position;
-        portEXIT_CRITICAL(&shared_mux);
         printf("Selector %s set to position %u (saved)\n", target_names[target], position + 1);
         return 0;
     }
@@ -763,7 +917,16 @@ int digits_phone_console(int argc, char **argv)
 
 #else
 
+#include <string.h>
+
 esp_err_t digits_phone_start(void) { return ESP_OK; }
+void digits_phone_config(digits_phone_config_t *out) { memset(out, 0, sizeof(*out)); }
+esp_err_t digits_phone_set_number(unsigned button, const char *number) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t digits_phone_set_ringtone(unsigned button, unsigned ringtone) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t digits_phone_set_selector(unsigned button, unsigned position) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t digits_phone_set_position(unsigned position, unsigned ringtone) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t digits_phone_forget_song(const char *name) { return ESP_OK; }
+esp_err_t digits_phone_preview(unsigned ringtone) { return ESP_ERR_NOT_SUPPORTED; }
 
 int digits_phone_console(int argc, char **argv)
 {

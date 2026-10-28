@@ -34,3 +34,8 @@ size_t sd_ringtone_first_sound(const int16_t *pcm, size_t count);
 
 // Multiplies by percent / 100 (1..100), rounding toward zero.
 void sd_ringtone_scale(int16_t *pcm, size_t count, unsigned percent);
+
+// A ringtone file name the library accepts for uploads: 1 to max_length-1
+// bytes, ending in .mp3 (any case), no path separators, characters FAT
+// forbids or control characters, not starting with a dot.
+bool sd_ringtone_name_valid(const char *name, size_t max_length);

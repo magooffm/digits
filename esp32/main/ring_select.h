@@ -27,11 +27,11 @@ void ring_select_default_map(ring_select_map_t *map, unsigned positions,
 bool ring_select_sanitize(ring_select_map_t *map);
 
 // The ringtone to play. offered is the caller's choice or -1 for none;
-// valid() reports which ringtones this phone has. A local ringtone for the
-// position (RINGTONE_FIRST_LOCAL + position, from the SD card) wins over the
-// map. A selected ringtone that is missing, or no selector for this caller
-// (position < 0), falls back to the caller's choice, then to the standard
-// ring.
+// valid() reports which ringtones this phone has. The map may hold SD card
+// library songs (RINGTONE_FIRST_LOCAL and up; phone.c fills them in from the
+// saved file names). A selected ringtone that is missing, or no selector for
+// this caller (position < 0), falls back to the caller's choice, then to the
+// standard ring.
 unsigned ring_select_resolve(const ring_select_map_t *map, int position, int offered,
                              bool (*valid)(unsigned ringtone));
 

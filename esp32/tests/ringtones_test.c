@@ -107,6 +107,12 @@ static void fake_stream(unsigned slot, uint32_t position, int16_t *mono, size_t 
     for (size_t i = 0; i < frames; ++i) mono[i] = stream_sample(position + (uint32_t)i);
 }
 
+static void other_stream(unsigned slot, uint32_t position, int16_t *mono, size_t frames)
+{
+    (void)slot; (void)position;
+    memset(mono, 0, frames * sizeof(*mono));
+}
+
 static void test_locals(void)
 {
     const unsigned id = RINGTONE_FIRST_LOCAL + 2;
@@ -115,7 +121,7 @@ static void test_locals(void)
     assert(!ringtones_set_local(2, 0, "x", fake_stream));
     assert(!ringtones_set_local(2, 48000, "x", NULL));
     assert(ringtones_set_local(2, 48000, "ringtone-03.mp3", fake_stream));
-    assert(!ringtones_set_local(2, 100, "again", fake_stream)); // Set once.
+    assert(!ringtones_set_local(2, 100, "again", fake_stream)); // Not while in use.
     assert(ringtones_valid(id) && !ringtones_sendable(id));
     assert(!ringtones_valid(id + 1));
     assert(ringtones_sendable(0) && !ringtones_sendable(RINGTONE_FIRST_LOCAL - 1));
@@ -141,7 +147,11 @@ static void test_locals(void)
 
     ringtones_clear_local(2); // File gone: callers fall back from now on.
     assert(!ringtones_valid(id) && ringtones_melody_frames(id) == 0);
-    assert(!ringtones_set_local(2, 48000, "reuse", fake_stream));
+    // A cleared slot takes the next song (an upload), with the same stream only.
+    assert(!ringtones_set_local(2, 48000, "other", other_stream));
+    assert(ringtones_set_local(2, 96000, "new song.mp3", fake_stream));
+    assert(ringtones_valid(id) && ringtones_melody_frames(id) == 96000 && !strcmp(ringtones_name(id), "new song.mp3"));
+    ringtones_clear_local(2);
 }
 
 int main(void)

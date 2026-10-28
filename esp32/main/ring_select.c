@@ -40,7 +40,6 @@ unsigned ring_select_resolve(const ring_select_map_t *map, int position, int off
 {
     unsigned fallback = offered >= 0 && valid((unsigned)offered) ? (unsigned)offered : 0;
     if (position < 0 || (unsigned)position >= map->positions) return fallback;
-    if (valid(RINGTONE_FIRST_LOCAL + (unsigned)position)) return RINGTONE_FIRST_LOCAL + (unsigned)position;
     uint8_t chosen = map->ringtone[position];
     if (!valid(chosen)) return fallback;
     return chosen;

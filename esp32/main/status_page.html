@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Digits phone</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:40em;margin:1.2em auto;padding:0 1em;background:#f6f1e7;color:#2b2620}
+h1{font-size:1.4em;margin:0}h2{font-size:1em;margin:0 0 .5em;color:#6b6257;text-transform:uppercase;letter-spacing:.05em}
+nav{display:flex;flex-wrap:wrap;gap:.3em;margin:.8em 0}
+nav button{background:#e7dfd1;color:#2b2620;border:0;border-radius:4px;padding:.45em .8em;font-size:.95em;cursor:pointer}
+nav button.on{background:#2b2620;color:#f6f1e7}
+section{background:#fffdf8;border:1px solid #ddd3c2;border-radius:6px;padding:.8em 1em;margin:.8em 0}
+dl{display:grid;grid-template-columns:9em 1fr;gap:.3em .8em;margin:0}dt{color:#6b6257}dd{margin:0;word-break:break-word}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:.35em .3em;border-bottom:1px solid #eee5d6;vertical-align:middle}
+input,select{font-size:.95em;padding:.3em;max-width:100%}
+.btn{background:#2b2620;color:#f6f1e7;border:0;border-radius:4px;padding:.35em .7em;cursor:pointer;font-size:.9em}
+.btn.light{background:#e7dfd1;color:#2b2620}
+.btn:disabled,input:disabled{opacity:.45;cursor:not-allowed}
+#songs{width:100%;max-width:26em;font-size:.95em}
+.library{display:flex;flex-wrap:wrap;gap:.8em;align-items:flex-start}
+.library .side{display:flex;flex-direction:column;gap:.5em}
+.ok{color:#3c6e3c}.bad{color:#9b3b2b}.muted{color:#6b6257;font-size:.9em}.new{font-weight:600}
+.warn{background:#fff3d6;border-color:#e8c46a}
+audio{height:2em;max-width:100%}
+#toast{position:fixed;bottom:1em;left:50%;transform:translateX(-50%);background:#2b2620;color:#f6f1e7;padding:.5em 1em;border-radius:4px;display:none}
+</style>
+</head>
+<body>
+<h1 id="title">Digits phone</h1>
+<p class="muted"><span id="firmware"></span> &middot; up <span id="uptime"></span> <span id="login"></span></p>
+<nav id="tabs">
+<button data-tab="status" class="on">Status</button><button data-tab="buttons">Buttons</button>
+<button data-tab="ringtones">Ringtones</button><button data-tab="messages">Messages</button>
+<button data-tab="greeting">Greeting</button><button data-tab="log">Log</button>
+</nav>
+
+<div id="tab-status">
+<section><h2>Line</h2><dl>
+<dt>Number</dt><dd id="number"></dd>
+<dt>Call</dt><dd id="call"></dd>
+<dt>Incoming calls</dt><dd id="silence"></dd>
+<dt>Answering machine</dt><dd id="voicemail"></dd>
+</dl></section>
+<section><h2>Connection</h2><dl>
+<dt>Wi-Fi</dt><dd id="wifi"></dd>
+<dt>Server</dt><dd id="server"></dd>
+</dl></section>
+<section><h2>Device</h2><dl>
+<dt>SD card</dt><dd id="sd"></dd>
+<dt>Internal RAM</dt><dd id="internal"></dd>
+<dt>PSRAM</dt><dd id="psram"></dd>
+</dl></section>
+</div>
+
+<div id="tab-buttons" hidden>
+<section><h2>Call buttons</h2>
+<p class="muted">Who each button calls and how their phone rings. "Rings here" is how their calls
+ring on this phone: the contact's knob picks a position, the Ringtones tab what it plays.</p>
+<table id="buttonlist"></table></section>
+</div>
+
+<div id="tab-ringtones" hidden>
+<section><h2>Knob positions</h2>
+<p class="muted">What each knob position plays: a built-in ringtone or a song from the SD card.
+If a chosen song is deleted, the position goes back to its built-in ringtone.</p>
+<table id="positions"></table></section>
+<section><h2>Songs on the SD card</h2>
+<div class="library">
+<select id="songs" size="8" onchange="pickSong()"></select>
+<div class="side">
+<audio id="songplayer" controls preload="none"></audio>
+<span><button class="btn light write" id="songphone" onclick="act('/api/preview',{id:$('songs').value})">Play on phone</button>
+<button class="btn light write" id="songdelete" onclick="deleteSong()">Delete</button></span>
+</div></div>
+<p class="muted">Add a song (MP3, up to 20 MB, kept under its file name; the same name replaces it):<br>
+<input type="file" id="songfile" class="write" accept=".mp3,audio/mpeg">
+<button class="btn write" id="songupload" onclick="uploadSong()">Upload</button>
+<progress id="songprogress" max="100" value="0" hidden></progress></p>
+<p class="muted" id="card"></p>
+</section>
+</div>
+
+<div id="tab-messages" hidden>
+<section><h2>Messages</h2><div id="messages"></div></section>
+</div>
+
+<div id="tab-greeting" hidden>
+<section><h2>Greeting</h2>
+<p id="greetingstate"></p>
+<p><button class="btn light" onclick="act('/api/greeting-action',{action:'play'})">Play on the phone</button>
+<span id="greetingactions"></span></p>
+<p class="muted">Upload your own (MP3, up to 5 MB, sent at full level to callers):</p>
+<input type="file" id="greetingfile" accept=".mp3,audio/mpeg">
+<button class="btn" onclick="upload('/api/greeting',$('greetingfile'),'greetingprogress')">Upload</button>
+<progress id="greetingprogress" max="100" value="0" hidden></progress>
+</section>
+</div>
+
+<div id="tab-log" hidden>
+<section class="warn"><h2>Log</h2>
+<p>Following the log keeps the phone's network busy. During a call it refreshes only every 15 s,
+but it can still cost a little call quality, so leave it closed when you don't need it.</p>
+<p><a class="btn" href="/logs">Open the live log</a></p></section>
+</div>
+
+<div id="toast"></div>
+<script>
+function $(id){return document.getElementById(id)}
+function esc(t){return String(t).replace(/[&<>"']/g,function(c){return'&#'+c.charCodeAt(0)+';'})}
+function kb(n){return Math.round(n/1024)+' KB'}
+function toast(t){var e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(e.t);e.t=setTimeout(function(){e.style.display='none'},3500)}
+function set(id,text,good){$(id).textContent=text;$(id).className=good===undefined?'':good?'ok':'bad'}
+var cfg=null,tab='status',wait=3000,authorized=false;
+
+// ---- Status
+function show(s){
+  authorized=s.authorized;
+  $('title').textContent='Digits phone '+(s.number||'');
+  $('firmware').textContent=s.firmware;
+  var u=s.uptime_s,d=Math.floor(u/86400),h=Math.floor(u%86400/3600),m=Math.floor(u%3600/60);
+  $('uptime').textContent=(d?d+' d ':'')+h+' h '+m+' min';
+  $('login').innerHTML=s.authorized?'':'&middot; <a href="/login">Log in</a> for settings, messages and caller numbers';
+  set('number',s.number||'not paired',!!s.number);
+  set('call',s.call.phase+(s.call.remote?' with '+s.call.remote:''));
+  set('silence',(s.silence.silent?'silent':'ring')+(s.silence.overridden?' (set on the phone; server says '+(s.silence.server?'silent':'ring')+')':''));
+  set('voicemail',!s.voicemail.ready?'off (no SD card)':s.voicemail.enabled?'answers after '+s.voicemail.timeout_s+' s, '+s.voicemail.unheard+' new':'not enabled for this line, '+s.voicemail.unheard+' new');
+  set('wifi',s.wifi.connected?s.wifi.ssid+', '+s.wifi.rssi+' dBm, '+s.wifi.ip:'not connected',s.wifi.connected);
+  set('server',s.server.url+(s.server.connected?' (connected)':' (not connected)'),s.server.connected);
+  set('sd',s.sd);
+  set('internal',kb(s.memory.internal_free)+' free, lowest '+kb(s.memory.internal_min)+', largest block '+kb(s.memory.internal_largest));
+  set('psram',kb(s.memory.psram_free)+' free');
+}
+function poll(){
+  fetch('/api/status').then(function(r){wait=+r.headers.get('X-Poll-Ms')||3000;return r.json()}).then(show)
+    .catch(function(){$('uptime').textContent='(phone not reachable)'}).then(function(){setTimeout(poll,wait)});
+}
+
+// ---- Actions
+function act(url,fields,after){
+  fetch(url,{method:'POST',body:new URLSearchParams(fields)}).then(function(r){
+    return r.text().then(function(t){toast(r.status==401?'Log in first':t);if(r.ok&&after)after()});
+  }).catch(function(){toast('Phone not reachable')});
+}
+function upload(url,input,progress,after){
+  var f=input.files[0];if(!f){toast('Choose a file first');return}
+  var x=new XMLHttpRequest();x.open('POST',url);$(progress).hidden=false;
+  x.upload.onprogress=function(e){if(e.lengthComputable)$(progress).value=100*e.loaded/e.total};
+  x.onload=function(){$(progress).hidden=true;toast(x.responseText);loadConfig()};
+  x.onerror=function(){$(progress).hidden=true;toast('Upload failed')};
+  x.setRequestHeader('Content-Type','application/octet-stream');x.send(f);
+}
+function need(r){if(r.status==401)throw 'login';return r.json()}
+function locked(id){$(id).innerHTML='<p class="muted"><a href="/login">Log in</a> to see this.</p>'}
+
+// ---- Settings
+function name(id){
+  var r=cfg.ringtones.concat(cfg.library).filter(function(x){return x.id==id})[0];
+  return r?(id>=101?'SD: ':'')+r.name:'#'+id}
+function ringtoneOptions(selected){return cfg.ringtones.map(function(r){
+  return '<option value="'+r.id+'"'+(r.id==selected?' selected':'')+'>'+esc(r.name)+'</option>'}).join('')}
+function positionOptions(p){
+  var builtin=cfg.ringtones.map(function(r){return '<option value="'+r.id+'"'+(!p.file&&r.id==p.builtin?' selected':'')+'>'+esc(r.name)+'</option>'}).join('');
+  var songs=cfg.library.map(function(r){return '<option value="'+r.id+'"'+(p.file&&p.file.toLowerCase()==r.name.toLowerCase()?' selected':'')+'>'+esc(r.name)+'</option>'}).join('');
+  var missing=p.file&&p.plays<101?'<option selected disabled>'+esc(p.file)+' (missing)</option>':'';
+  return missing+'<optgroup label="Built-in">'+builtin+'</optgroup>'+(songs?'<optgroup label="SD card">'+songs+'</optgroup>':'');
+}
+function seconds(s){return Math.floor(s/60)+':'+('0'+s%60).slice(-2)}
+function uploadSong(){
+  var f=$('songfile').files[0];if(!f){toast('Choose a file first');return}
+  if(!/\.mp3$/i.test(f.name)){toast('Only .mp3 files');return}
+  upload('/api/ringtone?name='+encodeURIComponent(f.name),$('songfile'),'songprogress');
+}
+function loadConfig(){
+  fetch('/api/config').then(need).then(function(c){cfg=c;drawButtons();drawPositions();drawGreeting()})
+    .catch(function(e){
+      if(e!='login'){toast('Could not show the settings');console.error(e);return}
+      locked('buttonlist');locked('positions');$('greetingstate').innerHTML='<a href="/login">Log in</a> to see this.'});
+}
+function drawButtons(){
+  var dis=cfg.writable?'':' disabled',rows='<tr><th></th><th>Number</th><th>Their phone rings with</th><th>Rings here</th><th></th></tr>';
+  cfg.buttons.forEach(function(b,i){
+    var knob='knob position '+b.selector; // Set by the knob only.
+    rows+='<tr><td><b>'+b.name+'</b></td><td><input id="num'+i+'" value="'+esc(b.number)+'" size="9" inputmode="numeric"'+dis+'></td>'+
+      '<td><select id="ring'+i+'"'+dis+'>'+ringtoneOptions(b.ringtone)+'</select></td><td>'+knob+'<br><span class="muted">'+esc(name(b.rings_here))+'</span></td>'+
+      '<td>'+(cfg.writable?'<button class="btn" onclick="saveButton('+i+')">Save</button>':'')+'</td></tr>';
+  });
+  $('buttonlist').innerHTML=rows+(cfg.writable?'':'<tr><td colspan="5" class="muted">Read-only: set a setup password in menuconfig to change settings here.</td></tr>');
+}
+function saveButton(i){
+  act('/api/button',{button:i,number:$('num'+i).value.replace(/\D/g,''),ringtone:$('ring'+i).value},loadConfig);
+}
+function drawPositions(){
+  var dis=cfg.writable?'':' disabled',rows='<tr><th>Pos.</th><th>Plays</th></tr>';
+  cfg.positions.forEach(function(p){
+    rows+='<tr><td>'+p.position+'</td><td><select'+dis+' onchange="act(\'/api/position\',{position:'+p.position+',ringtone:this.value},loadConfig)">'+
+      positionOptions(p)+'</select></td></tr>';
+  });
+  $('positions').innerHTML=rows;
+  var keep=$('songs').value;
+  if(!cfg.library.some(function(r){return r.id==keep})&&cfg.library.length)keep=cfg.library[0].id;
+  $('songs').innerHTML=cfg.library.length?cfg.library.map(function(r){
+    return '<option value="'+r.id+'"'+(r.id==keep?' selected':'')+'>'+esc(r.name)+' ('+seconds(r.seconds)+')</option>'}).join('')
+    :'<option disabled>No songs yet</option>';
+  $('card').innerHTML='Card: '+esc(cfg.card)+' &middot; <button class="btn light write" onclick="act(\'/api/stop\',{})">Stop playing</button>';
+  pickSong();
+}
+// One player for the selected song; buttons stay visible, greyed out when read-only.
+function pickSong(){
+  var id=+$('songs').value,chosen=cfg.library.some(function(r){return r.id==id});
+  var src=chosen?'/api/ringtone?id='+id:'';
+  if($('songplayer').getAttribute('src')!=src){if(src)$('songplayer').src=src;else $('songplayer').removeAttribute('src')}
+  Array.prototype.forEach.call(document.querySelectorAll('#tab-ringtones .write'),function(e){e.disabled=!cfg.writable});
+  $('songphone').disabled=$('songdelete').disabled=!cfg.writable||!chosen;
+  $('songplayer').style.opacity=chosen?1:.45;
+}
+function deleteSong(){
+  var r=cfg.library.filter(function(x){return x.id==$('songs').value})[0];
+  if(r&&confirm('Delete '+r.name+'?'))act('/api/ringtone-delete',{id:r.id},loadConfig);
+}
+function drawGreeting(){
+  $('greetingstate').textContent=cfg.greeting.custom?'Your greeting from the SD card ('+cfg.greeting.seconds+' s).':'The built-in greeting.';
+  $('greetingactions').innerHTML=cfg.greeting.custom?'<audio controls preload="none" src="/api/greeting"></audio> '+
+    (cfg.writable?'<button class="btn light" onclick="if(confirm(\'Use the built-in greeting again?\'))act(\'/api/greeting-action\',{action:\'delete\'},loadConfig)">Delete</button>':''):'';
+}
+
+// ---- Messages
+function contact(number){
+  if(cfg)for(var i=0;i<cfg.buttons.length;i++)if(cfg.buttons[i].number==number)return 'Button '+cfg.buttons[i].name+' ('+number+')';
+  return number;
+}
+function loadMessages(){
+  fetch('/api/messages').then(need).then(function(m){
+    if(!m.ready){$('messages').innerHTML='<p class="muted">Answering machine off (no SD card).</p>';return}
+    if(!m.messages.length){$('messages').innerHTML='<p class="muted">No messages.</p>';return}
+    var groups={};m.messages.forEach(function(x){(groups[x.caller]=groups[x.caller]||[]).push(x)});
+    var html='';Object.keys(groups).forEach(function(caller){
+      html+='<h3>'+esc(contact(caller))+'</h3><table>';
+      groups[caller].slice().reverse().forEach(function(x){
+        var when=x.time?new Date(x.time*1000).toLocaleString():'date unknown';
+        html+='<tr><td class="'+(x.heard?'':'new')+'">'+(x.heard?'':'New &middot; ')+esc(when)+'<br><span class="muted">'+x.seconds+' s</span></td>'+
+          '<td><audio controls preload="none" src="/api/message?n='+x.n+'"></audio></td><td>'+
+          '<button class="btn light" onclick="act(\'/api/message\',{n:'+x.n+',action:\'play\'})">Play on phone</button> '+
+          (x.heard?'':'<button class="btn light" onclick="act(\'/api/message\',{n:'+x.n+',action:\'heard\'},loadMessages)">Heard</button> ')+
+          '<button class="btn light" onclick="if(confirm(\'Delete this message?\'))act(\'/api/message\',{n:'+x.n+',action:\'delete\'},loadMessages)">Delete</button></td></tr>';
+      });
+      html+='</table>';
+    });
+    $('messages').innerHTML=html+'<p class="muted">Playing in the browser does not mark a message heard.</p>';
+  }).catch(function(){locked('messages')});
+}
+
+// ---- Tabs
+Array.prototype.forEach.call(document.querySelectorAll('#tabs button'),function(b){b.onclick=function(){
+  tab=b.dataset.tab;Array.prototype.forEach.call(document.querySelectorAll('#tabs button'),function(x){x.className=x==b?'on':''});
+  ['status','buttons','ringtones','messages','greeting','log'].forEach(function(t){$('tab-'+t).hidden=t!=tab});
+  if(tab=='buttons'||tab=='ringtones'||tab=='greeting')loadConfig();
+  if(tab=='messages'){if(!cfg)loadConfig();loadMessages()}
+  history.replaceState(null,'',tab=='status'?'/':'#'+tab);
+}});
+poll();
+var start=document.querySelector('#tabs button[data-tab="'+location.hash.slice(1)+'"]');
+if(start)start.click(); // Bookmarkable tabs: /#messages, /#ringtones, ...
+</script>
+</body>
+</html>

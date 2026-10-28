@@ -196,6 +196,11 @@ static void close_recording(bool keep)
     vm_message_t added;
     lock();
     bool committed = vm_store_commit(&store, rec.caller, &added);
+    if (committed) {
+        // Known now; saves reading the file's end for the message list.
+        for (unsigned i = 0; i < store.count; ++i)
+            if (store.messages[i].number == added.number) store.messages[i].tenths = tenths ? tenths : 1;
+    }
     unlock();
     if (!committed) {
         unlink(temp);
@@ -479,27 +484,87 @@ esp_err_t digits_voicemail_start(void)
 
 // ---- Console --------------------------------------------------------------
 
+// Date and length of one message; tail is a TAIL_BYTES scratch buffer.
+static void message_info(const vm_message_t *m, uint8_t *tail, digits_voicemail_message_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->number = m->number;
+    snprintf(out->caller, sizeof(out->caller), "%s", m->caller);
+    out->heard = m->heard;
+    out->tenths = m->tenths;
+    char path[VM_STORE_PATH_BYTES];
+    struct stat info;
+    if (!vm_store_path(&store, m, path) || stat(path, &info)) return;
+    struct tm local;
+    localtime_r(&info.st_mtime, &local);
+    if (local.tm_year + 1900 >= CLOCK_VALID_YEAR) out->recorded = (int64_t)info.st_mtime;
+    FILE *file = tail && !out->tenths ? fopen(path, "rb") : NULL; // Reads the end once, then cached.
+    if (!file) return;
+    long size = info.st_size < TAIL_BYTES ? (long)info.st_size : TAIL_BYTES;
+    uint64_t granule = 0;
+    if (!fseek(file, -size, SEEK_END) && fread(tail, 1, (size_t)size, file) == (size_t)size &&
+        ogg_last_granule(tail, (size_t)size, &granule) && granule > OGG_OPUS_PRESKIP)
+        out->tenths = (uint32_t)((granule - OGG_OPUS_PRESKIP) * 10 / OGG_OPUS_RATE);
+    fclose(file);
+}
+
 static void describe(const vm_message_t *m, uint8_t *tail)
 {
-    char path[VM_STORE_PATH_BYTES], when[24] = "date unknown";
-    struct stat info;
-    unsigned tenths = 0;
-    if (vm_store_path(&store, m, path) && !stat(path, &info)) {
+    digits_voicemail_message_t info;
+    message_info(m, tail, &info);
+    char when[24] = "date unknown";
+    if (info.recorded) {
+        time_t t = (time_t)info.recorded;
         struct tm local;
-        localtime_r(&info.st_mtime, &local);
-        if (local.tm_year + 1900 >= CLOCK_VALID_YEAR) strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &local);
-        FILE *file = tail ? fopen(path, "rb") : NULL;
-        if (file) {
-            long size = info.st_size < TAIL_BYTES ? (long)info.st_size : TAIL_BYTES;
-            uint64_t granule = 0;
-            if (!fseek(file, -size, SEEK_END) && fread(tail, 1, (size_t)size, file) == (size_t)size &&
-                ogg_last_granule(tail, (size_t)size, &granule) && granule > OGG_OPUS_PRESKIP)
-                tenths = (unsigned)((granule - OGG_OPUS_PRESKIP) * 10 / OGG_OPUS_RATE);
-            fclose(file);
-        }
+        localtime_r(&t, &local);
+        strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &local);
     }
     printf("%6u  %-4s  from %-12s %s  %u.%u s\n", (unsigned)m->number, m->heard ? "" : "new", m->caller, when,
-           tenths / 10, tenths % 10);
+           (unsigned)info.tenths / 10, (unsigned)info.tenths % 10);
+}
+
+unsigned digits_voicemail_list(digits_voicemail_message_t *out, unsigned max)
+{
+    if (!digits_voicemail_ready()) return 0;
+    uint8_t *tail = heap_caps_malloc(TAIL_BYTES, PSRAM);
+    lock();
+    unsigned count = store.count;
+    for (unsigned i = 0; i < count && i < max; ++i) {
+        message_info(&store.messages[i], tail, &out[i]);
+        store.messages[i].tenths = out[i].tenths;
+    }
+    unlock();
+    free(tail);
+    return count;
+}
+
+bool digits_voicemail_file(uint32_t number, char *path, size_t capacity)
+{
+    if (!digits_voicemail_ready() || capacity < VM_STORE_PATH_BYTES) return false;
+    lock();
+    const vm_message_t *m = vm_store_find(&store, number);
+    bool found = m && vm_store_path(&store, m, path);
+    unlock();
+    return found;
+}
+
+esp_err_t digits_voicemail_mark_heard(uint32_t number)
+{
+    if (!digits_voicemail_ready()) return ESP_ERR_INVALID_STATE;
+    lock();
+    bool ok = vm_store_mark_heard(&store, number);
+    unlock();
+    return ok ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t digits_voicemail_delete(uint32_t number)
+{
+    if (!digits_voicemail_ready()) return ESP_ERR_INVALID_STATE;
+    digits_voicemail_stop();
+    lock();
+    bool ok = vm_store_delete(&store, number);
+    unlock();
+    return ok ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 static bool parse_number(const char *text, uint32_t *number)
@@ -605,6 +670,10 @@ esp_err_t digits_voicemail_play(uint32_t number)
 }
 esp_err_t digits_voicemail_play_greeting(void) { return ESP_ERR_NOT_SUPPORTED; }
 void digits_voicemail_stop(void) {}
+unsigned digits_voicemail_list(digits_voicemail_message_t *out, unsigned max) { return 0; }
+bool digits_voicemail_file(uint32_t number, char *path, size_t capacity) { return false; }
+esp_err_t digits_voicemail_mark_heard(uint32_t number) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t digits_voicemail_delete(uint32_t number) { return ESP_ERR_NOT_SUPPORTED; }
 int digits_voicemail_console(int argc, char **argv)
 {
     (void)argc; (void)argv;

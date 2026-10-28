@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Digits phone logs</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#1e1b18;color:#e9e2d4}
+header{padding:.6em 1em;background:#2b2620;position:sticky;top:0}a{color:#e9e2d4}
+pre{margin:0;padding:.6em 1em;font:12px/1.4 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all}
+.W{color:#e8c46a}.E{color:#f08a74}
+</style>
+</head>
+<body>
+<header><a href="/">&larr; Status</a> &middot; recent log, updating live &middot;
+<label><input type="checkbox" id="follow" checked> follow</label>
+<span style="opacity:.7">(every 15 s during calls, to spare the audio)</span></header>
+<pre id="log"></pre>
+<script>
+var since=0,wait=2000,log=document.getElementById('log');
+function add(text){
+  text.split('\n').forEach(function(line,i,all){
+    if(i==all.length-1&&!line)return;
+    var span=document.createElement('span');span.textContent=line+'\n';
+    if(line[0]=='W'||line[0]=='E')span.className=line[0];
+    log.appendChild(span);
+  });
+  while(log.childNodes.length>3000)log.removeChild(log.firstChild);
+  if(document.getElementById('follow').checked)window.scrollTo(0,document.body.scrollHeight);
+}
+function poll(){
+  fetch('/api/log?since='+since).then(function(r){
+    if(!r.ok)throw r.status;
+    since=r.headers.get('X-Log-Next')||since;wait=+r.headers.get('X-Poll-Ms')||2000;return r.text();
+  }).then(function(t){if(t)add(t)}).catch(function(){}).then(function(){setTimeout(poll,wait)});
+}
+poll();
+</script>
+</body>
+</html>

@@ -51,6 +51,65 @@ If using a USB-UART bridge instead of native USB, select UART under
 Component config -> ESP System Settings -> Channel for console output.
 URLs other than `ws://.../ws` fail fast.
 
+### Status page
+
+On the home network the phone serves a page at `http://<its address>/` (the
+address is on the setup page, in `wifi` and in the boot log). Tabs, also as
+bookmarks (`/#messages`):
+
+- **Status.** Number, call state, incoming-call silence and where it comes
+  from, answering machine, Wi-Fi and server, SD card, firmware version,
+  uptime and memory, refreshed every few seconds.
+- **Buttons.** Each call button's number and the ringtone the called phone
+  rings with; how their calls ring here (knob position, settable here while
+  no physical knob is fitted).
+- **Ringtones.** For every knob position one choice: a built-in ringtone or
+  a song from the SD card library (see "Ringtones from the SD card"). Below,
+  the library as one scrollable list with a single player for the selected
+  song: play on the phone, delete, or upload an MP3 (up to 20 MB, kept under
+  its file name). Changes work at once. Without the password these buttons
+  stay visible but greyed out.
+- **Messages.** Grouped by caller (named after the call button with that
+  number): play in the browser (Ogg Opus; current Chrome, Firefox and
+  Safari), play on the phone, mark heard, delete.
+- **Greeting.** Built-in or your own: upload an MP3 (up to 5 MB), listen,
+  play on the phone, delete to go back to the built-in one.
+- **Log.** Opens the live log after a warning: following it keeps the
+  network busy and can cost a little call quality.
+
+**Access.** Everyone on the home network sees the Status tab. Caller
+numbers, settings, messages and the log need the setup password (`Log in`;
+the browser asks, any user name). Without a configured password everything
+is readable but nothing can be changed, so nobody on the network can alter
+the call buttons. The password travels unencrypted over the home network
+(plain HTTP). Uploads, deletions and greeting changes are refused during
+calls and while the handset is lifted.
+
+**Calls.** Every request costs a call a little audio (Wi-Fi and network
+handling), so during a call the pages ask only every 15 seconds instead of
+every 2-3: measured with the status and log pages open, a one-minute call
+stayed within normal variation (8-20 skipped frames), against 22-27 at full
+rate.
+
+**Internals.** One web server runs all the time with its stack in PSRAM
+(priority 2, below audio); while the setup network is open it restarts with
+an internal-RAM stack and also serves the setup page there. Settings writes
+from the page run on a small internal-RAM worker, because writing NVS from a
+PSRAM-stack task is not allowed. Running all this costs about 5 KB of
+internal RAM. Code: `status.c` (status, log), `web_config.c` (settings,
+files), `log_ring.c` (tested by `tests/log_ring_test.c`).
+
+Verified on the board on 2026-10-28 from the PC (API calls, and the page
+rendered in Firefox): read-only access without a password; with a test
+password: button number, ringtone and knob position saved and kept after a
+restart, an invalid number refused, a position's built-in ringtone changed,
+an MP3 uploaded to an empty position, downloaded unchanged, previewed on the
+phone and deleted, a junk file refused and removed, a greeting uploaded,
+played and deleted, an answering-machine message listed with caller, date
+and length, downloaded (a valid Ogg Opus file per `opusinfo`), marked heard,
+played and deleted. Not yet verified: playing messages in Safari, and
+uploads from a phone's browser.
+
 ### Version
 
 The firmware version comes from git tags named `esp32/vX.Y.Z` (other tags
@@ -310,27 +369,28 @@ with the selector's choice.
 
 ### Ringtones from the SD card
 
-Put MP3 files in a `ringtones` folder on a FAT32 microSD card in the board's
-slot, named after the selector position they take over. `ringtone-03.mp3`
-then plays whenever a selector stands on position 3, instead of that
-position's mapped ringtone. Positions without a file keep their map entry.
-The files stay on this phone: callers never see or choose them.
+MP3 files in a `ringtones` folder on a FAT32 microSD card in the board's slot
+form a library of up to 32 songs under their own names (alphabetical; names
+up to 51 characters, other files are logged and ignored). Each knob position
+plays either a built-in ringtone or one of these songs; choose on the status
+page's **Ringtones** tab or with `phone position P N`. Songs can be uploaded
+and deleted there too, or copied to the card on a computer. The files stay on
+this phone: callers never see or choose them.
 
-```text
-ringtones/
-  ringtone-03.mp3
-  ringtone-07.mp3
-```
-
-- **Names.** `ringtone-NN.mp3`, NN from 01 to the number of selector
-  positions; `ringtone-3.mp3` and any letter case work too. Other files are
-  logged and ignored.
+- **Saved by name.** A position remembers its song's file name, so adding or
+  deleting other songs does not move it. If the file is missing (deleted, or
+  the card is out), the position plays its built-in ringtone; deleting a
+  song from the page also clears it from every position.
+- **Earlier layout.** Before the library, `ringtone-NN.mp3` played on
+  position NN. The first start with the library assigns such files to those
+  positions once; after that the names are ordinary.
 - **Streaming.** Files play straight from the card, whole songs of any
   length: a decoder task fills a one-second buffer while ringing, so memory
   use does not depend on the file. Each ring cycle plays the song, pauses
   two seconds and starts again. The card is mounted at boot and read for
-  file names and lengths (from the MP3 headers); restart the phone after
-  changing files.
+  file names and lengths (from the MP3 headers); uploads and deletions on
+  the status page take effect at once, files copied on a computer after the
+  next restart.
 - **Quality.** Mono (the board has one speaker), leading silence skipped.
   48 kHz files need no resampling; other rates go through
   Espressif's high-quality resampler (`esp_audio_effects`, complexity 3)
@@ -339,11 +399,14 @@ ringtones/
   (12 by default, which puts a full-scale master at the standard ring's
   peak). For the best result, store 48 kHz MP3s at 192 kbps or more.
 - **Failures.** A file that cannot be decoded when it should ring falls back
-  to the standard ring for that call and to the mapped ringtone afterwards.
-- **Console.** `phone ringtones` shows the card status and the files as
-  numbers 101-112; `phone positions` and `phone status` show which positions
-  a file takes over; `phone preview 103` plays one. They cannot be sent as an
-  outgoing ringtone: `phone ringtone a 103` is refused.
+  to the standard ring for that call and to the position's built-in ringtone
+  afterwards.
+- **Console.** `phone ringtones` shows the card status and the songs as
+  numbers 101-132 (valid until the next restart; positions keep names);
+  `phone positions` and `phone status` show what each position plays;
+  `phone position 7 103` puts song 103 on position 7; `phone preview 103`
+  plays it. Songs cannot be sent as an outgoing ringtone: `phone ringtone a
+  103` is refused.
 - **Setup.** On by default under **Phone controls → Ringtones from the SD
   card**. The card uses GPIO40 (CLK), GPIO42 (CMD) and GPIO41 (D0) in 1-bit
   mode, as in Waveshare's demos; keep buttons off those pins. Long file
@@ -354,8 +417,12 @@ ringtones/
 Verified on the board on 2026-10-26: boot with and without a card, five
 48 kHz files found with their lengths, previews streaming with no buffer
 underruns (heard through the board microphone), console output and the
-refused outgoing number. Not yet verified: an incoming call ringing with an
-SD file, and resampling of non-48 kHz files.
+refused outgoing number. On 2026-10-28, with the library: the five files
+moved to positions 1-5 on the first start, an upload with spaces and
+parentheses in its name was put on a position, kept after a restart and
+rang a real incoming call; a junk MP3 and a bad name were refused; deleting
+the song sent its position back to the built-in ringtone. Not yet verified:
+resampling of non-48 kHz files.
 
 ### Silence
 

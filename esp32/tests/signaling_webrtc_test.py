@@ -391,7 +391,7 @@ static char reported_code[8], reported_number[32];
 void digits_setup_report_server(bool connected) { server_reported = connected; }
 void digits_setup_report_pairing_code(const char *code) { snprintf(reported_code, sizeof(reported_code), "%s", code); }
 void digits_setup_report_number(const char *number) { snprintf(reported_number, sizeof(reported_number), "%s", number ? number : ""); }
-void digits_setup_open(const char *reason, bool forced) { assert(reason && forced); ++setup_opens; }
+void digits_setup_request(const char *reason) { assert(reason); ++setup_opens; }
 esp_err_t digits_webrtc_console_start(void) { ++console_starts; return ESP_OK; }
 esp_err_t digits_webrtc_init(digits_webrtc_send_fn send, void *context)
 {

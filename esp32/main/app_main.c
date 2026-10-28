@@ -14,12 +14,14 @@
 #include "signaling.h"
 #include "wifi.h"
 #include "setup.h"
+#include "status.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 
 void app_main(void)
 {
     // Never erase NVS automatically: doing so could strand a paired device.
+    digits_status_init(); // Keep boot log lines for the status page.
     ESP_ERROR_CHECK(nvs_flash_init());
     esp_err_t settings_err = digits_settings_init();
     if (settings_err != ESP_OK)
@@ -31,6 +33,7 @@ void app_main(void)
     digits_setup_init();
     digits_setup_report_number(credentials.device_token[0] ? credentials.number : NULL);
     digits_wifi_start();
+    digits_setup_start_web();
     esp_err_t err = digits_audio_board_init();
     if (err != ESP_OK)
         ESP_LOGE("digits", "Speaker initialization failed: %s; signaling continues", esp_err_to_name(err));

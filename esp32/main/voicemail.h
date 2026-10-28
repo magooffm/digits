@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "call_audio.h"
 #include "esp_err.h"
@@ -32,6 +33,21 @@ bool digits_voicemail_full(void);
 esp_err_t digits_voicemail_play(uint32_t number);
 esp_err_t digits_voicemail_play_greeting(void);
 void digits_voicemail_stop(void);
+
+// Messages for the web page, oldest first. Store changes take a lock and
+// touch only the SD card (no flash), so any task may call them.
+typedef struct {
+    uint32_t number;
+    char caller[32];
+    bool heard;
+    int64_t recorded;   // Unix time from the file date; 0 when the clock was unset.
+    uint32_t tenths;    // Length in tenths of a second.
+} digits_voicemail_message_t;
+// Fills up to max entries; returns how many messages exist.
+unsigned digits_voicemail_list(digits_voicemail_message_t *out, unsigned max);
+bool digits_voicemail_file(uint32_t number, char *path, size_t capacity);
+esp_err_t digits_voicemail_mark_heard(uint32_t number);
+esp_err_t digits_voicemail_delete(uint32_t number);
 
 // Console: vm [status] | list | play [N] | greeting | stop | heard N |
 // delete N | delete heard. Returns 0 on success, 1 on usage error.

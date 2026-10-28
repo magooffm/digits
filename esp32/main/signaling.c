@@ -184,7 +184,7 @@ static void dispatch_message(signaling_t *s)
     } else if (strcmp(type, "factory_reset") == 0) {
         // The web UI's "Recovery mode": open the setup network; nothing is erased.
         ESP_LOGW("signaling", "Recovery requested by the server: opening the setup network");
-        digits_setup_open("server recovery request", true);
+        digits_setup_request("server recovery request");
     } else if (strcmp(type, "ring_test") == 0) {
         digits_ring_test_request();
     } else if (strcmp(type, "error") == 0) {

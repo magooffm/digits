@@ -1,4 +1,6 @@
 #include "setup.h"
+#include "status.h"
+#include "web_config.h"
 #include "wifi.h"
 #include "wifi_setup_form.h"
 #include <stdio.h>
@@ -32,7 +34,8 @@ extern const char page_end[] asm("_binary_setup_page_html_end");
 
 static SemaphoreHandle_t lock;
 static esp_netif_t *ap_netif;
-static httpd_handle_t server;
+static httpd_handle_t server;     // Always running: status page, plus setup while open.
+static bool setup_open;
 static dns_server_handle_t dns;
 static char ap_name[32];
 static char networks[MAX_NETWORKS][WIFI_SETUP_SSID_BYTES];
@@ -94,6 +97,13 @@ bool digits_setup_server_connected(void)
     return connected;
 }
 
+void digits_setup_number(char *out, size_t capacity)
+{
+    portENTER_CRITICAL(&state_mux);
+    snprintf(out, capacity, "%s", state.number);
+    portEXIT_CRITICAL(&state_mux);
+}
+
 bool digits_setup_paired(void)
 {
     portENTER_CRITICAL(&state_mux);
@@ -103,6 +113,16 @@ bool digits_setup_paired(void)
 }
 
 bool digits_setup_forced(void) { return esp_timer_get_time() < forced_until; }
+
+static const char *requested_reason;
+
+void digits_setup_request(const char *reason)
+{
+    requested_reason = reason;
+    forced_until = esp_timer_get_time() + CONFIG_DIGITS_SETUP_FORCED_MINUTES * 60 * 1000000LL;
+}
+
+const char *digits_setup_requested(void) { return digits_setup_forced() ? requested_reason : NULL; }
 void digits_setup_allow_lan(void) { lan_allowed = true; }
 
 static void restart(void *arg)
@@ -133,11 +153,8 @@ void digits_setup_init(void)
 
 // ---- Page -----------------------------------------------------------------
 
-// The page and its actions answer only on the setup network: on the home
-// network nobody needs the setup password to reach the phone.
-static bool allowed(httpd_req_t *req)
+static bool on_setup_network(httpd_req_t *req)
 {
-    if (lan_allowed) return true;
     struct sockaddr_storage address;
     socklen_t size = sizeof(address);
     if (getsockname(httpd_req_to_sockfd(req), (struct sockaddr *)&address, &size)) return false;
@@ -152,6 +169,14 @@ static bool allowed(httpd_req_t *req)
     }
     esp_netif_ip_info_t info;
     return ap_netif && esp_netif_get_ip_info(ap_netif, &info) == ESP_OK && ip == info.ip.addr;
+}
+
+// Setup pages and actions: only while the setup network is open, and only
+// on it, never on the home network. This also keeps every flash write in
+// setup mode, whose server task has an internal-RAM stack.
+static bool allowed(httpd_req_t *req)
+{
+    return setup_open && (lan_allowed || on_setup_network(req));
 }
 
 static esp_err_t refuse(httpd_req_t *req)
@@ -194,7 +219,7 @@ static void scan_networks(void)
 
 static esp_err_t root_get(httpd_req_t *req)
 {
-    if (!allowed(req)) return refuse(req);
+    if (!allowed(req)) return digits_status_page(req); // Home network: read-only status.
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, page_start, page_end - page_start - 1); // Without EMBED_TXTFILES' NUL.
 }
@@ -345,7 +370,7 @@ static esp_err_t restart_post(httpd_req_t *req)
 // Captive portal: phones probe fixed URLs; every unknown path leads here.
 static esp_err_t redirect(httpd_req_t *req, httpd_err_code_t error)
 {
-    (void)error;
+    if (!allowed(req)) return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", "/");
     return httpd_resp_send(req, "Redirect to the setup page", HTTPD_RESP_USE_STRLEN); // iOS needs a body.
@@ -353,11 +378,58 @@ static esp_err_t redirect(httpd_req_t *req, httpd_err_code_t error)
 
 // ---- Access point ---------------------------------------------------------
 
+// Setup mode writes NVS and flash, so its task stack must be internal RAM;
+// the status-only server keeps its stack in PSRAM. Caller holds lock.
+static void server_start(bool setup_mode)
+{
+    httpd_config_t http = HTTPD_DEFAULT_CONFIG();
+    http.max_open_sockets = 4;
+    http.lru_purge_enable = true;
+    http.max_uri_handlers = 32;
+    http.stack_size = 6144;
+    http.task_priority = 2; // Below the call audio (5) and peer (6) tasks.
+    http.task_caps = setup_mode ? (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) : (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (httpd_start(&server, &http) != ESP_OK) {
+        server = NULL;
+        ESP_LOGE(TAG, "Web server could not start");
+        return;
+    }
+    static const httpd_uri_t handlers[] = {
+        {.uri = "/", .method = HTTP_GET, .handler = root_get},
+        {.uri = "/status", .method = HTTP_GET, .handler = status_get},
+        {.uri = "/scan", .method = HTTP_GET, .handler = scan_get},
+        {.uri = "/wifi", .method = HTTP_POST, .handler = wifi_post},
+        {.uri = "/update", .method = HTTP_POST, .handler = update_post},
+        {.uri = "/restart", .method = HTTP_POST, .handler = restart_post},
+    };
+    for (unsigned i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i)
+        httpd_register_uri_handler(server, &handlers[i]);
+    httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, redirect);
+    digits_status_register(server);
+    digits_web_config_register(server);
+}
+
+static void server_stop(void)
+{
+    if (server) httpd_stop(server);
+    server = NULL;
+}
+
+void digits_setup_start_web(void)
+{
+    esp_log_level_set("httpd_uri", ESP_LOG_ERROR); // Portal probes and scans cause many 404s.
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
+    esp_log_level_set("httpd_parse", ESP_LOG_ERROR);
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (!server) server_start(setup_open);
+    xSemaphoreGive(lock);
+}
+
 void digits_setup_open(const char *reason, bool forced)
 {
     if (forced) forced_until = esp_timer_get_time() + CONFIG_DIGITS_SETUP_FORCED_MINUTES * 60 * 1000000LL;
     xSemaphoreTake(lock, portMAX_DELAY);
-    if (server) {
+    if (setup_open) {
         xSemaphoreGive(lock);
         return;
     }
@@ -376,35 +448,13 @@ void digits_setup_open(const char *reason, bool forced)
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &config);
     scan_networks();
-    esp_log_level_set("httpd_uri", ESP_LOG_ERROR); // Portal probes cause many 404s.
-    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
-    esp_log_level_set("httpd_parse", ESP_LOG_ERROR);
-    httpd_config_t http = HTTPD_DEFAULT_CONFIG();
-    http.max_open_sockets = 4;
-    http.lru_purge_enable = true;
-    http.stack_size = 6144; // Writes NVS and flash: stays in internal RAM.
-    http.max_uri_handlers = 8;
-    if (httpd_start(&server, &http) == ESP_OK) {
-        static const httpd_uri_t handlers[] = {
-            {.uri = "/", .method = HTTP_GET, .handler = root_get},
-            {.uri = "/status", .method = HTTP_GET, .handler = status_get},
-            {.uri = "/scan", .method = HTTP_GET, .handler = scan_get},
-            {.uri = "/wifi", .method = HTTP_POST, .handler = wifi_post},
-            {.uri = "/update", .method = HTTP_POST, .handler = update_post},
-            {.uri = "/restart", .method = HTTP_POST, .handler = restart_post},
-        };
-        for (unsigned i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i)
-            httpd_register_uri_handler(server, &handlers[i]);
-        httpd_register_err_handler(server, HTTPD_404_NOT_FOUND, redirect);
-        dns_server_config_t dns_config = DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
-        dns = start_dns_server(&dns_config);
-        ESP_LOGI(TAG, "Setup network %s open (%s)%s; page at http://192.168.4.1", ap_name, reason,
-                 protected ? "" : ", WITHOUT a password: set CONFIG_DIGITS_SETUP_PASSWORD");
-    } else {
-        server = NULL;
-        esp_wifi_set_mode(WIFI_MODE_STA);
-        ESP_LOGE(TAG, "Setup page could not start");
-    }
+    setup_open = true;
+    server_stop();
+    server_start(true);
+    dns_server_config_t dns_config = DNS_SERVER_CONFIG_SINGLE("*", "WIFI_AP_DEF");
+    dns = start_dns_server(&dns_config);
+    ESP_LOGI(TAG, "Setup network %s open (%s)%s; page at http://192.168.4.1", ap_name, reason,
+             protected ? "" : ", WITHOUT a password: set CONFIG_DIGITS_SETUP_PASSWORD");
     xSemaphoreGive(lock);
 }
 
@@ -412,11 +462,12 @@ void digits_setup_close(void)
 {
     forced_until = 0;
     xSemaphoreTake(lock, portMAX_DELAY);
-    if (server) {
+    if (setup_open) {
         if (dns) stop_dns_server(dns);
-        httpd_stop(server);
         dns = NULL;
-        server = NULL;
+        setup_open = false;
+        server_stop();
+        server_start(false);
         esp_wifi_set_mode(WIFI_MODE_STA);
         ESP_LOGI(TAG, "Setup network %s closed", ap_name);
     }
@@ -426,7 +477,7 @@ void digits_setup_close(void)
 bool digits_setup_running(void)
 {
     xSemaphoreTake(lock, portMAX_DELAY);
-    bool running = server != NULL;
+    bool running = setup_open;
     xSemaphoreGive(lock);
     return running;
 }

@@ -46,10 +46,10 @@ static void test_sanitize(void)
 
 static void test_resolve(void)
 {
-    ring_select_map_t map = {.positions = 6, .ringtone = {0, 2, 12, 99, 3, 37}};
+    ring_select_map_t map = {.positions = 6, .ringtone = {0, 2, RINGTONE_FIRST_LOCAL + 2, 99, 3, 37}};
     assert(ring_select_resolve(&map, 1, 4, have) == 2);    // Local choice wins.
-    assert(ring_select_resolve(&map, 2, -1, have) == RINGTONE_FIRST_LOCAL + 2); // SD file wins.
-    assert(ring_select_resolve(&map, 4, -1, have) == 3);   // No SD file: the map.
+    assert(ring_select_resolve(&map, 2, -1, have) == RINGTONE_FIRST_LOCAL + 2); // An SD card song.
+    assert(ring_select_resolve(&map, 4, -1, have) == 3);
     assert(ring_select_resolve(&map, 3, 4, have) == 4);    // Missing clip: caller's choice.
     assert(ring_select_resolve(&map, 3, -1, have) == 0);   // ... or standard.
     assert(ring_select_resolve(&map, 5, 2, have) == 37);   // Last position is a ringtone too.

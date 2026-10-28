@@ -105,8 +105,24 @@ static void test_pcm(void)
     assert(loud[0] == 3932);
 }
 
+static void test_upload_names(void)
+{
+    assert(sd_ringtone_name_valid("Funkytown.mp3", 52));
+    assert(sd_ringtone_name_valid("my song (live).MP3", 52));
+    assert(!sd_ringtone_name_valid(".hidden.mp3", 52));
+    assert(!sd_ringtone_name_valid("song.wav", 52));
+    assert(!sd_ringtone_name_valid(".mp3", 52));
+    assert(!sd_ringtone_name_valid("a/b.mp3", 52));
+    assert(!sd_ringtone_name_valid("..\\x.mp3", 52));
+    assert(!sd_ringtone_name_valid("what?.mp3", 52));
+    assert(!sd_ringtone_name_valid("tab\t.mp3", 52));
+    assert(sd_ringtone_name_valid("12345678901234567890123456789012345678901234567.mp3", 52)); // 51 bytes.
+    assert(!sd_ringtone_name_valid("123456789012345678901234567890123456789012345678.mp3", 52));
+}
+
 int main(void)
 {
+    test_upload_names();
     test_names();
     test_id3();
     test_mp3_length();

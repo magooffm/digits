@@ -23,6 +23,7 @@ typedef struct {
     uint32_t number;
     char caller[VM_STORE_CALLER_BYTES];
     bool heard;
+    uint32_t tenths; // Length cache for the caller; 0 when not known yet.
 } vm_message_t;
 
 typedef struct {
