@@ -143,7 +143,8 @@ void vTaskDelete(TaskHandle_t task) { assert(!task); longjmp(done,1); }
 
 // Answering machine hooks: a recognizable greeting frame and a packet count.
 #define GREETING_SAMPLE 7000
-static unsigned fills, recorded_packets, filled_encodes, live_encodes, attend_at_read;
+static unsigned fills, recorded_packets, filled_encodes, live_encodes, attend_at_read, copper_encodes;
+static bool copper_expected;
 static const digits_call_audio_unattended_t *start_hooks;
 static void test_fill(int16_t *mono, size_t frames)
 {
@@ -277,8 +278,9 @@ esp_audio_err_t esp_opus_enc_process(void *handle,esp_audio_enc_in_frame_t *in,e
 {
     assert(handle && in->len == 1920 && out->len == 1275);
     int16_t *pcm = (int16_t *)in->buffer;
-    assert(pcm[0] > 0 && pcm[959] == pcm[0] + 959); // Live captured PCM, not silence.
+    assert(copper_expected || (pcm[0] > 0 && pcm[959] == pcm[0] + 959)); // Live captured PCM, not silence.
     if (pcm[0] == GREETING_SAMPLE) ++filled_encodes; // The room microphone was replaced.
+    else if (pcm[959] != pcm[0] + 959) ++copper_encodes; // Copper filtered the ramp.
     else { assert(pcm[0] == (int16_t)mic_reads); ++live_encodes; }
     out->buffer[0] = (uint8_t)mic_reads; out->buffer[1] = 1; out->buffer[2] = 2;
     out->encoded_bytes = 3;
@@ -472,6 +474,28 @@ int main(void)
     assert(stats.received_frames == 3 && stats.encoded_frames == 30 && !stats.rx_queue_drops);
     attend_at_read=0;
 
+    // Copper Wire: the microphone ramp (a slow, mostly DC signal) is changed
+    // by the 300 Hz high-pass on every frame; Modern sends it unchanged.
+    filled_encodes=live_encodes=copper_encodes=0;
+    copper_expected=true;
+    begin(DIGITS_CALL_AUDIO_TX);
+    digits_call_audio_set_copper(active,true);
+    run(0); stats=finish();
+    assert(copper_encodes == 30 && !live_encodes && stats.encoded_frames == 30);
+    copper_expected=false;
+    begin(DIGITS_CALL_AUDIO_TX);
+    digits_call_audio_set_copper(active,false);
+    run(0); stats=finish();
+    assert(copper_encodes == 30 && live_encodes == 30);
+    // The greeting is never filtered, even with Copper chosen.
+    start_hooks=&test_hooks;
+    filled_encodes=0;
+    begin(DIGITS_CALL_AUDIO_TX);
+    start_hooks=NULL;
+    digits_call_audio_set_copper(active,true);
+    run(0); stats=finish();
+    assert(filled_encodes == 30 && copper_encodes == 30);
+
     // Classic answering machine: the speaker plays the greeting until it is
     // over, then the caller; the recorder gets every packet regardless.
     digits_call_audio_unattended_t classic = {.fill = test_fill, .record = test_record,
@@ -520,6 +544,7 @@ with tempfile.TemporaryDirectory(prefix="digits-call-audio-") as temporary:
     for include in [build, repo / "esp32/main", codec, codec / "encoder", codec / "encoder/impl",
                     codec / "decoder", codec / "decoder/impl"]:
         command += ["-I", str(include)]
-    command += [str(build / "test.c"), str(repo / "esp32/main/call_audio_jitter.c"), "-o", str(build / "test")]
+    command += [str(build / "test.c"), str(repo / "esp32/main/call_audio_jitter.c"),
+                str(repo / "esp32/main/voice_style.c"), "-lm", "-o", str(build / "test")]
     subprocess.run(command, check=True)
     subprocess.run([str(build / "test")], check=True)

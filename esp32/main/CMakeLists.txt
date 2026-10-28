@@ -4,7 +4,7 @@ idf_component_register(SRCS "app_main.c" "credentials.c" "wifi.c" "signaling.c" 
     "record_playback_test.c" "record_playback_pcm.c" "button_record_playback.c" "record_button.c"
     "phone.c" "phone_fsm.c" "tone_gen.c" "call_tones.c" "ringtones.c" "ringtone_pack.c" "ring_select.c"
     "sd_ringtone_util.c" "sd_ringtones.c" "sd_card.c" "silence.c"
-    "ogg_opus.c" "voicemail_store.c" "voicemail_prompt.c" "voicemail.c" "wifi_setup_form.c" "setup.c" "status.c" "log_ring.c" "web_config.c" "greeting_pcm.c" "greeting_record.c"
+    "ogg_opus.c" "voicemail_store.c" "voicemail_prompt.c" "voicemail.c" "wifi_setup_form.c" "setup.c" "status.c" "log_ring.c" "web_config.c" "greeting_pcm.c" "greeting_record.c" "voice_style.c"
     INCLUDE_DIRS "."
     # The Pi's default greeting, used when the card has no greeting.mp3.
     EMBED_FILES "${CMAKE_CURRENT_LIST_DIR}/../../pi/tones/voicemail_greeting.wav"

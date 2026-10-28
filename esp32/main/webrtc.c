@@ -812,7 +812,7 @@ static void process_event(event_t *event)
         ESP_LOGI(TAG, "Answering machine: %s, %d unheard%s", digits_voicemail_ready() ? "ready" : "off (no SD card)",
                  digits_voicemail_unheard() > 0 ? digits_voicemail_unheard() : 0,
                  rtc.call.voicemail ? ", answering this call" : "");
-        ESP_LOGI(TAG, "Settings: effective_silent=%s voice_style=%s auto_update=%s voicemail=%s timeout=%us (voice/auto cached only)",
+        ESP_LOGI(TAG, "Settings: effective_silent=%s voice_style=%s auto_update=%s voicemail=%s timeout=%us (auto-update cached only)",
                  settings.silent_mode ? "yes" : "no",
                  settings.voice_style == DIGITS_VOICE_MODERN ? "modern" : "copper",
                  settings.auto_update ? "yes" : "no", settings.voicemail_enabled ? "yes" : "no",
@@ -986,6 +986,10 @@ static void service_audio(int64_t now)
             return;
         }
     }
+    // Voice style from the server's line settings, changed live mid-call too.
+    digits_line_settings_t settings;
+    digits_settings_get(&settings, NULL);
+    digits_call_audio_set_copper(rtc.call.audio, settings.voice_style == DIGITS_VOICE_COPPER);
     digits_call_audio_stats_t stats;
     digits_call_audio_get_stats(rtc.call.audio, &stats);
     if (stats.state == DIGITS_CALL_AUDIO_FAILED) {

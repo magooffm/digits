@@ -83,7 +83,8 @@ bookmarks (`/#messages`):
   kept. Recording and uploading replace each other; **Delete** returns to
   the built-in one. A kept recording sits in PSRAM (32 KB per second) and is
   upsampled to 48 kHz for callers.
-- **Log.** Opens the live log after a warning: following it keeps the
+- **Log.** (Without the microphone diagnostic's line per second, which stays
+  on the serial console.) Opens the live log after a warning: following it keeps the
   network busy and can cost a little call quality.
 
 **Access.** Everyone on the home network sees the Status tab. Caller
@@ -123,6 +124,24 @@ phone, a too-short take refused, a take discarded, and the built-in greeting
 restored. Not yet verified: playing messages in Safari, uploads from a
 phone's browser, and recording with the handset microphone.
 
+### Voice style
+
+The server's per-line **Copper Wire / Modern HD** setting now shapes what the
+other side hears from this phone. Copper Wire (the default for new lines)
+runs the outgoing microphone audio through the Pi's telephone-band chain:
+two 300 Hz high-pass and two 3,400 Hz low-pass Butterworth sections
+(`voice_style.c`). Modern HD sends it unfiltered. A change in the web UI
+applies within milliseconds, also mid-call (the status page shows the style
+the phone uses); the answering machine's greeting
+is never filtered, as on the Pi. Measured on the host: 1 kHz -0.1 dB, the
+corners -6 dB, 100 Hz -38 dB, 6 kHz -22 dB; single precision stays within
+two counts of the Pi's double-precision filter. The Pi also suppresses noise
+(RNNoise) whatever the style; the ESP32 does not yet. On the board
+(2026-10-28), PC speakers played tones into the board microphone during a
+call in each style: Copper minus Modern was -1 dB at 500 Hz, about 0 dB at
+2 kHz, -16 dB at 5 kHz and -28 dB at 7 kHz (single tones in a room vary by a
+few dB). The worst encode time stayed at 13-19 ms, as without the filter.
+
 ### Remote restart
 
 **Restart service** and **Reboot device** on the phone's page in the server's
@@ -130,8 +149,11 @@ web UI both restart the board (it has one program, no separate service).
 The phone first reports `restarting` or `rebooting` like the Pi, so the page
 shows the right text, then waits half a second for that to leave. A running
 call is hung up first, and an answering-machine message being recorded is
-saved; then the board restarts and is back online in about five seconds,
-within the page's wait. Host test: `test_remote_restart` in
+saved. The phone then closes its WebSocket properly (close frame and TCP
+close), so the server marks it offline at once: the page waits for exactly
+that. Restarting without closing left the server's connection open until its
+keep-alive timeout, after the phone was long back, and the page timed out.
+The board is back online in about five seconds, within the page's wait. Host test: `test_remote_restart` in
 `tests/signaling_webrtc_test.py`.
 
 ### Version

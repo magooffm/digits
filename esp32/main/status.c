@@ -43,7 +43,10 @@ static int capture(const char *format, va_list args)
 {
     va_list copy;
     va_copy(copy, args);
-    if (ring.data && !__atomic_exchange_n(&formatting, 1, __ATOMIC_ACQUIRE)) {
+    // The microphone diagnostic's line every second would push everything
+    // else out of the page's log; it stays on the serial console.
+    bool keep = !strstr(format, "mono RMS=");
+    if (keep && ring.data && !__atomic_exchange_n(&formatting, 1, __ATOMIC_ACQUIRE)) {
         int length = vsnprintf(line, sizeof(line), format, copy);
         if (length >= (int)sizeof(line)) {
             length = sizeof(line) - 1;
@@ -163,7 +166,7 @@ static esp_err_t status_get(httpd_req_t *req)
     snprintf(text, STATUS_BYTES,
              "{\"firmware\":\"%s\",\"uptime_s\":%llu,\"number\":\"%s\",\"authorized\":%s,"
              "\"call\":{\"phase\":\"%s\",\"remote\":\"%s\"},"
-             "\"silence\":{\"silent\":%s,\"server\":%s,\"overridden\":%s},"
+             "\"silence\":{\"silent\":%s,\"server\":%s,\"overridden\":%s},\"voice_style\":\"%s\","
              "\"voicemail\":{\"ready\":%s,\"enabled\":%s,\"timeout_s\":%u,\"unheard\":%d},"
              "\"wifi\":{\"ssid\":%s,\"connected\":%s,\"rssi\":%d,\"ip\":\"%s\"},"
              "\"server\":{\"url\":%s,\"connected\":%s},"
@@ -173,7 +176,8 @@ static esp_err_t status_get(httpd_req_t *req)
              allowed ? "true" : "false", phase_name(call.phase),
              allowed && call.phase != DIGITS_CALL_IDLE ? call.remote : "",
              silence.effective ? "true" : "false", silence.server ? "true" : "false",
-             silence.overridden ? "true" : "false", digits_voicemail_ready() ? "true" : "false",
+             silence.overridden ? "true" : "false",
+             settings.voice_style == DIGITS_VOICE_MODERN ? "modern" : "copper", digits_voicemail_ready() ? "true" : "false",
              settings.voicemail_enabled ? "true" : "false", (unsigned)settings.voicemail_ring_timeout_seconds,
              unheard > 0 ? unheard : 0, ssid, digits_wifi_online() ? "true" : "false", digits_wifi_rssi(), address,
              url, digits_setup_server_connected() ? "true" : "false",

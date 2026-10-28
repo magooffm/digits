@@ -1,6 +1,7 @@
 #include "call_audio.h"
 #include "audio_board.h"
 #include "microphone.h"
+#include "voice_style.h"
 #include <stdlib.h>
 #include <string.h>
 #include "esp_heap_caps.h"
@@ -38,6 +39,9 @@ struct digits_call_audio {
     // Greeting for the speaker: the encoder writes, the playback worker reads.
     int16_t *monitor;
     uint32_t monitor_head, monitor_tail;
+    bool copper;                 // Wanted: set by the peer worker.
+    voice_style_copper_t filter; // Encoder task only.
+    bool copper_active;
     bool stop_requested, tx_ready, rx_ready, tx_done, rx_done;
     QueueHandle_t tx_packets, rx_packets;
     StaticQueue_t tx_queue_control, rx_queue_control;
@@ -192,6 +196,14 @@ static void encoder_worker(void *argument)
         if (unattended(audio)) {
             audio->hooks.fill(audio->capture->pcm, DIGITS_MIC_FRAME_SAMPLES);
             if (audio->monitor && !greeting_done(audio)) monitor_push(audio, audio->capture->pcm);
+        } else if (__atomic_load_n(&audio->copper, __ATOMIC_RELAXED)) {
+            // Copper Wire: the voice band only, like the Pi. A fresh start each
+            // time it is chosen; the greeting above is never filtered.
+            if (!audio->copper_active) voice_style_copper_reset(&audio->filter);
+            audio->copper_active = true;
+            voice_style_copper_process(&audio->filter, audio->capture->pcm, DIGITS_MIC_FRAME_SAMPLES);
+        } else {
+            audio->copper_active = false;
         }
         esp_audio_enc_in_frame_t input = {
             .buffer = (uint8_t *)audio->capture->pcm, .len = sizeof(audio->capture->pcm),
@@ -504,6 +516,7 @@ esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
     if (!audio) return ESP_ERR_NO_MEM;
     audio->lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     audio->mode = mode;
+    voice_style_copper_init(&audio->filter, DIGITS_AUDIO_SAMPLE_RATE);
     if (hooks) {
         audio->hooks = *hooks;
         audio->unattended = true; // Before any worker exists.
@@ -643,6 +656,11 @@ bool digits_call_audio_receive(digits_call_audio_t *audio, uint32_t pts_ms,
     if (!queued) ++audio->stats.rx_queue_drops;
     portEXIT_CRITICAL(&audio->lock);
     return queued;
+}
+
+void digits_call_audio_set_copper(digits_call_audio_t *audio, bool copper)
+{
+    if (audio) __atomic_store_n(&audio->copper, copper, __ATOMIC_RELAXED);
 }
 
 void digits_call_audio_attend(digits_call_audio_t *audio)

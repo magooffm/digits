@@ -11,7 +11,7 @@ typedef enum {
 } digits_voice_style_t;
 
 typedef struct {
-    digits_voice_style_t voice_style;
+    digits_voice_style_t voice_style; // Copper filters the outgoing voice (voice_style.h).
     bool silent_mode; // Effective server value: manual silence OR Quiet Hours.
     bool auto_update; // Cached only; this module never starts an updater.
     bool voicemail_enabled; // Cached only; no answering machine is activated.

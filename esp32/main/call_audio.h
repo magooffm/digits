@@ -57,6 +57,10 @@ typedef struct {
 esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
                                              const digits_call_audio_unattended_t *hooks,
                                              digits_call_audio_t **out);
+// Voice style: Copper Wire filters the microphone to the telephone band
+// (voice_style.h) from the next frame; Modern HD (false) sends it unfiltered.
+// Never applied to the answering machine's greeting. Any task.
+void digits_call_audio_set_copper(digits_call_audio_t *audio, bool copper);
 // Handset lifted: normal two-way audio from the next frame. Idempotent.
 void digits_call_audio_attend(digits_call_audio_t *audio);
 void digits_call_audio_get_stats(digits_call_audio_t *audio, digits_call_audio_stats_t *stats);

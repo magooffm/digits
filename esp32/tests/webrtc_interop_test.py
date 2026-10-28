@@ -564,6 +564,13 @@ esp_err_t digits_call_audio_start_unattended(digits_call_audio_mode_t mode,
     return err;
 }
 
+static int media_copper = -1;
+void digits_call_audio_set_copper(digits_call_audio_t *audio, bool copper)
+{
+    assert(in_worker && audio == &media && media.live);
+    media_copper = copper;
+}
+
 void digits_call_audio_attend(digits_call_audio_t *audio)
 {
     assert(in_worker && audio == &media && media.live);
@@ -1829,6 +1836,22 @@ static void test_voicemail_count_reports(void)
     ++cases;
 }
 
+static void test_voice_style(void)
+{
+    setup();
+    media_copper = -1;
+    settings.voice_style = DIGITS_VOICE_COPPER; // The server's default.
+    start_outgoing();
+    apply_answer();
+    connect_peer();
+    assert(media_copper == 1);
+    settings.voice_style = DIGITS_VOICE_MODERN; // Changed in the web UI mid-call.
+    pump(1);
+    assert(media_copper == 0);
+    finish();
+    ++cases;
+}
+
 static void test_tones_release_before_call_audio(void)
 {
     setup();
@@ -2072,6 +2095,7 @@ int main(void)
     test_answering_machine();
     test_answering_machine_not_armed();
     test_voicemail_count_reports();
+    test_voice_style();
     printf("WebRTC adapter: %u real-worker lifecycle cases passed (mock peer; physical interoperability unverified)\n", cases);
     return 0;
 }

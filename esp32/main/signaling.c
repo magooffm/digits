@@ -25,6 +25,9 @@
 #define CREDENTIALS_CHANGED BIT1
 #define STORAGE_FAILED BIT2
 #define START_RETURNED BIT3
+#define SHUTDOWN BIT4      // Restart requested: close the connection cleanly, then stop.
+#define SHUTDOWN_DONE BIT5
+#define SHUTDOWN_WAIT_MS 2000
 #define MAX_MESSAGE DIGITS_WEBRTC_MAX_SIGNALING_MESSAGE
 #define TX_QUEUE_LENGTH 8
 
@@ -237,7 +240,7 @@ static bool restart_pending;
 
 static void restart_task(void *arg)
 {
-    (void)arg;
+    signaling_t *s = arg;
     vTaskDelay(pdMS_TO_TICKS(RESTART_REPORT_MS));
     digits_webrtc_call_state_t call;
     digits_webrtc_call_state(&call);
@@ -251,6 +254,11 @@ static void restart_task(void *arg)
         }
         vTaskDelay(pdMS_TO_TICKS(RESTART_SAVE_MS));
     }
+    // Close the WebSocket properly: the server then sees the phone go offline
+    // at once, which the web UI waits for. Without it the server would only
+    // notice after its keep-alive timeout, long after the phone is back.
+    xEventGroupSetBits(s->events, SHUTDOWN);
+    xEventGroupWaitBits(s->events, SHUTDOWN_DONE, pdFALSE, pdTRUE, pdMS_TO_TICKS(SHUTDOWN_WAIT_MS));
     ESP_LOGW("signaling", "Restarting as requested by the server");
     esp_restart();
 }
@@ -271,7 +279,7 @@ static void handle_restart(signaling_t *s, const char *mode)
         cJSON_AddStringToObject(json, "update_detail", reboot ? "Device reboot requested" : "Service restart requested"))
         enqueue_peer_message(json, s->session, NULL);
     cJSON_Delete(json);
-    if (xTaskCreate(restart_task, "digits_restart", 3072, NULL, 5, NULL) != pdPASS) {
+    if (xTaskCreate(restart_task, "digits_restart", 3072, s, 5, NULL) != pdPASS) {
         ESP_LOGE("signaling", "Cannot start the restart; restarting at once");
         esp_restart();
     }
@@ -411,15 +419,22 @@ void digits_signaling_run(digits_credentials_t *credentials)
         if (err == ESP_OK) {
             do {
                 bits = xEventGroupWaitBits(s->events,
-                    RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED, pdFALSE, pdFALSE,
-                    pdMS_TO_TICKS(10)) & (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED);
+                    RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED | SHUTDOWN, pdFALSE, pdFALSE,
+                    pdMS_TO_TICKS(10)) & (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED | SHUTDOWN);
                 if (!bits) drain_outbound(s);
-                bits |= xEventGroupGetBits(s->events) & (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED);
+                bits |= xEventGroupGetBits(s->events) & (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED | SHUTDOWN);
             } while (!bits);
         }
         else ESP_LOGW("signaling", "WebSocket start failed: %s", esp_err_to_name(err));
         // Stop/destroy are forbidden inside the WebSocket callback. Owner only.
         transport_down(s);
+        if (bits & SHUTDOWN) {
+            // Close frame and TCP close, then no reconnect: the board restarts.
+            if (err == ESP_OK) esp_websocket_client_close(s->client, pdMS_TO_TICKS(SHUTDOWN_WAIT_MS / 2));
+            esp_websocket_client_destroy(s->client);
+            xEventGroupSetBits(s->events, SHUTDOWN_DONE);
+            for (;;) vTaskDelay(portMAX_DELAY);
+        }
         if (err == ESP_OK) esp_websocket_client_stop(s->client);
         ESP_ERROR_CHECK(esp_websocket_client_destroy(s->client));
         discard_outbound();

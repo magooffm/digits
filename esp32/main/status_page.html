@@ -40,6 +40,7 @@ audio{height:2em;max-width:100%}
 <dt>Number</dt><dd id="number"></dd>
 <dt>Call</dt><dd id="call"></dd>
 <dt>Incoming calls</dt><dd id="silence"></dd>
+<dt>Voice style</dt><dd id="voice"></dd>
 <dt>Answering machine</dt><dd id="voicemail"></dd>
 </dl></section>
 <section><h2>Connection</h2><dl>
@@ -141,6 +142,7 @@ function show(s){
   $('login').innerHTML=s.authorized?'':'&middot; <a href="/login">Log in</a> for settings, messages and caller numbers';
   set('number',s.number||'not paired',!!s.number);
   set('call',s.call.phase+(s.call.remote?' with '+s.call.remote:''));
+  set('voice',s.voice_style==='modern'?'Modern HD':'Copper Wire (filtered)');
   set('silence',(s.silence.silent?'silent':'ring')+(s.silence.overridden?' (set on the phone; server says '+(s.silence.server?'silent':'ring')+')':''));
   set('voicemail',!s.voicemail.ready?'off (no SD card)':s.voicemail.enabled?'answers after '+s.voicemail.timeout_s+' s, '+s.voicemail.unheard+' new':'not enabled for this line, '+s.voicemail.unheard+' new');
   set('wifi',s.wifi.connected?s.wifi.ssid+', '+s.wifi.rssi+' dBm, '+s.wifi.ip:'not connected',s.wifi.connected);

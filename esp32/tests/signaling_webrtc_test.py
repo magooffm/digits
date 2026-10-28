@@ -43,6 +43,8 @@ typedef int esp_err_t;
 #define BIT1 (1U << 1)
 #define BIT2 (1U << 2)
 #define BIT3 (1U << 3)
+#define BIT4 (1U << 4)
+#define BIT5 (1U << 5)
 #define pdTRUE 1
 #define pdFALSE 0
 typedef uint32_t TickType_t;
@@ -112,6 +114,7 @@ esp_err_t esp_websocket_register_events(esp_websocket_client_handle_t client,
                                       int32_t events, fake_event_handler_t handler, void *context);
 esp_err_t esp_websocket_client_start(esp_websocket_client_handle_t client);
 esp_err_t esp_websocket_client_stop(esp_websocket_client_handle_t client);
+esp_err_t esp_websocket_client_close(esp_websocket_client_handle_t client, TickType_t timeout);
 esp_err_t esp_websocket_client_destroy(esp_websocket_client_handle_t client);
 int esp_websocket_client_send_text(esp_websocket_client_handle_t client,
                                   const char *data, int length, TickType_t wait);
@@ -314,6 +317,13 @@ esp_err_t esp_websocket_client_stop(esp_websocket_client_handle_t client)
     emit(client, WEBSOCKET_EVENT_FINISH, NULL);
     return ESP_OK;
 }
+esp_err_t esp_websocket_client_close(esp_websocket_client_handle_t client, TickType_t timeout)
+{
+    (void)timeout;
+    assert(!callback_depth && client->started && !client->stopped);
+    client->stopped = true;
+    return ESP_OK;
+}
 esp_err_t esp_websocket_client_destroy(esp_websocket_client_handle_t client)
 {
     assert(!callback_depth && !client->destroyed);
@@ -461,6 +471,10 @@ EventBits_t xEventGroupWaitBits(EventGroupHandle_t group, EventBits_t bits,
                               int clear, int all, TickType_t ticks)
 {
     ++waits;
+    if (bits == SHUTDOWN_DONE) { // The restart task waits for the owner's clean close.
+        assert(!callback_depth && all == pdTRUE && clear == pdFALSE && ticks == pdMS_TO_TICKS(SHUTDOWN_WAIT_MS));
+        return group->bits;
+    }
     if (bits == START_RETURNED) {
         assert(callback_depth == 1 && all == pdTRUE && clear == pdFALSE && ticks == portMAX_DELAY);
         assert(group->bits & START_RETURNED);
@@ -468,7 +482,7 @@ EventBits_t xEventGroupWaitBits(EventGroupHandle_t group, EventBits_t bits,
         return group->bits;
     }
     assert(owner_running && !callback_depth && clear == pdFALSE && all == pdFALSE);
-    assert(bits == (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED) && ticks == pdMS_TO_TICKS(10));
+    assert(bits == (RETRY | CREDENTIALS_CHANGED | STORAGE_FAILED | SHUTDOWN) && ticks == pdMS_TO_TICKS(10));
     struct fake_client *client = &clients[client_count - 1];
     assert(++client->polls <= 2); // Wrong START_RETURNED mask stops on the first poll.
     now_us += 10000;
@@ -842,16 +856,19 @@ static void test_remote_restart(void)
     assert(!strcmp(string_field(json, "update_status"), "rebooting"));
     cJSON_Delete(json);
     fake_phase = DIGITS_CALL_CONNECTED; // A call is running: it is ended first.
-    restart_entry(NULL);
+    restart_entry(&s);
     assert(hangups == 1 && restarts == 1 && fake_phase == DIGITS_CALL_IDLE);
+    assert(s.events->bits & SHUTDOWN); // The owner is told to close the WebSocket cleanly.
+    s.events->bits &= ~SHUTDOWN;
     restart_pending = false;
     text_event(s.client, "{\"type\":\"restart\",\"restart_mode\":\"service\"}");
     drain_outbound(&s);
     json = cJSON_Parse(sends[sent_count - 1].wire);
     assert(!strcmp(string_field(json, "update_status"), "restarting"));
     cJSON_Delete(json);
-    restart_entry(NULL); // Idle: no hangup.
-    assert(hangups == 1 && restarts == 2);
+    restart_entry(&s); // Idle: no hangup.
+    assert(hangups == 1 && restarts == 2 && (s.events->bits & SHUTDOWN));
+    s.events->bits &= ~SHUTDOWN;
     restart_pending = false;
     cleanup(&s);
 }
