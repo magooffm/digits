@@ -51,6 +51,33 @@ If using a USB-UART bridge instead of native USB, select UART under
 Component config -> ESP System Settings -> Channel for console output.
 URLs other than `ws://.../ws` fail fast.
 
+### Version
+
+The firmware version comes from git tags named `esp32/vX.Y.Z` (other tags
+such as upstream's `server/v...` are ignored):
+
+| Build from | Version |
+| --- | --- |
+| the tagged commit | `esp32-0.4.0` |
+| three commits later | `esp32-0.4.0-3-gabc1234` |
+| with uncommitted changes | `...-dirty` |
+| before the first `esp32/v` tag | `esp32-0.0.0-gabc1234` |
+
+The `esp32-` prefix keeps it apart from Pi versions in the web UI.
+
+```sh
+git tag esp32/v0.1.0   # then build; the version is read when CMake configures
+```
+
+CMake reconfigures on commits, checkouts and new tags; after editing without
+committing, `-dirty` appears on the next configure. The version is in the
+boot log ("App version"), on the setup page, and after every connection the
+phone reports it to the server as `device_info` (with commit and local IP),
+where the web UI shows it as the software version. The Pi/Pico update
+buttons and the automatic-updates setting do nothing on the ESP32: the
+server only knows Pi and Pico releases. Firmware is updated over USB or on
+the setup page.
+
 ### Setup network and page
 
 Wi-Fi network and Digits server are saved on the phone (NVS namespace

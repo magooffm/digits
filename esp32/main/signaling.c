@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
@@ -221,6 +222,24 @@ static bool send_register(signaling_t *s)
     return registered;
 }
 
+// What the web UI shows as the phone's software version (the Pi's field
+// names; there is no Pico, so the firmware fields stay empty).
+// Queued after registration; the owner sends it like any other message.
+static void queue_device_info(signaling_t *s)
+{
+    char address[16] = "";
+    cJSON *json = cJSON_CreateObject();
+    bool ok = json && cJSON_AddStringToObject(json, "type", "device_info") &&
+        cJSON_AddStringToObject(json, "pi_version", esp_app_get_description()->version);
+    if (ok && DIGITS_COMMIT[0]) ok = cJSON_AddStringToObject(json, "pi_commit", DIGITS_COMMIT) != NULL;
+    if (ok && digits_wifi_address(address, sizeof(address)))
+        ok = cJSON_AddStringToObject(json, "local_addr", address) != NULL;
+    if (!ok || enqueue_peer_message(json, s->session, NULL) != ESP_OK)
+        ESP_LOGW("signaling", "Could not queue device_info");
+    else ESP_LOGI("signaling", "device_info queued: version %s", esp_app_get_description()->version);
+    cJSON_Delete(json);
+}
+
 static void websocket_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     signaling_t *s = arg;
@@ -241,6 +260,7 @@ static void websocket_event(void *arg, esp_event_base_t base, int32_t id, void *
             // peer call traffic requires a registration with a stored token.
             digits_setup_report_server(true);
             outbound_set(s->session, s->credentials->device_token[0] != 0);
+            if (s->credentials->device_token[0]) queue_device_info(s); // Unpaired the server ignores it.
             digits_settings_transport(s->session, s->credentials->device_token[0] != 0);
             digits_webrtc_transport(s->session, true, s->credentials->number,
                                     s->credentials->device_token[0] != 0);

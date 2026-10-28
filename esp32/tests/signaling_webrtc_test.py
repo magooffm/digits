@@ -56,6 +56,9 @@ typedef const char *esp_event_base_t;
 #define portMAX_DELAY UINT32_MAX
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms) / 10U)
 #define CONFIG_DIGITS_SERVER_URL "ws://test-server/ws"
+#define DIGITS_COMMIT "abc1234"
+typedef struct { char version[32]; } esp_app_desc_t;
+const esp_app_desc_t *esp_app_get_description(void);
 #define ESP_ERROR_CHECK(result) assert((result) == ESP_OK)
 void fake_log(const char *tag, const char *format, ...);
 #define ESP_LOGI(tag, ...) fake_log(tag, __VA_ARGS__)
@@ -375,6 +378,12 @@ void digits_silence_server(bool silent)
 }
 void digits_wifi_wait_connected(void) { assert(!callback_depth); ++wifi_waits; }
 const char *digits_wifi_server_url(void) { return CONFIG_DIGITS_SERVER_URL; }
+const esp_app_desc_t *esp_app_get_description(void)
+{
+    static const esp_app_desc_t app = {.version = "esp32-0.4.0-2-gabc1234"};
+    return &app;
+}
+bool digits_wifi_address(char *out, size_t capacity) { snprintf(out, capacity, "192.168.1.66"); return true; }
 // Setup network reports: callbacks may only record state.
 static bool server_reported;
 static unsigned setup_opens;
@@ -436,7 +445,7 @@ EventBits_t xEventGroupWaitBits(EventGroupHandle_t group, EventBits_t bits,
     assert(group->bits & START_RETURNED);
     if (client->polls == 2) {
         if (owner_case == OWNER_RECONNECT && client->id == 1) {
-            assert(client->sends == 3); // register, then queued call and SDP.
+            assert(client->sends == 4); // register, device_info, then queued call and SDP.
             assert(queue_message("sdp", last_session) == ESP_OK);
             emit(client, WEBSOCKET_EVENT_DISCONNECTED, NULL);
         } else {
@@ -494,7 +503,20 @@ static void setup(signaling_t *s, digits_credentials_t *c)
     assert(esp_websocket_register_events(s->client, WEBSOCKET_EVENT_ANY, websocket_event, s) == ESP_OK);
     outbound_set(s->session, false);
 }
-static void connect(signaling_t *s) { emit(s->client, WEBSOCKET_EVENT_CONNECTED, NULL); }
+// A paired registration queues the version report first. Tests about other
+// traffic take it off the queue here; keep_device_info leaves it in place.
+static bool keep_device_info;
+static void connect(signaling_t *s)
+{
+    emit(s->client, WEBSOCKET_EVENT_CONNECTED, NULL);
+    if (keep_device_info || !s->credentials->device_token[0] || !outbound.queue || !outbound.queue->count) return;
+    tx_message_t first;
+    memcpy(&first, outbound.queue->items + outbound.queue->head * outbound.queue->width, sizeof(first));
+    if (!strstr(first.wire, "\"type\":\"device_info\"")) return;
+    assert(xQueueReceive(outbound.queue, &first, 0) == pdTRUE);
+    cJSON_free(first.wire);
+    --atomic_publications;
+}
 static void cleanup(signaling_t *s)
 {
     discard_outbound();
@@ -539,7 +561,9 @@ static void test_registration_and_pairing(void)
     c = credentials(true);
     setup(&s, &c);
     inject_during_register = true;
+    keep_device_info = true;
     connect(&s);
+    keep_device_info = false;
     json = cJSON_Parse(sends[0].wire);
     assert(cJSON_GetArraySize(json) == 4 && last_paired && outbound.registered);
     assert(!strcmp(string_field(json, "number"), "1001"));
@@ -548,7 +572,15 @@ static void test_registration_and_pairing(void)
     assert(!strstr(logs, "original-test-token"));
     assert(queue_message("call", s.session) == ESP_OK);
     drain_outbound(&s);
-    assert(sent_count == 2 && strstr(sends[1].wire, "\"type\":\"call\""));
+    // The version report goes first, through the same owner queue.
+    assert(sent_count == 3 && strstr(sends[2].wire, "\"type\":\"call\""));
+    json = cJSON_Parse(sends[1].wire);
+    assert(!strcmp(string_field(json, "type"), "device_info"));
+    assert(!strcmp(string_field(json, "pi_version"), "esp32-0.4.0-2-gabc1234"));
+    assert(!strcmp(string_field(json, "pi_commit"), "abc1234"));
+    assert(!strcmp(string_field(json, "local_addr"), "192.168.1.66"));
+    assert(!cJSON_GetObjectItem(json, "firmware_version") && !cJSON_GetObjectItem(json, "device_token"));
+    cJSON_Delete(json);
     cleanup(&s);
 }
 static void test_mailbox_bounds_and_generations(void)
@@ -744,15 +776,17 @@ static void test_owner(enum owner_case scenario)
     assert(peer_send && peer_send_context == NULL && !outbound.registered);
     if (scenario == OWNER_RECONNECT) {
         assert(client_count == 2 && stops == 2 && destroys == 2 && delayed_ticks == 600);
-        assert(sent_count == 6 && wifi_waits == 2);
-        assert(sends[0].client == 1 && sends[3].client == 2);
-        assert(strstr(sends[0].wire, "\"type\":\"register\"") && strstr(sends[3].wire, "\"type\":\"register\""));
+        assert(sent_count == 8 && wifi_waits == 2);
+        assert(sends[0].client == 1 && sends[4].client == 2);
+        assert(strstr(sends[0].wire, "\"type\":\"register\"") && strstr(sends[4].wire, "\"type\":\"register\""));
+        // Every new connection reports the version again: the server keeps it per connection.
+        assert(strstr(sends[1].wire, "\"type\":\"device_info\"") && strstr(sends[5].wire, "\"type\":\"device_info\""));
     } else if (scenario == OWNER_START_FAIL) {
         assert(client_count == 2 && stops == 1 && destroys == 2 && delayed_ticks == 600);
-        assert(sent_count == 3 && sends[0].client == 2);
+        assert(sent_count == 4 && sends[0].client == 2 && strstr(sends[1].wire, "\"type\":\"device_info\""));
     } else {
         assert(client_count == 1 && stops == 1 && destroys == 1 && !console_starts);
-        assert(sent_count == 1);
+        assert(sent_count == 2 && strstr(sends[1].wire, "\"type\":\"device_info\"")); // Without WebRTC too.
     }
     assert(!outbound.queue->count && logs_used && strstr(logs, "No deliberate reconnect"));
     cleanup(NULL);
@@ -810,7 +844,7 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix="digits-signaling-webrtc-") as temporary:
     directory = Path(temporary)
     (directory / "fake_idf.h").write_text(fake_header)
-    for name in ("esp_err.h", "esp_log.h", "esp_timer.h", "esp_websocket_client.h", "sdkconfig.h",
+    for name in ("esp_app_desc.h", "esp_err.h", "esp_log.h", "esp_timer.h", "esp_websocket_client.h", "sdkconfig.h",
                  "freertos/FreeRTOS.h", "freertos/event_groups.h", "freertos/queue.h"):
         header = directory / name
         header.parent.mkdir(parents=True, exist_ok=True)

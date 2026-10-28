@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 #include "wifi_setup_form.h"
 
@@ -22,6 +23,8 @@ void digits_wifi_start(void);
 void digits_wifi_wait_connected(void);
 bool digits_wifi_online(void);
 int digits_wifi_rssi(void); // 0 when not connected.
+// Station IPv4 address as text, or false when there is none.
+bool digits_wifi_address(char *out, size_t capacity);
 
 void digits_wifi_config(digits_wifi_config_t *out);
 // Server address for this boot; "" when none is configured.

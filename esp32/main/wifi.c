@@ -104,6 +104,16 @@ int digits_wifi_rssi(void)
     return digits_wifi_online() && esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
 }
 
+bool digits_wifi_address(char *out, size_t capacity)
+{
+    esp_netif_ip_info_t info;
+    esp_netif_t *station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!digits_wifi_online() || !station || esp_netif_get_ip_info(station, &info) != ESP_OK || !info.ip.addr)
+        return false;
+    snprintf(out, capacity, IPSTR, IP2STR(&info.ip));
+    return true;
+}
+
 // ---- Clock ----------------------------------------------------------------
 
 static void clock_set(struct timeval *now)
