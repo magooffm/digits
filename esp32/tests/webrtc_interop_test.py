@@ -18,7 +18,7 @@ parser.add_argument("--source", type=Path, default=repo / "esp32/main/webrtc.c")
 parser.add_argument("--idf-path", type=Path, default=os.environ.get("IDF_PATH"))
 parser.add_argument(
     "--peer-include", type=Path,
-    default=repo / "esp32/managed_components/espressif__esp_peer/include",
+    default=repo / "esp32/components/esp_peer/include",
 )
 parser.add_argument("--sanitize", action="store_true")
 args = parser.parse_args()

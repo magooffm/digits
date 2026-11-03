@@ -1,0 +1,264 @@
+# Changelog
+
+## v1.5.7
+
+### Bug Fixes
+
+- Fixed skipped nomination when XOR-MAPPED-ADDRESS was not a local candidate
+
+### Features
+
+- Added support for `prflx` candidate if not received in signaling yet
+- Added esp32c6 target support
+
+## v1.5.6
+
+### Bug Fixes
+
+- Fixed connection fail due to TCP and UDP use same IP and port (map candidate wrongly)
+- Fixed handshake HELLO request is dropped if received before connected (add cache logic)
+- Fixed connection fails due to ICE lite attribute set in SDP and no manual set ICE lite mode (no need to set)
+- Refined comment for SDP and candidate message string structure
+- Fixed ICE nominate wrongly if responded XOR mapped address not match local sent candidate even transaction ID matched
+- Fixed H264 profile use `4d001f` not match actual device capability
+
+## v1.5.5
+
+### Features
+
+- Added `REMB` RTCP receiver parser and report (no sending `REMB` report to peer)
+  - Parser enabled if `on_remb` callback is set
+- Added `TWCC` support, both report generate for sender and parsing for receiver
+  - User need manually enable `TWCC` use `esp_peer_default_twcc_cfg_t.enable`
+  - Can configuration the `TWCC` sending period and control its history cache
+- Added support for multiple audio and video codecs through `esp_peer_cfg_t.codec_caps`
+  - If not set (default), in SDP only send the codec set in audio/video info
+  - If set, when offer SDP, send all codecs that supported by the codec capabilities,
+    When answer SDP, only answer the supported ones in peer codec lists
+- Added `MJPEG` through RTP support follow RFC2435 (not supported by browser yet)
+  - Used for video call by 2 peers, low cpu consume than JPEG over data channel
+
+## v1.5.4
+
+### Features
+
+- Added "PLI" RTCP message handler and callback
+- Remove debug abort in sctp
+
+## v1.5.3
+
+- Fixed IDF v6 / mbedTLS 4.1 first-boot DTLS handshake fail (`-0x6e00`): use ClientHello
+  reassembly BIO, force datagram transport, per-session timer, and stricter cookie/PSA init
+
+## v1.5.2
+
+### Bug Fixes
+
+- Fixed handshake fail return `-0x7080` on mbedTLS version below than v3.6.6
+
+## v1.5.1
+
+### Bug Fixes
+
+- Fixed leakage caused by DTLS re-setup
+- Fixed data channel still create even peer sdp not contain data channel
+- Fixed aggressive SCTP resend logic, use exponential resend time as browser
+
+## v1.5.0
+
+### Features
+
+- Added TCP and TURNS support for agent
+
+## v1.4.2
+
+### Features
+
+- Added re-negotiation support when SDP changed during connected
+- Add ECDSA 256 support
+
+### Bug Fixes
+
+- Fixed nominate candidate too early when act as controlled
+- Treat DTLS role as client when peer send `actpass`
+- Treat `MBEDTLS_ERR_SSL_CLIENT_RECONNECT` as disconnected
+- Fixed un-reliable data channel failed to open due to DCEP message not retransmitted
+- Fixed memory leakage due to DTLS resource not free
+
+## v1.4.1
+
+### Features
+
+- Added `esp32s31` target support
+
+## v1.4.0
+
+### Features
+
+- Added ESP-IDF v6.0 support (backward compatible with IDF v5.x)
+- ICE Lite mode for non-initiator peers: Enabled answerer (non-offer SDP) to act as the controlling agent
+- RTP port parsing from SDP: Added support for FreeSWITCH WebRTC server compatibility
+- Refined DTLS pre-generate certification keys for faster session setup
+- Fixed premature ICE nomination
+  - Prevented use-candidate attribute from being signaled too early before final nomination
+
+## v1.3.4
+
+### Features
+
+- Added `alive_binding_retries` to configuration binding maximum retries before disconnected
+  - Binding retry is a keep alive mechanism to detect peer leave unexpected
+- Fixed connectivity check fail if remote candidate not acceptable (TCP etc)
+- Added video RTP RTX support
+
+### Bug Fixes
+
+- Fixed peer binding response discard if RTT over 400ms
+
+## v1.3.3
+
+### Features
+
+- Support PLI interval setting so that can control browser key frame send behavior
+
+## v1.3.2
+
+### Bug Fixes
+
+- Fixed auto disconnected from turn server after 10min due to no permission updated
+
+### Features
+
+- Added ICE lite support through configuration `ice_use_lite_mode`
+
+## v1.3.1
+
+### Bug Fixes
+
+- Fixed some turn server fail to connect due to user name too long
+
+## v1.3.0~1
+
+### Bug Fixes
+
+- Fixed esp32c5 library can not build on IDFv5.5.2
+
+## v1.3.0
+
+### Bug Fixes
+
+- Fixed crash caused by receiving SCTP messages before data channel creation
+- Fixed incorrect H264 profile usage when controlled by peer
+- Fixed race condition in SCTP reference counting
+- Fixed misleading fingerprint verification error logs
+- Fixed crash due to negative KMS server priority value
+- Fixed agent deinitialization while still in use
+
+### Features
+
+- Added RTP transformer support (custom packet processing)
+- Added H264 RTP decoder support
+- Added IPv6 compatibility
+- Added media direction negotiation based on SDP
+- Added agent argument validation
+- Added receive lock to prevent crashes during concurrent packet processing
+- Added weak UDP transport implementation (fallback for unreliable networks)
+- Added DTLS close_notify handling for graceful disconnection
+- Added configurable limit for maximum ICE candidates
+
+## v1.2.7
+
+### Bug Fixes
+
+- Fixed un-reliable data channel forward TSN not send when limit with 0 setting
+- Fixed DTLS role not follow sdp answer
+
+
+## v1.2.6
+
+### Bug Fixes
+
+- Added `msid` support in SDP
+- Fixed padding issue of TURN server relay packet
+- Fixed race condition for SCTP reference count
+- Fixed wrong fingerprint error log output
+
+### Features
+
+- Added esp32c5 support
+
+## v1.2.5
+
+### Bug Fixes
+
+- Fixed crash regression when ICE server number set to 0
+- Fixed relay only setting fail to build connection
+
+## v1.2.4
+
+### Bug Fixes
+
+- Fixed some turn server can not connect
+- Improve connectivity stability use relay server
+- Fixed `mbedtls_ssl_write` fail due to entropy freed
+- Fixed crash when keep alive checking during disconnect
+- Added DTLS key print for wireshark analysis
+
+## v1.2.3
+
+### Features
+
+- Added support for IDFv6.0
+- Added API `esp_peer_pre_generate_cert` for pre-generate DTLS key
+
+### Bug Fixes
+
+- Fixed build error on IDFv6.0
+- Make DTLS module to be open source
+- Fixed data channel role not follow DTLS role
+
+## v1.2.2
+
+### Bug Fixes
+
+- Fixed build error for component name miss matched
+
+## v1.2.1
+
+### Features
+
+- Make `esp_peer` as separate module for ESP Component Registry
+- Allow RTP rolling buffer allocated on RAM
+
+### Bug Fixes
+
+- Fixed handshake may error if agent receive handshake message during connectivity check
+
+## v1.2.0
+
+### Features
+
+- Added reliable and un-ordered data channel support
+- Added FORWARD-TSN support for un-ordered data channel
+
+### Bug Fixes
+
+- Fixed keep alive check not take effect if agent only have local candidates
+- Fixed agent mode not set if remote candidate already get
+
+## v1.1.0
+
+### Features
+
+- Export buffer configuration for RTP and data channel
+- Added support for multiple data channel
+- Added notify for data channel open, close event
+
+### Bug Fixes
+
+- Fixed keep alive check not take effect if peer closed unexpectedly
+
+
+## v1.0.0
+
+- Initial version of `peer_default`

@@ -751,11 +751,19 @@ The manifest and lock file pin:
 | Component | Version | Purpose |
 | --- | --- | --- |
 | ESP-IDF | 5.5.3 | Target SDK; includes mbedTLS 3.6.5 |
-| `espressif/esp_peer` | 1.5.7 | ICE, DTLS and encoded RTP peer API |
+| `espressif/esp_peer` | 1.5.7, patched copy in `components/esp_peer` | ICE, DTLS and encoded RTP peer API |
 | `espressif/esp_libsrtp` | 1.0.0 | Bundled libSRTP 3.0.0 |
 | `espressif/esp_websocket_client` | 1.6.1 | Existing Digits transport |
 | `espressif/esp_codec_dev` | 1.6.2 | Existing ES8311/ES7210 drivers |
 | `espressif/esp_audio_codec` | 2.6.2 | Direct Opus encode/decode APIs |
+
+esp_peer is used from `components/esp_peer` (`override_path`): its DTLS
+server restarted the handshake on every ~56 ms poll, so two ESP32 phones never
+connected (the slower ESP32 client's flight met a fresh session: `-0x7700`).
+Pion and browsers answer fast enough. The fix, and how to carry it to a new
+esp_peer release, is in `components/esp_peer/DIGITS.md`. Verified 2026-11-03:
+ESP32 to ESP32 connects in about one second, audio both ways, and hanging up
+while ringing or connected ends the call on both phones.
 
 The initial transport milestone sent validated `f8 ff fe` Opus silence and
 counted received packets. The call audio implementation replaces that source
