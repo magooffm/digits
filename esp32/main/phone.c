@@ -5,6 +5,7 @@
 #include "phone_fsm.h"
 #include "audio_board.h"
 #include "incoming_ring.h"
+#include "led_ring.h"
 #include "call_tones.h"
 #include "ringtones.h"
 #include "ring_select.h"
@@ -432,6 +433,7 @@ static void phone_task(void *arg)
     unsigned polls = 0;
     int64_t held_since[PHONE_CALL_TARGETS] = {0};
     bool hold_used[PHONE_CALL_TARGETS] = {false};
+    uint32_t led_ended_calls = 0; // The worker counts from 0 too.
     TickType_t poll_ticks = pdMS_TO_TICKS(POLL_MS) ? pdMS_TO_TICKS(POLL_MS) : 1;
     for (;;) {
         int64_t now = esp_timer_get_time();
@@ -523,6 +525,17 @@ static void phone_task(void *arg)
             if (!off_hook) digits_call_tones_stop();
         }
         digits_call_tones_play(out.tone); // Idempotent; keeps cadence.
+        if (call.ended_calls != led_ended_calls) {
+            digits_led_ring_call_ended(now);
+            led_ended_calls = call.ended_calls;
+        }
+        digits_led_ring_show(call.phase == DIGITS_CALL_CALLING || call.phase == DIGITS_CALL_RINGING ?
+                                 DIGITS_LED_RING_RINGING :
+                             call.phase >= DIGITS_CALL_CONNECTING ? DIGITS_LED_RING_CALL :
+                             fsm.line == PHONE_LINE_DIAL ? DIGITS_LED_RING_LIFTED :
+                             fsm.line == PHONE_LINE_BUSY || fsm.line == PHONE_LINE_REORDER ? DIGITS_LED_RING_ENDED :
+                             DIGITS_LED_RING_OFF,
+                             now);
         // Long press on hook with an idle line: open the setup network.
         for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {
             bool holding = err == ESP_OK && buttons[i].stable && !off_hook && call.phase == DIGITS_CALL_IDLE;
@@ -552,6 +565,7 @@ esp_err_t digits_phone_start(void)
     if (started) return ESP_ERR_INVALID_STATE;
     load_numbers();
     selectors_init();
+    digits_led_ring_init(); // Optional; logs why when it fails.
     digits_webrtc_set_ringtone_resolver(resolve_ringtone);
     esp_err_t err = inputs_init();
     if (err == ESP_OK &&

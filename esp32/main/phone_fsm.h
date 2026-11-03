@@ -13,7 +13,8 @@
 // Timings follow the Pi controller and Pico firmware (GR-506 style).
 #define PHONE_DIAL_TONE_TIMEOUT_US (15LL * 1000000)  // Unused dial tone.
 #define PHONE_TREATMENT_DELAY_US (1LL * 1000000)     // Silence before reorder.
-#define PHONE_REORDER_DURATION_US (45LL * 1000000)   // Then silent lockout.
+// The Pi plays reorder for 45 s; the board speaker makes that a nuisance.
+#define PHONE_HANGUP_TONE_US (5LL * 1000000)         // Busy or reorder, then silent lockout.
 #define PHONE_CALL_START_TIMEOUT_US (3LL * 1000000)  // Dialed call never started.
 
 // Debounced input. presses counts confirmed inactive -> active edges. The
@@ -71,8 +72,8 @@ typedef enum {
     PHONE_LINE_IDLE,    // On hook.
     PHONE_LINE_DIAL,    // Lifted, waiting for a call button: dial tone.
     PHONE_LINE_CALL,    // Calling, answering or talking: ringback while calling.
-    PHONE_LINE_BUSY,    // Busy tone until the handset is replaced.
-    PHONE_LINE_REORDER, // Short silence, then reorder.
+    PHONE_LINE_BUSY,    // Busy tone, then lockout.
+    PHONE_LINE_REORDER, // Short silence, then reorder, then lockout.
     PHONE_LINE_LOCKOUT, // Silent until the handset is replaced.
 } phone_line_t;
 

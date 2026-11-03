@@ -195,9 +195,9 @@ static void test_tones_outgoing_and_remote_hangup(void)
     assert(step().tone == TONE_GEN_NONE);
     at(110);
     assert(step().tone == TONE_GEN_REORDER);
-    at(100 + 459);
+    at(100 + 59);
     assert(step().tone == TONE_GEN_REORDER);
-    at(100 + 460);
+    at(100 + 60);
     assert(step().tone == TONE_GEN_NONE && fsm.line == PHONE_LINE_LOCKOUT);
     in.off_hook = false;
     assert(step().tone == TONE_GEN_NONE && fsm.line == PHONE_LINE_IDLE);
@@ -213,8 +213,10 @@ static void test_tones_busy(void)
     in.phase = PHONE_PHASE_IDLE;
     end_call(PHONE_END_BUSY, false);
     assert(step().tone == TONE_GEN_BUSY); // No delay for busy.
-    at(600);
-    assert(step().tone == TONE_GEN_BUSY); // Until the handset is replaced.
+    at(49);
+    assert(step().tone == TONE_GEN_BUSY);
+    at(50);
+    assert(step().tone == TONE_GEN_NONE && fsm.line == PHONE_LINE_LOCKOUT); // Silent until replaced.
     in.presses[1] = 2;
     assert(step().action == PHONE_ACTION_IGNORED_PRESS);
     in.off_hook = false;

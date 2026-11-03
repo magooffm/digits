@@ -190,6 +190,25 @@ menu "Digits development configuration"
             help
                 Songs are mastered near full scale. 12 puts their peaks at
                 the standard ring's level; raise it for louder songs.
+        config DIGITS_LED_RING_GPIO
+            int "LED ring data GPIO (-1: no LED ring)"
+            depends on DIGITS_PHONE
+            range -1 48
+            default 38
+            help
+                The board's WS2812 ring: yellow with dial tone, orange
+                flashing while a call rings (here or at the other end),
+                green during a call, red when it ends, off otherwise.
+        config DIGITS_LED_RING_LEDS
+            int "LEDs in the ring"
+            depends on DIGITS_PHONE
+            range 1 64
+            default 7
+        config DIGITS_LED_RING_BRIGHTNESS
+            int "LED ring brightness (percent)"
+            depends on DIGITS_PHONE
+            range 1 100
+            default 30
     endmenu
     menu "Answering machine"
         config DIGITS_VOICEMAIL

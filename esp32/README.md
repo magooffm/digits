@@ -359,6 +359,13 @@ commands. Rules follow the Pi controller:
   reorder) are logged and ignored. Replace the handset first, as on the Pi.
 - The incoming ringtone is silent while the handset is lifted. If a call
   arrives off-hook, replacing the handset starts ringing; it is not rejected.
+- The board's LED ring (7 WS2812 on GPIO38, `led_ring.c`) is a traffic
+  light: yellow with dial tone; orange flashing while a call rings, here or
+  at the other end; green during a call (also one the answering machine
+  takes); red when a call ends, on both sides, for 2 s or while the busy or
+  reorder tone plays; off otherwise, also while a lifted handset stays
+  silent after that tone. Menuconfig sets pin, count and
+  brightness (default 30 %); GPIO -1 disables it.
 
 ### Call-progress tones
 
@@ -372,7 +379,7 @@ generated in `tone_gen.c` instead of stored as WAV files:
 | Busy, or the far end left while ringing | Busy, 480+620 Hz, 0.5 s on / 0.5 s off |
 | Unreachable, failed, or the other side hung up | 1 s silence, then reorder, 480+620 Hz, 0.25 s on / 0.25 s off |
 | Dial tone unused for 15 s | Same reorder treatment |
-| 45 s of reorder | Silence until the handset is replaced |
+| 5 s of busy or reorder (the Pi: 45 s of reorder, busy without limit) | Silence until the handset is replaced |
 
 The Pi's spoken announcements and its howler tone are left out: there are no
 recordings on the ESP32, and the howler is too loud for the board speaker.

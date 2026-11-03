@@ -122,8 +122,9 @@ phone_output_t phone_fsm_step(phone_fsm_t *fsm, const phone_inputs_t *in)
     }
     if (fsm->line == PHONE_LINE_DIAL && in->now_us - fsm->line_since_us >= PHONE_DIAL_TONE_TIMEOUT_US)
         enter(fsm, PHONE_LINE_REORDER, in->now_us);
-    if (fsm->line == PHONE_LINE_REORDER &&
-        in->now_us - fsm->line_since_us >= PHONE_TREATMENT_DELAY_US + PHONE_REORDER_DURATION_US)
+    if ((fsm->line == PHONE_LINE_REORDER &&
+         in->now_us - fsm->line_since_us >= PHONE_TREATMENT_DELAY_US + PHONE_HANGUP_TONE_US) ||
+        (fsm->line == PHONE_LINE_BUSY && in->now_us - fsm->line_since_us >= PHONE_HANGUP_TONE_US))
         enter(fsm, PHONE_LINE_LOCKOUT, in->now_us);
 
     for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {

@@ -10,3 +10,4 @@ dependencies:
     override_path: "../components/esp_peer"
   espressif/esp_libsrtp: "1.0.0"
   espressif/esp-sr: "2.5.5"
+  espressif/led_strip: "3.0.3"
