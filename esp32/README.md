@@ -228,7 +228,11 @@ the setup page.
 
 Wi-Fi network and Digits server are saved on the phone (NVS namespace
 `digits_wifi`) and survive flashing. The menuconfig SSID, password and
-server URL are only fallbacks until something is saved; they may stay empty.
+server URL are only fallbacks until something is saved. Keep SSID and
+password empty (since 2026-11-03 the default build has none), so every phone
+asks for its own Wi-Fi; the server URL may stay as a prefill. Before
+clearing them on a phone that ran on them, save them on it with `wifi set`
+and `wifi server`, and its call buttons with `phone set`.
 
 The phone opens its setup network `Digits-Setup-XXXX` (the last digits of
 its MAC address) only when needed:
@@ -249,17 +253,27 @@ That password is the login: the page answers only on the setup network,
 never on the home network, and WPA2 also encrypts the home Wi-Fi password
 while you type it. Without a password the network is open and the log warns.
 
-**The page.** Joining the network opens it by itself, as on hotel Wi-Fi;
-otherwise go to `http://192.168.4.1`.
+**The wizard.** Three steps; the device used for setup changes network once.
 
-- **Status.** Wi-Fi, server and number, refreshed every few seconds.
-- **Pairing.** While unpaired, the server's 6-digit code. Note it, switch
-  back to the home Wi-Fi, open the server's Phones page (the link is shown),
-  enter the code and choose the number. The server has no automatic number
-  assignment: the number is always chosen there.
-- **Wi-Fi and server.** Network (nearby ones are suggested), password (empty
-  keeps the saved one of the same network) and `ws://HOST:PORT/ws`. Saving
-  restarts the phone.
+1. **Wi-Fi and server**, on the setup network. Joining it opens the page by
+   itself, as on hotel Wi-Fi; otherwise go to `http://192.168.4.1`. Network
+   (nearby ones are suggested), password (empty keeps the saved one of the
+   same network) and `ws://HOST:PORT/ws`. Saving restarts the phone; the
+   setup network comes back while it has no number. Reconnected, the page
+   says whether Wi-Fi and server work and shows the phone's address on the
+   home network.
+2. **Number**, on the home network at that address: the status page opens
+   with a setup panel. After logging in with the setup password it shows the
+   server's pairing code and a link to the server's pairing page; there the
+   number is chosen (the server assigns none by itself). The panel moves on
+   by itself once the server has paired the phone, and the setup network
+   closes.
+3. **Buttons 1 and 2** (A and B): who they call. **Later** skips; the Buttons
+   tab changes them any time. The panel shows while the phone has no number,
+   then while both buttons are empty.
+
+The setup network's page also offers firmware update and restart (folded
+away):
 - **Update firmware.** Upload `build/digits_signaling.bin`. It goes to the
   idle firmware slot, is checked (image checksum and project name) and the
   phone restarts into it. The new firmware confirms itself once the server

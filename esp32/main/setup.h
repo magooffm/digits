@@ -33,6 +33,8 @@ void digits_setup_report_number(const char *number); // NULL or "": unpaired.
 bool digits_setup_server_connected(void);
 bool digits_setup_paired(void);
 void digits_setup_number(char *out, size_t capacity); // "" when unpaired.
+// The server's current pairing code; "" when paired or none received yet.
+void digits_setup_pairing_code(char *out, size_t capacity);
 
 // Console only: also serve the page on the home network until restart.
 void digits_setup_allow_lan(void);

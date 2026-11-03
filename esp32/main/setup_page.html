@@ -13,38 +13,43 @@ input,button{font-size:1em;width:100%;box-sizing:border-box;padding:.6em}
 button{margin-top:1em;background:#2b2620;color:#f6f1e7;border:0;border-radius:4px}
 button.plain{background:#e7dfd1;color:#2b2620}
 dl{display:grid;grid-template-columns:auto 1fr;gap:.3em .8em;margin:0}dt{color:#6b6257}dd{margin:0;word-break:break-all}
-.code{font-size:2.2em;letter-spacing:.15em;font-family:ui-monospace,monospace;margin:.2em 0}
+.steps{display:flex;gap:.4em;margin:.6em 0 0;padding:0;list-style:none;font-size:.9em}
+.steps li{flex:1;padding:.4em;border-radius:4px;background:#e7dfd1;text-align:center}
+.steps li.on{background:#2b2620;color:#f6f1e7}.steps li.done{background:#d4e4cf}
+.big{font-size:1.3em;font-weight:600;word-break:break-all}
 .muted{color:#6b6257;font-size:.9em}.ok{color:#3c6e3c}.bad{color:#9b3b2b}
+.next{border-color:#8fb487;background:#f1f8ee}
+details{margin:1em 0}summary{cursor:pointer;color:#6b6257}
 progress{width:100%;margin-top:.8em}
 </style>
 </head>
 <body>
-<h1>Digits phone</h1>
+<h1>Digits phone setup</h1>
 <p class="muted" id="firmware"></p>
+<ol class="steps"><li id="s1" class="on">1 Wi-Fi</li><li id="s2">2 Number</li><li id="s3">3 Buttons</li></ol>
+
+<section id="next" class="next" hidden>
+<h2>Step 1 done</h2>
+<p>The phone is on <b id="nextssid"></b>. Switch this device to that network too, then open</p>
+<p class="big"><a id="nextlink" href="#"></a></p>
+<p class="muted">There you get a number from your Digits server and choose who buttons 1 and 2 call.
+You need the setup password once more. This setup network closes when the phone has its number.</p>
+</section>
+
+<section id="paired" class="next" hidden>
+<h2>This phone is set up</h2>
+<p>Number <b id="pairednumber"></b>. Its settings are at <a id="pairedlink" href="#"></a> on your Wi-Fi.</p>
+</section>
 
 <section>
-<h2>Status</h2>
+<h2>Step 1: Wi-Fi and server</h2>
 <dl>
 <dt>Wi-Fi</dt><dd id="wifi">...</dd>
 <dt>Server</dt><dd id="server">...</dd>
-<dt>Number</dt><dd id="number">...</dd>
 </dl>
-</section>
-
-<section id="pairing" hidden>
-<h2>Pairing</h2>
-<p>Note this code:</p>
-<p class="code" id="code"></p>
-<p>Switch your phone back to your home Wi-Fi, open <a id="pairlink" href="#"></a>,
-choose <b>Pair a new handset</b>, enter the code and pick a 7-digit number
-(or add this phone to an existing line). The code is valid for 10 minutes;
-this page shows a new one when it expires.</p>
-</section>
-
-<section>
-<h2>Wi-Fi and server</h2>
+<p class="bad" id="problem" hidden></p>
 <form id="wifiform" method="post" action="/wifi">
-<label for="ssid">Network</label>
+<label for="ssid">Your Wi-Fi network</label>
 <input id="ssid" name="ssid" list="nets" required maxlength="32" autocomplete="off">
 <datalist id="nets"></datalist>
 <label for="password">Password</label>
@@ -57,6 +62,8 @@ this page shows a new one when it expires.</p>
 <p class="muted"><a href="/scan">Search for networks again</a></p>
 </section>
 
+<details>
+<summary>Firmware update and restart</summary>
 <section>
 <h2>Update firmware</h2>
 <p class="muted">A <code>digits_signaling.bin</code> from <code>esp32/build</code>. If the new
@@ -66,25 +73,30 @@ firmware fails to start, the phone goes back to the current one.</p>
 <progress id="progress" max="100" value="0" hidden></progress>
 <p id="uploadresult"></p>
 </section>
-
 <section>
 <h2>Restart</h2>
 <form method="post" action="/restart"><button class="plain">Restart the phone</button></form>
 </section>
+</details>
 
 <script>
 function $(id){return document.getElementById(id)}
 var filled=false;
 function show(s){
   $('firmware').textContent='Firmware '+s.firmware;
-  $('wifi').innerHTML='';$('wifi').textContent=s.wifi.ssid?(s.wifi.ssid+(s.wifi.connected?' (connected, '+s.wifi.rssi+' dBm)':' (not connected)')):'not configured';
+  $('wifi').textContent=s.wifi.ssid?(s.wifi.ssid+(s.wifi.connected?' (connected, '+s.wifi.rssi+' dBm)':' (not connected)')):'not configured';
   $('wifi').className=s.wifi.connected?'ok':'bad';
   $('server').textContent=s.server.url?(s.server.url+(s.server.connected?' (connected)':' (not connected)')):'not configured';
   $('server').className=s.server.connected?'ok':'bad';
-  $('number').textContent=s.number||'not paired yet';
-  var pairing=!s.number&&s.code;
-  $('pairing').hidden=!pairing;
-  if(pairing){$('code').textContent=s.code;$('pairlink').textContent=s.pairing_page;$('pairlink').href=s.pairing_page}
+  var link=s.wifi.ip?'http://'+s.wifi.ip+'/':'';
+  var problem=!s.wifi.ssid?'':!s.wifi.connected?'The phone cannot join '+s.wifi.ssid+' yet. Check the network and password.':
+    !s.server.connected?'The phone is on your Wi-Fi but cannot reach the server. Check the server address.':'';
+  $('problem').textContent=problem;$('problem').hidden=!problem;
+  var ready=s.wifi.connected&&s.server.connected&&link;
+  $('next').hidden=!ready||!!s.number;$('paired').hidden=!ready||!s.number;
+  if(ready){$('nextssid').textContent=s.wifi.ssid;$('nextlink').textContent=link;$('nextlink').href=link;
+    $('pairednumber').textContent=s.number;$('pairedlink').textContent=link;$('pairedlink').href=link}
+  $('s1').className=ready?'done':'on';$('s2').className=s.number?'done':'';
   if(!filled){filled=true;$('ssid').value=s.wifi.ssid;$('url').value=s.server.url;
     s.networks.forEach(function(n){var o=document.createElement('option');o.value=n;$('nets').appendChild(o)})}
 }

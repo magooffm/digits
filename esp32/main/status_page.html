@@ -23,12 +23,19 @@ input,select{font-size:.95em;padding:.3em;max-width:100%}
 .ok{color:#3c6e3c}.bad{color:#9b3b2b}.muted{color:#6b6257;font-size:.9em}.new{font-weight:600}
 .warn{background:#fff3d6;border-color:#e8c46a}
 audio{height:2em;max-width:100%}
+.next{border-color:#8fb487;background:#f1f8ee}
+.steps{display:flex;gap:.4em;margin:0 0 .8em;padding:0;list-style:none;font-size:.9em}
+.steps li{flex:1;padding:.35em;border-radius:4px;background:#e7dfd1;text-align:center}
+.steps li.on{background:#2b2620;color:#f6f1e7}.steps li.done{background:#d4e4cf}
+.code{font-size:2em;letter-spacing:.15em;font-family:ui-monospace,monospace;margin:.2em 0}
+.wiz label{display:block;margin:.5em 0}.wiz ol{padding-left:1.2em}.wiz ol.steps{padding:0}
 #toast{position:fixed;bottom:1em;left:50%;transform:translateX(-50%);background:#2b2620;color:#f6f1e7;padding:.5em 1em;border-radius:4px;display:none}
 </style>
 </head>
 <body>
 <h1 id="title">Digits phone</h1>
 <p class="muted"><span id="firmware"></span> &middot; up <span id="uptime"></span> <span id="login"></span></p>
+<section id="setup" class="next wiz" hidden></section>
 <nav id="tabs">
 <button data-tab="status" class="on">Status</button><button data-tab="buttons">Buttons</button>
 <button data-tab="ringtones">Ringtones</button><button data-tab="messages">Messages</button>
@@ -137,9 +144,55 @@ function toast(t){var e=$('toast');e.textContent=t;e.style.display='block';clear
 function set(id,text,good){$(id).textContent=text;$(id).className=good===undefined?'':good?'ok':'bad'}
 var cfg=null,tab='status',wait=3000,authorized=false;
 
+// ---- Setup wizard, steps 2 and 3 (step 1, Wi-Fi, is on the setup network).
+// Shown while the phone has no number, then until button 1 or 2 has one.
+var setupHtml='',setupStep=0,setupLater=false,setupAsked=false,lastStatus=null;
+function steps(n){
+  function c(i){return i<n?'done':i==n?'on':''}
+  return '<ol class="steps"><li class="done">1 Wi-Fi</li><li class="'+c(2)+'">2 Number</li><li class="'+c(3)+'">3 Buttons</li></ol>';
+}
+function drawSetup(s){
+  lastStatus=s;
+  if(s.number&&!cfg&&s.authorized&&!setupAsked){setupAsked=true;loadConfig()}
+  var step=!s.number?2:cfg&&!cfg.buttons[0].number&&!cfg.buttons[1].number&&!setupLater?3:setupStep==4?4:0;
+  $('setup').hidden=!step;
+  var html='';
+  if(step==2&&!s.authorized)
+    html=steps(2)+'<p>Next this phone gets its number from your Digits server. Log in with the setup password first.</p>'+
+      '<p><a class="btn" href="/login">Log in</a></p>';
+  else if(step==2&&!s.pairing.code)
+    html=steps(2)+'<p>Waiting for a pairing code from the server'+(s.server.connected?'...':': the phone cannot reach it ('+esc(s.server.url)+').')+'</p>';
+  else if(step==2)
+    html=steps(2)+'<p>Pairing code</p><p class="code">'+esc(s.pairing.code)+'</p><ol>'+
+      '<li>Open <a target="_blank" rel="noopener" href="'+esc(s.pairing.page)+'">'+esc(s.pairing.page)+'</a> (your Digits server) and sign in.</li>'+
+      '<li>Choose <b>Pair a new handset</b>, enter the code and pick a 7-digit number, or add this phone to an existing line.</li>'+
+      '<li>Come back here: this page continues by itself once the phone has its number.</li></ol>'+
+      '<p class="muted">The code is valid for 10 minutes; a new one appears here when it expires.</p>';
+  else if(step==3&&setupStep==3)return; // Keep what is being typed.
+  else if(step==3)
+    html=steps(3)+'<p>This phone is now <b>'+esc(s.number)+'</b>. Who should its two call buttons call?</p>'+
+      '<label>Button 1 <input id="wiz1" inputmode="numeric" maxlength="15" placeholder="number"></label>'+
+      '<label>Button 2 <input id="wiz2" inputmode="numeric" maxlength="15" placeholder="number"></label>'+
+      '<p><button class="btn" onclick="saveWizard()">Save</button> <button class="btn light" onclick="setupLater=true;drawSetup(lastStatus)">Later</button></p>'+
+      '<p class="muted">You can change both any time on the Buttons tab.</p>';
+  else if(step==4)return;
+  setupStep=step;
+  if(html!=setupHtml){$('setup').innerHTML=html;setupHtml=html}
+}
+function saveWizard(){
+  var n1=$('wiz1').value.replace(/\D/g,''),n2=$('wiz2').value.replace(/\D/g,'');
+  if(!n1&&!n2){toast('Enter a number for button 1 or 2, or choose Later');return}
+  act('/api/button',{button:0,number:n1},function(){act('/api/button',{button:1,number:n2},function(){
+    setupStep=4;setupHtml='';
+    $('setup').innerHTML='<p><b>Setup complete.</b> This phone is '+esc(lastStatus.number)+'. Button 1 calls '+(n1||'nobody')+
+      ', button 2 calls '+(n2||'nobody')+'.</p><p><button class="btn light" onclick="setupStep=0;$(\'setup\').hidden=true">Close</button></p>';
+    loadConfig()})});
+}
+
 // ---- Status
 function show(s){
   authorized=s.authorized;
+  drawSetup(s);
   $('title').textContent='Digits phone '+(s.number||'');
   $('firmware').textContent=s.firmware;
   var u=s.uptime_s,d=Math.floor(u/86400),h=Math.floor(u%86400/3600),m=Math.floor(u%3600/60);
@@ -197,7 +250,7 @@ function uploadSong(){
   upload('/api/ringtone?name='+encodeURIComponent(f.name),$('songfile'),'songprogress');
 }
 function loadConfig(){
-  fetch('/api/config').then(need).then(function(c){cfg=c;drawButtons();drawPositions();drawGreeting();drawListen();drawMic()})
+  fetch('/api/config').then(need).then(function(c){cfg=c;if(lastStatus)drawSetup(lastStatus);drawButtons();drawPositions();drawGreeting();drawListen();drawMic()})
     .catch(function(e){
       if(e!='login'){toast('Could not show the settings');console.error(e);return}
       locked('buttonlist');locked('positions');$('greetingstate').innerHTML='<a href="/login">Log in</a> to see this.'});

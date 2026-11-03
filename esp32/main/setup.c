@@ -104,6 +104,13 @@ void digits_setup_number(char *out, size_t capacity)
     portEXIT_CRITICAL(&state_mux);
 }
 
+void digits_setup_pairing_code(char *out, size_t capacity)
+{
+    portENTER_CRITICAL(&state_mux);
+    snprintf(out, capacity, "%s", state.code);
+    portEXIT_CRITICAL(&state_mux);
+}
+
 bool digits_setup_paired(void)
 {
     portENTER_CRITICAL(&state_mux);
@@ -245,6 +252,9 @@ static esp_err_t status_get(httpd_req_t *req)
     cJSON_AddStringToObject(w, "ssid", wifi.ssid);
     cJSON_AddBoolToObject(w, "connected", digits_wifi_online());
     cJSON_AddNumberToObject(w, "rssi", digits_wifi_rssi());
+    char address[16] = "";
+    digits_wifi_address(address, sizeof(address));
+    cJSON_AddStringToObject(w, "ip", address);
     cJSON_AddStringToObject(s, "url", wifi.url);
     cJSON_AddBoolToObject(s, "connected", server_connected);
     cJSON_AddStringToObject(root, "number", number);
@@ -303,8 +313,9 @@ static esp_err_t wifi_post(httpd_req_t *req)
     esp_err_t err = digits_wifi_save(ssid, password, url);
     if (err != ESP_OK) return send_message(req, "Not saved", "The phone could not store the settings.");
     ESP_LOGI(TAG, "Setup page saved network %s and server %s; restarting", ssid, url);
-    send_message(req, "Saved", "The phone restarts and joins the network. If it cannot connect, this setup "
-                               "network comes back after two minutes.");
+    send_message(req, "Saved", "The phone restarts and joins your Wi-Fi. Until it has a number this setup "
+                               "network stays open: reconnect to it if your device switched away, then "
+                               "open this page again for the next step.");
     restart_soon();
     return ESP_OK;
 }

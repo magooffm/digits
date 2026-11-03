@@ -141,7 +141,7 @@ void digits_status_json_string(char *out, size_t capacity, const char *text)
     out[at] = '\0';
 }
 
-#define STATUS_BYTES 1024
+#define STATUS_BYTES 1536
 
 // Written into one PSRAM buffer: many small cJSON allocations would land in
 // internal RAM, which calls need.
@@ -160,11 +160,21 @@ static esp_err_t status_get(httpd_req_t *req)
     digits_wifi_address(address, sizeof(address));
     digits_status_json_string(ssid, sizeof(ssid), wifi.ssid);
     digits_status_json_string(url, sizeof(url), wifi.url);
+    // The setup wizard on the home network: pairing code and the server's
+    // page to claim it, only while unpaired and only after login.
+    char code[8] = "", code_json[20], page[WIFI_SETUP_URL_BYTES + 16] = "", page_json[2 * sizeof(page) + 3];
+    if (allowed && !number[0]) {
+        digits_setup_pairing_code(code, sizeof(code));
+        wifi_setup_pairing_page(wifi.url, page, sizeof(page));
+    }
+    digits_status_json_string(code_json, sizeof(code_json), code);
+    digits_status_json_string(page_json, sizeof(page_json), page);
     char *text = heap_caps_malloc(STATUS_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!text) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
     int unheard = digits_voicemail_unheard();
     snprintf(text, STATUS_BYTES,
              "{\"firmware\":\"%s\",\"uptime_s\":%llu,\"number\":\"%s\",\"authorized\":%s,"
+             "\"pairing\":{\"code\":%s,\"page\":%s},"
              "\"call\":{\"phase\":\"%s\",\"remote\":\"%s\"},"
              "\"silence\":{\"silent\":%s,\"server\":%s,\"overridden\":%s},\"voice_style\":\"%s\","
              "\"voicemail\":{\"ready\":%s,\"enabled\":%s,\"timeout_s\":%u,\"unheard\":%d},"
@@ -173,7 +183,7 @@ static esp_err_t status_get(httpd_req_t *req)
              "\"sd\":\"%s, ringtones: %s\","
              "\"memory\":{\"internal_free\":%u,\"internal_min\":%u,\"internal_largest\":%u,\"psram_free\":%u}}",
              esp_app_get_description()->version, (unsigned long long)(esp_timer_get_time() / 1000000), number,
-             allowed ? "true" : "false", phase_name(call.phase),
+             allowed ? "true" : "false", code_json, page_json, phase_name(call.phase),
              allowed && call.phase != DIGITS_CALL_IDLE ? call.remote : "",
              silence.effective ? "true" : "false", silence.server ? "true" : "false",
              silence.overridden ? "true" : "false",
