@@ -11,13 +11,14 @@ IDF := source "$(IDF_PATH)/export.sh" >/dev/null && idf.py
 # flatpak-spawn. The [e]sp pattern keeps pkill from matching its own shell.
 HOST := $(if $(shell command -v flatpak-spawn 2>/dev/null),flatpak-spawn --host,)
 
-.PHONY: help build flash monitor deploy kill-monitors test test-quick menuconfig size clean
+.PHONY: help build flash monitor deploy fresh kill-monitors test test-quick menuconfig size clean
 
 help:
 	@echo "make build       compile firmware"
 	@echo "make flash       build if needed, then flash to PORT=$(PORT)"
 	@echo "make monitor     serial console (exit with Ctrl+])"
 	@echo "make deploy      build, flash and open the serial console"
+	@echo "make fresh       new board: build, erase it completely, flash (asks first)"
 	@echo "make kill-monitors  stop every serial monitor and free PORT"
 	@echo "                 (flash, monitor and deploy do this first)"
 	@echo "make test        all host tests, normal and sanitized"
@@ -36,6 +37,19 @@ monitor: kill-monitors
 
 deploy: kill-monitors
 	@$(IDF) -p $(PORT) flash monitor
+
+# A new board: erase once (Waveshare's demo leaves data behind), then flash.
+# Erasing deletes pairing, number and settings, so it shows the board's MAC
+# and asks first. Building comes first: a build error erases nothing.
+fresh: build kill-monitors
+	@echo "Board on $(PORT):"
+	@source "$(IDF_PATH)/export.sh" >/dev/null 2>&1 && esptool.py --port $(PORT) read_mac 2>/dev/null | grep -m1 "MAC:" \
+		|| { echo "No board answers on $(PORT)"; exit 1; }
+	@echo "This erases EVERYTHING on that board: pairing, number, settings, saved Wi-Fi."
+	@read -r -p "Type ERASE to continue: " answer; [ "$$answer" = ERASE ] || { echo "Cancelled, nothing erased"; exit 1; }
+	@$(IDF) -p $(PORT) erase-flash
+	@$(IDF) -p $(PORT) flash
+	@echo "Done. Join the Digits-Setup-XXXX network with the setup password to start the wizard."
 
 # Hidden VS Code task terminals can keep an old monitor holding the port.
 kill-monitors:

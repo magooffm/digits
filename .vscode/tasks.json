@@ -28,6 +28,14 @@
             "presentation": { "clear": true }
         },
         {
+            "label": "ESP32: Fresh install (new board)",
+            "detail": "Builds, erases the whole board and flashes it. Shows the board's MAC and asks for ERASE first",
+            "type": "shell",
+            "command": "make -C esp32 fresh PORT=${input:freshPort}",
+            "problemMatcher": "$gcc",
+            "presentation": { "panel": "dedicated", "focus": true, "clear": true }
+        },
+        {
             "label": "ESP32: Monitor",
             "type": "shell",
             "command": "make -C esp32 monitor",
@@ -95,6 +103,14 @@
             "command": "make -C esp32 menuconfig",
             "problemMatcher": [],
             "presentation": { "panel": "dedicated", "focus": true }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "freshPort",
+            "type": "promptString",
+            "description": "Serial port of the NEW board (your running phone is usually /dev/ttyACM0)",
+            "default": "/dev/ttyACM1"
         }
     ]
 }
