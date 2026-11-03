@@ -1,4 +1,5 @@
 #include "web_config.h"
+#include "audio_board.h"
 #include "call_tones.h"
 #include "phone.h"
 #include "ringtones.h"
@@ -247,9 +248,9 @@ static esp_err_t config_get(httpd_req_t *req)
     bool hear_greeting, hear_caller;
     digits_voicemail_listen(&hear_greeting, &hear_caller);
     at = append(out, at, CONFIG_JSON_BYTES, "],\"listen\":{\"greeting\":%s,\"caller\":%s},"
-                "\"mic\":{\"gain_db\":%d,\"max_db\":%d",
+                "\"mic\":{\"gain_db\":%d,\"max_db\":%d},\"speaker\":{\"volume\":%d",
                 hear_greeting ? "true" : "false", hear_caller ? "true" : "false", tx_voice_gain_db(),
-                TX_VOICE_GAIN_MAX_DB);
+                TX_VOICE_GAIN_MAX_DB, digits_audio_speaker_volume());
     at = append(out, at, CONFIG_JSON_BYTES,
                 "},\"card\":\"%s\",\"greeting\":{\"kind\":\"%s\",\"seconds\":%u,"
                 "\"recording\":{\"state\":\"%s\",\"seconds\":%u.%u,\"message\":\"%s\"}}}",
@@ -510,6 +511,24 @@ static esp_err_t mic_post(httpd_req_t *req)
     return done(req, run_internal(apply_mic, &db), "Saved");
 }
 
+static esp_err_t apply_volume(const void *arg)
+{
+    return digits_audio_speaker_set_volume(*(const int *)arg);
+}
+
+static esp_err_t volume_post(httpd_req_t *req)
+{
+    esp_err_t result;
+    if (!may_write(req, &result)) return result;
+    char body[FORM_BYTES];
+    int size = read_form(req, body, sizeof(body));
+    unsigned long volume;
+    if (size < 0 || !form_number(body, (size_t)size, "volume", &volume) || volume > 100)
+        return done(req, ESP_ERR_INVALID_ARG, "");
+    int value = (int)volume;
+    return done(req, run_internal(apply_volume, &value), "Saved");
+}
+
 // ---- Greeting -------------------------------------------------------------
 
 static esp_err_t greeting_get(httpd_req_t *req)
@@ -611,6 +630,7 @@ void digits_web_config_register(httpd_handle_t server)
         {.uri = "/api/greeting-new", .method = HTTP_GET, .handler = greeting_new_get},
         {.uri = "/api/listen", .method = HTTP_POST, .handler = listen_post},
         {.uri = "/api/mic", .method = HTTP_POST, .handler = mic_post},
+        {.uri = "/api/volume", .method = HTTP_POST, .handler = volume_post},
         {.uri = "/api/firmware", .method = HTTP_POST, .handler = firmware_post},
     };
     for (unsigned i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i)

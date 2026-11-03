@@ -25,6 +25,12 @@ esp_err_t digits_audio_record_button_read(bool *pressed);
 esp_err_t digits_audio_board_keys_init(void);
 esp_err_t digits_audio_board_keys_read(uint8_t *pressed);
 
+// Speaker volume 0-100 (the codec maps it to -50..0 dB), saved in NVS.
+// Applies at once, also mid-call; set it from an internal-RAM stack.
+#define DIGITS_SPEAKER_VOLUME_DEFAULT 50
+int digits_audio_speaker_volume(void);
+esp_err_t digits_audio_speaker_set_volume(int volume);
+
 // Reserve output across recording/playback; never acquire from the WS callback.
 bool digits_audio_speaker_acquire(uint32_t timeout_ms);
 void digits_audio_speaker_release(void);

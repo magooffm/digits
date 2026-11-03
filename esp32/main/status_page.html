@@ -75,6 +75,11 @@ to the current firmware by itself. Not during a call.</p>
 <p class="muted">Who each button calls and how their phone rings. "Rings here" is how their calls
 ring on this phone: the contact's knob picks a position, the Ringtones tab what it plays.</p>
 <table id="buttonlist"></table></section>
+<section><h2>Speaker</h2>
+<p><label>Volume <select id="volume" class="mwrite" onchange="saveVolume()"></select></label></p>
+<p class="muted">How loud calls, ringtones and tones play on the phone's speaker. Applies at once,
+also during a call.</p>
+</section>
 <section><h2>Microphone</h2>
 <p><label>Gain <select id="micgain" class="mwrite" onchange="saveMic()"></select></label></p>
 <p class="muted">How loud the other side hears you. Echo cancellation keeps the speaker out of it.
@@ -270,7 +275,7 @@ function uploadSong(){
   upload('/api/ringtone?name='+encodeURIComponent(f.name),$('songfile'),'songprogress');
 }
 function loadConfig(){
-  fetch('/api/config').then(need).then(function(c){cfg=c;if(lastStatus)drawSetup(lastStatus);drawButtons();drawPositions();drawGreeting();drawListen();drawMic()})
+  fetch('/api/config').then(need).then(function(c){cfg=c;if(lastStatus)drawSetup(lastStatus);drawButtons();drawPositions();drawGreeting();drawListen();drawMic();drawVolume()})
     .catch(function(e){
       if(e!='login'){toast('Could not show the settings');console.error(e);return}
       locked('buttonlist');locked('positions');$('greetingstate').innerHTML='<a href="/login">Log in</a> to see this.'});
@@ -347,6 +352,14 @@ function drawMic(){
   s.innerHTML=h;s.value=cfg.mic.gain_db;s.disabled=!cfg.writable;
 }
 function saveMic(){act('/api/mic',{gain_db:$('micgain').value},loadConfig)}
+// The codec maps 0-100 linearly to -50..0 dB.
+function drawVolume(){
+  var s=$('volume'),h='',v=cfg.speaker.volume;
+  for(var n=30;n<=100;n+=5)h+='<option value="'+n+'">'+n+' ('+(n/2-50)+' dB)'+(n==50?', default':'')+'</option>';
+  if(v<30||v%5)h+='<option value="'+v+'">'+v+'</option>';
+  s.innerHTML=h;s.value=v;s.disabled=!cfg.writable;
+}
+function saveVolume(){act('/api/volume',{volume:$('volume').value},loadConfig)}
 function saveListen(){act('/api/listen',{greeting:$('heargreeting').checked?1:0,caller:$('hearcaller').checked?1:0},loadConfig)}
 function contact(number){
   if(cfg)for(var i=0;i<cfg.buttons.length;i++)if(cfg.buttons[i].number==number)return 'Button '+cfg.buttons[i].name+' ('+number+')';

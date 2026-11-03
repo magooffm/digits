@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "nvs.h"
 
 // Waveshare v1.1: PA_CTRL is Extend_IO8 / TCA9555 P10, active high.
 #define PA_BIT (1U << 0)
@@ -15,7 +16,8 @@
 #define RECORD_KEY_BIT (1U << 1)
 #define BOARD_KEYS_SHIFT 1
 #define BOARD_KEYS_MASK (0x7U << BOARD_KEYS_SHIFT)
-#define SPEAKER_VOLUME 50
+#define NVS_NAMESPACE "digits_audio"
+static int speaker_volume = DIGITS_SPEAKER_VOLUME_DEFAULT;
 
 static struct {
     i2c_master_bus_handle_t bus;
@@ -100,6 +102,12 @@ static esp_err_t verify_format(i2s_chan_handle_t channel, bool enabled)
 esp_err_t digits_audio_board_init(void)
 {
     if (board.bus) return ESP_ERR_INVALID_STATE;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        uint8_t value;
+        if (nvs_get_u8(nvs, "volume", &value) == ESP_OK && value <= 100) speaker_volume = value;
+        nvs_close(nvs);
+    }
     esp_err_t err;
 #define TRY(call) do { err = (call); if (err != ESP_OK) goto fail; } while (0)
     i2c_master_bus_config_t bus = {
@@ -169,7 +177,7 @@ esp_err_t digits_audio_board_init(void)
         .bits_per_sample = 16, .mclk_multiple = 256,
     };
     if (esp_codec_dev_open(board.device, &sample) != ESP_CODEC_DEV_OK ||
-        esp_codec_dev_set_out_vol(board.device, SPEAKER_VOLUME) != ESP_CODEC_DEV_OK ||
+        esp_codec_dev_set_out_vol(board.device, speaker_volume) != ESP_CODEC_DEV_OK ||
         esp_codec_dev_set_out_mute(board.device, true) != ESP_CODEC_DEV_OK) {
         err = ESP_FAIL;
         goto fail;
@@ -184,7 +192,7 @@ esp_err_t digits_audio_board_init(void)
     board.speaker_lock = xSemaphoreCreateMutex();
     if (!board.speaker_lock) { err = ESP_ERR_NO_MEM; goto fail; }
     ESP_LOGI("audio_board", "Speaker ready: ES8311 DAC, 48000 Hz, MCLK=12288000 Hz; PA=TCA9555 P10; volume=%d",
-             SPEAKER_VOLUME);
+             speaker_volume);
     return ESP_OK;
 fail:
     release_board();
@@ -193,6 +201,22 @@ fail:
 }
 
 i2c_master_bus_handle_t digits_audio_i2c_bus(void) { return board.bus; }
+
+int digits_audio_speaker_volume(void) { return __atomic_load_n(&speaker_volume, __ATOMIC_RELAXED); }
+
+esp_err_t digits_audio_speaker_set_volume(int volume)
+{
+    if (volume < 0 || volume > 100) return ESP_ERR_INVALID_ARG;
+    if (board.device && esp_codec_dev_set_out_vol(board.device, volume) != ESP_CODEC_DEV_OK) return ESP_FAIL;
+    __atomic_store_n(&speaker_volume, volume, __ATOMIC_RELAXED);
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(nvs, "volume", (uint8_t)volume);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
 i2s_chan_handle_t digits_audio_rx_channel(void) { return board.rx; }
 
 esp_err_t digits_audio_record_button_init(void)

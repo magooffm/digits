@@ -64,7 +64,8 @@ bookmarks (`/#messages`):
   a call; same checks and rollback as on the setup network's page.
 - **Buttons.** Each call button's number and the ringtone the called phone
   rings with; how their calls ring here (knob position, settable here while
-  no physical knob is fitted). Below, the microphone gain (see "Echo
+  no physical knob is fitted). Below, the speaker volume (0-100, the codec's
+  -50..0 dB; default 50, saved) and the microphone gain (see "Echo
   cancellation and microphone gain").
 - **Ringtones.** For every knob position one choice: a built-in ringtone or
   a song from the SD card library (see "Ringtones from the SD card"). Below,
@@ -1185,8 +1186,9 @@ The expander writes preserve every other pin; PA is latched low before
 configuring its direction. TX and RX retain the same clock/slot configuration
 during operation; microphone diagnostics never reconfigure speaker output.
 
-The initial DAC volume is **50/100** and the generated PCM peak is capped at
-25% of full scale. Short fades reduce clicks. This is an intentionally low
+The DAC volume defaults to **50/100** (-25 dB; the status page's Buttons
+tab changes it, saved in NVS `digits_audio`) and the generated PCM peak is
+capped at 25% of full scale. Short fades reduce clicks. This is an intentionally low
 starting level; actual loudness must be assessed on the board. The amplifier
 is disabled and DAC muted while idle. DMA auto-clear prevents a stale buffer
 from repeating after playback. Codec initialization failure is logged and
