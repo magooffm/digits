@@ -434,6 +434,7 @@ static void phone_task(void *arg)
     int64_t held_since[PHONE_CALL_TARGETS] = {0};
     bool hold_used[PHONE_CALL_TARGETS] = {false};
     uint32_t led_ended_calls = 0; // The worker counts from 0 too.
+    bool reached_server = false;
     TickType_t poll_ticks = pdMS_TO_TICKS(POLL_MS) ? pdMS_TO_TICKS(POLL_MS) : 1;
     for (;;) {
         int64_t now = esp_timer_get_time();
@@ -525,6 +526,7 @@ static void phone_task(void *arg)
             if (!off_hook) digits_call_tones_stop();
         }
         digits_call_tones_play(out.tone); // Idempotent; keeps cadence.
+        reached_server = reached_server || call.online;
         if (call.ended_calls != led_ended_calls) {
             digits_led_ring_call_ended(now);
             led_ended_calls = call.ended_calls;
@@ -534,7 +536,7 @@ static void phone_task(void *arg)
                              call.phase >= DIGITS_CALL_CONNECTING ? DIGITS_LED_RING_CALL :
                              fsm.line == PHONE_LINE_DIAL ? DIGITS_LED_RING_LIFTED :
                              fsm.line == PHONE_LINE_BUSY || fsm.line == PHONE_LINE_REORDER ? DIGITS_LED_RING_ENDED :
-                             DIGITS_LED_RING_OFF,
+                             reached_server ? DIGITS_LED_RING_OFF : DIGITS_LED_RING_STARTING,
                              now);
         // Long press on hook with an idle line: open the setup network.
         for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {

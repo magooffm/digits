@@ -2,6 +2,7 @@
 #include "status.h"
 #include "web_config.h"
 #include "wifi.h"
+#include "led_ring.h"
 #include "webrtc.h"
 #include "wifi_setup_form.h"
 #include <stdio.h>
@@ -423,9 +424,11 @@ esp_err_t digits_setup_receive_firmware(httpd_req_t *req, digits_flash_runner_t 
         job.length = (size_t)n;
         err = ota_run(run, &job, OTA_WRITE);
         left -= (size_t)n;
+        digits_led_ring_upload((int)(100 - (uint64_t)left * 100 / req->content_len));
     }
     free(chunk);
     if (err != ESP_OK) {
+        digits_led_ring_upload(DIGITS_LED_RING_UPLOAD_FAILED);
         if (begun) ota_run(run, &job, OTA_ABORT);
         ESP_LOGE(TAG, "Firmware upload failed: %s", esp_err_to_name(err));
         return httpd_resp_send(req, "Upload failed; the phone keeps its current firmware.", HTTPD_RESP_USE_STRLEN);
@@ -435,11 +438,13 @@ esp_err_t digits_setup_receive_firmware(httpd_req_t *req, digits_flash_runner_t 
     if (err == ESP_OK && strncmp(job.description.project_name, esp_app_get_description()->project_name,
                                  sizeof(job.description.project_name))) {
         ESP_LOGE(TAG, "Uploaded firmware is for %s", job.description.project_name);
+        digits_led_ring_upload(DIGITS_LED_RING_UPLOAD_FAILED);
         return httpd_resp_send(req, "That file is not Digits phone firmware; nothing changed.", HTTPD_RESP_USE_STRLEN);
     }
     if (err == ESP_OK) err = ota_run(run, &job, OTA_BOOT);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Firmware rejected: %s", esp_err_to_name(err));
+        digits_led_ring_upload(DIGITS_LED_RING_UPLOAD_FAILED);
         return httpd_resp_send(req, "The file is not a valid firmware image; nothing changed.", HTTPD_RESP_USE_STRLEN);
     }
     ESP_LOGI(TAG, "Firmware %s written to %s; restarting", job.description.version, job.target->label);

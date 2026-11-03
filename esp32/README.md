@@ -364,7 +364,8 @@ commands. Rules follow the Pi controller:
   at the other end; green during a call (also one the answering machine
   takes); red when a call ends, on both sides, for 2 s or while the busy or
   reorder tone plays; off otherwise, also while a lifted handset stays
-  silent after that tone. Menuconfig sets pin, count and
+  silent after that tone. After boot a blue dot circles until the server
+  first answers; a firmware upload fills the ring blue (red if it fails). Menuconfig sets pin, count and
   brightness (default 30 %); GPIO -1 disables it.
 
 ### Call-progress tones
