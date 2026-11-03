@@ -59,7 +59,11 @@ bookmarks (`/#messages`):
 
 - **Status.** Number, call state, incoming-call silence and where it comes
   from, answering machine, Wi-Fi and server, SD card, firmware version,
-  uptime and memory, refreshed every few seconds. Below, **Firmware update**:
+  uptime and memory, refreshed every few seconds. Below, **Device controls**
+  as in the server's web UI, with the setup password: Ring test (handset
+  down, no call), Restart (ends a call, closes the server connection
+  cleanly) and Recovery mode (opens the setup network for
+  `CONFIG_DIGITS_SETUP_FORCED_MINUTES`; nothing is erased). Then **Firmware update**:
   upload `build/digits_signaling.bin` with the setup password, refused during
   a call; same checks and rollback as on the setup network's page.
 - **Buttons.** Each call button's number and the ringtone the called phone

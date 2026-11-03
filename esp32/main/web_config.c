@@ -2,12 +2,14 @@
 #include "audio_board.h"
 #include "call_tones.h"
 #include "phone.h"
+#include "ring_test.h"
 #include "ringtones.h"
 #include "sd_card.h"
 #include "sd_ringtones.h"
 #include "sd_ringtone_util.h"
 #include "status.h"
 #include "setup.h"
+#include "signaling.h"
 #include "tx_voice.h"
 #include "voicemail.h"
 #include "greeting_record.h"
@@ -529,6 +531,34 @@ static esp_err_t volume_post(httpd_req_t *req)
     return done(req, run_internal(apply_volume, &value), "Saved");
 }
 
+// The server web UI's device controls, from the phone itself.
+static esp_err_t device_post(httpd_req_t *req)
+{
+    esp_err_t result;
+    if (!may_write(req, &result)) return result;
+    char body[FORM_BYTES], action[16];
+    int size = read_form(req, body, sizeof(body));
+    if (size < 0 || !wifi_setup_field(body, (size_t)size, "action", action, sizeof(action)))
+        return done(req, ESP_ERR_INVALID_ARG, "");
+    if (!strcmp(action, "ring_test")) {
+        if (!line_idle()) return done(req, ESP_ERR_INVALID_STATE, "");
+        digits_ring_test_request();
+        return done(req, ESP_OK, "Ringing");
+    }
+    if (!strcmp(action, "restart")) {
+        ESP_LOGI(TAG, "Restart from the status page");
+        result = done(req, ESP_OK, "Restarting");
+        digits_signaling_restart(); // Waits half a second, so the reply leaves first.
+        return result;
+    }
+    if (!strcmp(action, "recovery")) {
+        ESP_LOGW(TAG, "Recovery requested on the status page: opening the setup network");
+        digits_setup_request("status page recovery request");
+        return done(req, ESP_OK, "Setup network opening");
+    }
+    return done(req, ESP_ERR_INVALID_ARG, "");
+}
+
 // ---- Greeting -------------------------------------------------------------
 
 static esp_err_t greeting_get(httpd_req_t *req)
@@ -631,6 +661,7 @@ void digits_web_config_register(httpd_handle_t server)
         {.uri = "/api/listen", .method = HTTP_POST, .handler = listen_post},
         {.uri = "/api/mic", .method = HTTP_POST, .handler = mic_post},
         {.uri = "/api/volume", .method = HTTP_POST, .handler = volume_post},
+        {.uri = "/api/device", .method = HTTP_POST, .handler = device_post},
         {.uri = "/api/firmware", .method = HTTP_POST, .handler = firmware_post},
     };
     for (unsigned i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i)

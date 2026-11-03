@@ -59,6 +59,14 @@ audio{height:2em;max-width:100%}
 <dt>Internal RAM</dt><dd id="internal"></dd>
 <dt>PSRAM</dt><dd id="psram"></dd>
 </dl></section>
+<section><h2>Device controls</h2>
+<p><button class="btn light fwrite" onclick="device('ring_test')">Ring test</button>
+<button class="btn light fwrite" onclick="if(confirm('Restart the phone? A call in progress ends.'))device('restart')">Restart</button>
+<button class="btn light fwrite" onclick="if(confirm('Open the setup network (Digits-Setup) for 30 minutes?'))device('recovery')">Recovery mode</button></p>
+<p class="muted">Ring test: a short ring, only with the handset down and no call. Restart: the phone is back
+after about 10 seconds. Recovery mode: opens the phone's setup network to change Wi-Fi or server; this page stays
+reachable, nothing is erased.</p>
+</section>
 <section><h2>Firmware update</h2>
 <p class="muted">Running <span id="running"></span>. Choose <code>digits_signaling.bin</code> from
 <code>esp32/build</code>. The phone restarts into it; if it does not come back properly, it returns
@@ -236,6 +244,7 @@ function act(url,fields,after){
     return r.text().then(function(t){toast(r.status==401?'Log in first':t);if(r.ok&&after)after()});
   }).catch(function(){toast('Phone not reachable')});
 }
+function device(action){act('/api/device',{action:action})}
 function upload(url,input,progress,after){
   var f=input.files[0];if(!f){toast('Choose a file first');return}
   var x=new XMLHttpRequest();x.open('POST',url);$(progress).hidden=false;

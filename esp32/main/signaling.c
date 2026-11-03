@@ -237,6 +237,7 @@ static bool send_register(signaling_t *s)
 #define RESTART_CALL_WAIT_MS 3000
 #define RESTART_SAVE_MS 1500    // An answering-machine message is saved after the hangup.
 static bool restart_pending;
+static signaling_t *running_instance; // For restarts asked for on the phone.
 
 static void restart_task(void *arg)
 {
@@ -259,8 +260,28 @@ static void restart_task(void *arg)
     // notice after its keep-alive timeout, long after the phone is back.
     xEventGroupSetBits(s->events, SHUTDOWN);
     xEventGroupWaitBits(s->events, SHUTDOWN_DONE, pdFALSE, pdTRUE, pdMS_TO_TICKS(SHUTDOWN_WAIT_MS));
-    ESP_LOGW("signaling", "Restarting as requested by the server");
+    ESP_LOGW("signaling", "Restarting now");
     esp_restart();
+}
+
+// False when a restart is already under way.
+static bool start_restart(signaling_t *s)
+{
+    if (__atomic_exchange_n(&restart_pending, true, __ATOMIC_ACQ_REL)) return false;
+    if (xTaskCreate(restart_task, "digits_restart", 3072, s, 5, NULL) != pdPASS) {
+        ESP_LOGE("signaling", "Cannot start the restart; restarting at once");
+        esp_restart();
+    }
+    return true;
+}
+
+void digits_signaling_restart(void)
+{
+    if (!running_instance) {
+        esp_restart(); // No server connection to close.
+        return;
+    }
+    if (start_restart(running_instance)) ESP_LOGW("signaling", "Restart requested on the phone");
 }
 
 // The ESP32 has one program: "service" and "reboot" both restart the board.
@@ -272,19 +293,14 @@ static void handle_restart(signaling_t *s, const char *mode)
         ESP_LOGW("signaling", "Ignoring restart with unknown mode %s", mode ? mode : "(none)");
         return;
     }
-    if (restart_pending) return;
+    if (__atomic_load_n(&restart_pending, __ATOMIC_ACQUIRE)) return;
     cJSON *json = cJSON_CreateObject();
     if (json && cJSON_AddStringToObject(json, "type", "update_status") &&
         cJSON_AddStringToObject(json, "update_status", reboot ? "rebooting" : "restarting") &&
         cJSON_AddStringToObject(json, "update_detail", reboot ? "Device reboot requested" : "Service restart requested"))
         enqueue_peer_message(json, s->session, NULL);
     cJSON_Delete(json);
-    if (xTaskCreate(restart_task, "digits_restart", 3072, s, 5, NULL) != pdPASS) {
-        ESP_LOGE("signaling", "Cannot start the restart; restarting at once");
-        esp_restart();
-    }
-    restart_pending = true;
-    ESP_LOGW("signaling", "Restart requested by the server (%s)", reboot ? "reboot" : "service");
+    if (start_restart(s)) ESP_LOGW("signaling", "Restart requested by the server (%s)", reboot ? "reboot" : "service");
 }
 
 // What the web UI shows as the phone's software version (the Pi's field
@@ -380,6 +396,7 @@ void digits_signaling_run(digits_credentials_t *credentials)
     s->credentials = credentials;
     s->events = xEventGroupCreate();
     ESP_ERROR_CHECK(s->events ? ESP_OK : ESP_ERR_NO_MEM);
+    running_instance = s;
     outbound.queue = xQueueCreate(TX_QUEUE_LENGTH, sizeof(tx_message_t));
     ESP_ERROR_CHECK(outbound.queue ? ESP_OK : ESP_ERR_NO_MEM);
     esp_err_t peer_err = digits_webrtc_init(enqueue_peer_message, NULL);

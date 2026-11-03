@@ -488,7 +488,7 @@ static void server_start(bool setup_mode)
     httpd_config_t http = HTTPD_DEFAULT_CONFIG();
     http.max_open_sockets = 4;
     http.lru_purge_enable = true;
-    http.max_uri_handlers = 32;
+    http.max_uri_handlers = 40; // 30 in use.
     http.stack_size = 6144;
     http.task_priority = 2; // Below the call audio (5) and peer (6) tasks.
     http.task_caps = setup_mode ? (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) : (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
