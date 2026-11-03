@@ -2,6 +2,7 @@
 #include "status.h"
 #include "web_config.h"
 #include "wifi.h"
+#include "webrtc.h"
 #include "wifi_setup_form.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -363,18 +364,54 @@ static esp_err_t wifi_post(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t update_post(httpd_req_t *req)
+// One OTA step; run on an internal-RAM stack (flash writes turn the cache off).
+typedef struct {
+    enum { OTA_BEGIN, OTA_WRITE, OTA_END, OTA_ABORT, OTA_DESCRIBE, OTA_BOOT } step;
+    const esp_partition_t *target;
+    esp_ota_handle_t ota;
+    const char *data;
+    size_t length;
+    esp_app_desc_t description;
+} ota_job_t;
+
+static esp_err_t ota_step(const void *arg)
 {
-    if (!allowed(req)) return refuse(req);
-    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
-    httpd_resp_set_type(req, "text/plain");
-    if (!target || req->content_len < 1024 || req->content_len > target->size)
+    ota_job_t *job = (ota_job_t *)arg;
+    switch (job->step) {
+    case OTA_BEGIN: return esp_ota_begin(job->target, OTA_WITH_SEQUENTIAL_WRITES, &job->ota);
+    case OTA_WRITE: return esp_ota_write(job->ota, job->data, job->length);
+    case OTA_END: return esp_ota_end(job->ota); // Verifies the image.
+    case OTA_ABORT: return esp_ota_abort(job->ota);
+    case OTA_DESCRIBE: return esp_ota_get_partition_description(job->target, &job->description);
+    case OTA_BOOT: return esp_ota_set_boot_partition(job->target);
+    }
+    return ESP_ERR_INVALID_ARG;
+}
+
+static esp_err_t run_here(digits_flash_job_t job, const void *arg) { return job(arg); }
+
+static esp_err_t ota_run(digits_flash_runner_t run, ota_job_t *job, int step)
+{
+    job->step = step;
+    return run(ota_step, job);
+}
+
+esp_err_t digits_setup_receive_firmware(httpd_req_t *req, digits_flash_runner_t run)
+{
+    if (!run) run = run_here;
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    digits_webrtc_call_state_t call;
+    digits_webrtc_call_state(&call);
+    if (call.phase != DIGITS_CALL_IDLE)
+        return httpd_resp_send(req, "Not during a call; try again when the line is free.", HTTPD_RESP_USE_STRLEN);
+    ota_job_t job = {.target = esp_ota_get_next_update_partition(NULL)};
+    if (!job.target || req->content_len < 1024 || req->content_len > job.target->size)
         return httpd_resp_send(req, "Not a firmware file of a usable size.", HTTPD_RESP_USE_STRLEN);
     char *chunk = malloc(UPLOAD_CHUNK);
-    esp_ota_handle_t ota = 0;
-    esp_err_t err = chunk ? esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &ota) : ESP_ERR_NO_MEM;
+    esp_err_t err = chunk ? ota_run(run, &job, OTA_BEGIN) : ESP_ERR_NO_MEM;
+    bool begun = err == ESP_OK;
     size_t left = req->content_len;
-    ESP_LOGI(TAG, "Receiving %u bytes of firmware into %s", (unsigned)left, target->label);
+    ESP_LOGI(TAG, "Receiving %u bytes of firmware into %s", (unsigned)left, job.target->label);
     while (err == ESP_OK && left) {
         int n = httpd_req_recv(req, chunk, left < UPLOAD_CHUNK ? left : UPLOAD_CHUNK);
         if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
@@ -382,34 +419,41 @@ static esp_err_t update_post(httpd_req_t *req)
             err = ESP_FAIL;
             break;
         }
-        err = esp_ota_write(ota, chunk, (size_t)n);
+        job.data = chunk;
+        job.length = (size_t)n;
+        err = ota_run(run, &job, OTA_WRITE);
         left -= (size_t)n;
     }
     free(chunk);
     if (err != ESP_OK) {
-        if (ota) esp_ota_abort(ota);
+        if (begun) ota_run(run, &job, OTA_ABORT);
         ESP_LOGE(TAG, "Firmware upload failed: %s", esp_err_to_name(err));
         return httpd_resp_send(req, "Upload failed; the phone keeps its current firmware.", HTTPD_RESP_USE_STRLEN);
     }
-    err = esp_ota_end(ota); // Verifies the image.
-    esp_app_desc_t incoming;
-    if (err == ESP_OK) err = esp_ota_get_partition_description(target, &incoming);
-    if (err == ESP_OK && strncmp(incoming.project_name, esp_app_get_description()->project_name,
-                                 sizeof(incoming.project_name))) {
-        ESP_LOGE(TAG, "Uploaded firmware is for %s", incoming.project_name);
+    err = ota_run(run, &job, OTA_END);
+    if (err == ESP_OK) err = ota_run(run, &job, OTA_DESCRIBE);
+    if (err == ESP_OK && strncmp(job.description.project_name, esp_app_get_description()->project_name,
+                                 sizeof(job.description.project_name))) {
+        ESP_LOGE(TAG, "Uploaded firmware is for %s", job.description.project_name);
         return httpd_resp_send(req, "That file is not Digits phone firmware; nothing changed.", HTTPD_RESP_USE_STRLEN);
     }
-    if (err == ESP_OK) err = esp_ota_set_boot_partition(target);
+    if (err == ESP_OK) err = ota_run(run, &job, OTA_BOOT);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Firmware rejected: %s", esp_err_to_name(err));
         return httpd_resp_send(req, "The file is not a valid firmware image; nothing changed.", HTTPD_RESP_USE_STRLEN);
     }
-    ESP_LOGI(TAG, "Firmware %s written to %s; restarting", incoming.version, target->label);
+    ESP_LOGI(TAG, "Firmware %s written to %s; restarting", job.description.version, job.target->label);
     char reply[96];
-    snprintf(reply, sizeof(reply), "Firmware %.32s installed. The phone restarts now.", incoming.version);
+    snprintf(reply, sizeof(reply), "Firmware %.32s installed. The phone restarts now.", job.description.version);
     httpd_resp_send(req, reply, HTTPD_RESP_USE_STRLEN);
     restart_soon();
     return ESP_OK;
+}
+
+static esp_err_t update_post(httpd_req_t *req)
+{
+    if (!allowed(req)) return refuse(req);
+    return digits_setup_receive_firmware(req, NULL); // Setup mode: internal-RAM server stack.
 }
 
 static esp_err_t restart_post(httpd_req_t *req)

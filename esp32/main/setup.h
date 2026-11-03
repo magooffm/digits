@@ -2,6 +2,9 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "esp_err.h"
+
+struct httpd_req; // esp_http_server.h
 
 // Setup network "Digits-Setup-XXXX" with its page: Wi-Fi and server,
 // pairing code, firmware upload and restart. WPA2 with the built-in
@@ -35,6 +38,14 @@ bool digits_setup_paired(void);
 void digits_setup_number(char *out, size_t capacity); // "" when unpaired.
 // The server's current pairing code; "" when paired or none received yet.
 void digits_setup_pairing_code(char *out, size_t capacity);
+
+// Firmware upload into the idle OTA slot, answering the request in plain
+// text and restarting on success. Flash steps go through run, which must
+// execute them on an internal-RAM stack (NULL: the caller's own stack is
+// internal). Refused during a call.
+typedef esp_err_t (*digits_flash_job_t)(const void *arg);
+typedef esp_err_t (*digits_flash_runner_t)(digits_flash_job_t job, const void *arg);
+esp_err_t digits_setup_receive_firmware(struct httpd_req *req, digits_flash_runner_t run);
 
 // Console only: also serve the page on the home network until restart.
 void digits_setup_allow_lan(void);

@@ -59,7 +59,9 @@ bookmarks (`/#messages`):
 
 - **Status.** Number, call state, incoming-call silence and where it comes
   from, answering machine, Wi-Fi and server, SD card, firmware version,
-  uptime and memory, refreshed every few seconds.
+  uptime and memory, refreshed every few seconds. Below, **Firmware update**:
+  upload `build/digits_signaling.bin` with the setup password, refused during
+  a call; same checks and rollback as on the setup network's page.
 - **Buttons.** Each call button's number and the ringtone the called phone
   rings with; how their calls ring here (knob position, settable here while
   no physical knob is fitted). Below, the microphone gain (see "Echo
@@ -837,7 +839,7 @@ These changes leave Wi-Fi/server settings alone.
 NVS remains at `0x9000`, size `0x6000`, and PHY at `0xf000`, size `0x1000`.
 Since 2026-10-28 two 3 MiB firmware slots (`ota_0` at `0x20000`, `ota_1` at
 `0x320000`, with `otadata` at `0x10000`) replace the single 4 MiB factory app,
-for updates from the setup page with rollback; the ringtone pack partition
+for updates from the setup or status page with rollback; the ringtone pack partition
 shrank to the remaining 9.9 MiB (SD card ringtones are the main way now).
 Regular flashing writes the partition table and app without erasing the
 saved identity/token; the change to this layout needs one USB flash.

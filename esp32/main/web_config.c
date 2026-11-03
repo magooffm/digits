@@ -6,6 +6,7 @@
 #include "sd_ringtones.h"
 #include "sd_ringtone_util.h"
 #include "status.h"
+#include "setup.h"
 #include "tx_voice.h"
 #include "voicemail.h"
 #include "greeting_record.h"
@@ -37,7 +38,8 @@
 
 // ---- Settings writes on an internal-RAM stack ----------------------------
 // The web server's stack is in PSRAM, and writing NVS turns the flash cache
-// off, which such a task must not do. Writes run here instead; the server
+// off, which such a task must not do. Writes (and firmware update steps) run
+// here instead; the server
 // handles one request at a time, so one job slot is enough.
 
 typedef esp_err_t (*job_fn)(const void *arg);
@@ -482,6 +484,14 @@ static esp_err_t listen_post(httpd_req_t *req)
     return done(req, run_internal(apply_listen, &change), "Saved");
 }
 
+// The same upload as on the setup network, here behind the password.
+static esp_err_t firmware_post(httpd_req_t *req)
+{
+    esp_err_t result;
+    if (!may_write(req, &result)) return result;
+    return digits_setup_receive_firmware(req, run_internal);
+}
+
 static esp_err_t apply_mic(const void *arg)
 {
     return tx_voice_set_gain_db(*(const int *)arg);
@@ -580,7 +590,7 @@ void digits_web_config_register(httpd_handle_t server)
         job.start = xQueueCreate(1, sizeof(bool));
         job.done = xSemaphoreCreateBinary();
         if (!job.start || !job.done ||
-            xTaskCreate(worker, "digits_web_nvs", 4096, NULL, 3, NULL) != pdPASS)
+            xTaskCreate(worker, "digits_web_nvs", 6144, NULL, 3, NULL) != pdPASS)
             ESP_LOGE(TAG, "Settings worker unavailable: changes from the web page will fail");
     }
     static const httpd_uri_t handlers[] = {
@@ -601,6 +611,7 @@ void digits_web_config_register(httpd_handle_t server)
         {.uri = "/api/greeting-new", .method = HTTP_GET, .handler = greeting_new_get},
         {.uri = "/api/listen", .method = HTTP_POST, .handler = listen_post},
         {.uri = "/api/mic", .method = HTTP_POST, .handler = mic_post},
+        {.uri = "/api/firmware", .method = HTTP_POST, .handler = firmware_post},
     };
     for (unsigned i = 0; i < sizeof(handlers) / sizeof(handlers[0]); ++i)
         httpd_register_uri_handler(server, &handlers[i]);

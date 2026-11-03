@@ -59,6 +59,15 @@ audio{height:2em;max-width:100%}
 <dt>Internal RAM</dt><dd id="internal"></dd>
 <dt>PSRAM</dt><dd id="psram"></dd>
 </dl></section>
+<section><h2>Firmware update</h2>
+<p class="muted">Running <span id="running"></span>. Choose <code>digits_signaling.bin</code> from
+<code>esp32/build</code>. The phone restarts into it; if it does not come back properly, it returns
+to the current firmware by itself. Not during a call.</p>
+<input id="fwfile" type="file" accept=".bin" class="fwrite">
+<button class="btn fwrite" id="fwupload" onclick="uploadFirmware()">Upload and restart</button>
+<progress id="fwprogress" max="100" value="0" hidden></progress>
+<p class="muted" id="fwlogin"></p>
+</section>
 </div>
 
 <div id="tab-buttons" hidden>
@@ -194,7 +203,9 @@ function show(s){
   authorized=s.authorized;
   drawSetup(s);
   $('title').textContent='Digits phone '+(s.number||'');
-  $('firmware').textContent=s.firmware;
+  $('firmware').textContent=s.firmware;$('running').textContent=s.firmware;
+  Array.prototype.forEach.call(document.querySelectorAll('.fwrite'),function(e){e.disabled=!s.authorized});
+  $('fwlogin').innerHTML=s.authorized?'':'<a href="/login">Log in</a> with the setup password to update.';
   var u=s.uptime_s,d=Math.floor(u/86400),h=Math.floor(u%86400/3600),m=Math.floor(u%3600/60);
   $('uptime').textContent=(d?d+' d ':'')+h+' h '+m+' min';
   $('login').innerHTML=s.authorized?'':'&middot; <a href="/login">Log in</a> for settings, messages and caller numbers';
@@ -226,6 +237,15 @@ function upload(url,input,progress,after){
   x.upload.onprogress=function(e){if(e.lengthComputable)$(progress).value=100*e.loaded/e.total};
   x.onload=function(){$(progress).hidden=true;toast(x.responseText);loadConfig()};
   x.onerror=function(){$(progress).hidden=true;toast('Upload failed')};
+  x.setRequestHeader('Content-Type','application/octet-stream');x.send(f);
+}
+function uploadFirmware(){
+  var f=$('fwfile').files[0];if(!f){toast('Choose a firmware file first');return}
+  if(!/\.bin$/i.test(f.name)){toast('Choose the .bin file from esp32/build');return}
+  var x=new XMLHttpRequest();x.open('POST','/api/firmware');$('fwprogress').hidden=false;$('fwupload').disabled=true;
+  x.upload.onprogress=function(e){if(e.lengthComputable)$('fwprogress').value=100*e.loaded/e.total};
+  x.onload=function(){$('fwprogress').hidden=true;$('fwupload').disabled=false;toast(x.status==401?'Log in first':x.responseText)};
+  x.onerror=function(){$('fwprogress').hidden=true;$('fwupload').disabled=false;toast('Upload failed; the phone keeps its current firmware')};
   x.setRequestHeader('Content-Type','application/octet-stream');x.send(f);
 }
 function need(r){if(r.status==401)throw 'login';return r.json()}
