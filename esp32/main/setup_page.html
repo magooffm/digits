@@ -9,7 +9,7 @@ body{font-family:system-ui,sans-serif;max-width:28em;margin:1.5em auto;padding:0
 h1{font-size:1.4em;margin-bottom:.2em}h2{font-size:1.1em;margin:0 0 .6em}
 section{background:#fffdf8;border:1px solid #ddd3c2;border-radius:6px;padding:1em;margin:1em 0}
 label{display:block;margin:.8em 0 .3em}
-input,button{font-size:1em;width:100%;box-sizing:border-box;padding:.6em}
+input,button,select{font-size:1em;width:100%;box-sizing:border-box;padding:.6em}
 button{margin-top:1em;background:#2b2620;color:#f6f1e7;border:0;border-radius:4px}
 button.plain{background:#e7dfd1;color:#2b2620}
 dl{display:grid;grid-template-columns:auto 1fr;gap:.3em .8em;margin:0}dt{color:#6b6257}dd{margin:0;word-break:break-all}
@@ -49,9 +49,11 @@ You need the setup password once more. This setup network closes when the phone 
 </dl>
 <p class="bad" id="problem" hidden></p>
 <form id="wifiform" method="post" action="/wifi">
-<label for="ssid">Your Wi-Fi network</label>
-<input id="ssid" name="ssid" list="nets" required maxlength="32" autocomplete="off">
-<datalist id="nets"></datalist>
+<label for="pick">Your Wi-Fi network</label>
+<select id="pick"><option value="">Searching...</option></select>
+<button type="button" id="rescan" class="plain">Search again</button>
+<input id="ssid" name="ssid" required maxlength="32" autocomplete="off" autocapitalize="none"
+ autocorrect="off" spellcheck="false" placeholder="Network name, exactly as written" hidden>
 <label for="password">Password</label>
 <input id="password" name="password" type="password" maxlength="64" autocomplete="off">
 <p class="muted">Empty: keep the saved password for this network, or an open network.</p>
@@ -59,7 +61,6 @@ You need the setup password once more. This setup network closes when the phone 
 <input id="url" name="url" required maxlength="127" placeholder="ws://192.168.1.50:8080/ws">
 <button>Save and restart</button>
 </form>
-<p class="muted"><a href="/scan">Search for networks again</a></p>
 </section>
 
 <details>
@@ -81,7 +82,36 @@ firmware fails to start, the phone goes back to the current one.</p>
 
 <script>
 function $(id){return document.getElementById(id)}
-var filled=false;
+var filled=false,saved='',other='\u2026 Other network (type its name)';
+function bars(rssi){return rssi>=-60?'strong':rssi>=-72?'good':rssi>=-82?'weak':'very weak'}
+// The list from the last scan, strongest first; "Other" lets one type a hidden network.
+function option(value,text,selected){var o=document.createElement('option');o.value=value;o.textContent=text;o.selected=selected;return o}
+function fill(networks){
+  var keep=$('ssid').value||saved,found=false,pick=$('pick');
+  pick.innerHTML='';
+  networks.forEach(function(n){
+    var on=n.ssid==keep;found=found||on;
+    pick.appendChild(option(n.ssid,n.ssid+' ('+bars(n.rssi)+(n.open?', open':'')+')',on));
+  });
+  if(!networks.length)pick.appendChild(option('','No networks found',false));
+  pick.appendChild(option('?',other,!found&&!!keep));
+  if(!found&&keep)$('ssid').value=keep;
+  picked();
+}
+function picked(){
+  var v=$('pick').value,typing=v=='?';
+  $('ssid').hidden=!typing;
+  if(!typing)$('ssid').value=v;
+  else if(networksHave($('ssid').value))$('ssid').value='';
+}
+var lastNetworks=[];
+function networksHave(name){return lastNetworks.some(function(n){return n.ssid==name})}
+function rescan(){
+  $('rescan').disabled=true;$('rescan').textContent='Searching... (a few seconds)';
+  fetch('/scan').then(function(r){return r.json()}).then(function(s){lastNetworks=s.networks;fill(s.networks)})
+    .catch(function(){}).then(function(){$('rescan').disabled=false;$('rescan').textContent='Search again'});
+}
+$('pick').onchange=picked;$('rescan').onclick=rescan;
 function show(s){
   $('firmware').textContent='Firmware '+s.firmware;
   $('wifi').textContent=s.wifi.ssid?(s.wifi.ssid+(s.wifi.connected?' (connected, '+s.wifi.rssi+' dBm)':' (not connected)')):'not configured';
@@ -89,7 +119,9 @@ function show(s){
   $('server').textContent=s.server.url?(s.server.url+(s.server.connected?' (connected)':' (not connected)')):'not configured';
   $('server').className=s.server.connected?'ok':'bad';
   var link=s.wifi.ip?'http://'+s.wifi.ip+'/':'';
-  var problem=!s.wifi.ssid?'':!s.wifi.connected?'The phone cannot join '+s.wifi.ssid+' yet. Check the network and password.':
+  var problem=!s.wifi.ssid?'':!s.wifi.connected?(s.wifi.problem=='network not found'?'The phone cannot find "'+s.wifi.ssid+'". Pick the network from the list, or check its exact name.':
+    s.wifi.problem=='wrong password'?'"'+s.wifi.ssid+'" refuses the password. Enter it again.':
+    'The phone cannot join "'+s.wifi.ssid+'" yet'+(s.wifi.problem?' ('+s.wifi.problem+')':'')+'. Check the network and password.'):
     !s.server.connected?'The phone is on your Wi-Fi but cannot reach the server. Check the server address.':'';
   $('problem').textContent=problem;$('problem').hidden=!problem;
   var ready=s.wifi.connected&&s.server.connected&&link;
@@ -97,8 +129,8 @@ function show(s){
   if(ready){$('nextssid').textContent=s.wifi.ssid;$('nextlink').textContent=link;$('nextlink').href=link;
     $('pairednumber').textContent=s.number;$('pairedlink').textContent=link;$('pairedlink').href=link}
   $('s1').className=ready?'done':'on';$('s2').className=s.number?'done':'';
-  if(!filled){filled=true;$('ssid').value=s.wifi.ssid;$('url').value=s.server.url;
-    s.networks.forEach(function(n){var o=document.createElement('option');o.value=n;$('nets').appendChild(o)})}
+  if(!filled){filled=true;saved=s.wifi.ssid;$('url').value=s.server.url;lastNetworks=s.networks;
+    fill(s.networks);if(!s.networks.length)rescan()}
 }
 function poll(){fetch('/status').then(function(r){return r.json()}).then(show).catch(function(){})}
 poll();setInterval(poll,4000);

@@ -38,7 +38,12 @@ static httpd_handle_t server;     // Always running: status page, plus setup whi
 static bool setup_open;
 static dns_server_handle_t dns;
 static char ap_name[32];
-static char networks[MAX_NETWORKS][WIFI_SETUP_SSID_BYTES];
+static SemaphoreHandle_t scan_lock; // Scans run from the supervisor and the page.
+static struct {
+    char ssid[WIFI_SETUP_SSID_BYTES];
+    int8_t rssi;
+    bool open;
+} networks[MAX_NETWORKS];
 static unsigned network_count;
 static int64_t forced_until;
 static bool lan_allowed;
@@ -146,6 +151,7 @@ static void restart_soon(void)
 void digits_setup_init(void)
 {
     lock = xSemaphoreCreateMutex();
+    scan_lock = xSemaphoreCreateMutex();
     esp_timer_create_args_t restart_args = {.callback = restart, .name = "setup_restart"};
     esp_timer_create(&restart_args, &restart_timer);
     esp_ota_img_states_t image;
@@ -204,24 +210,64 @@ static esp_err_t send_message(httpd_req_t *req, const char *title, const char *t
     return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
 }
 
+// The radio refuses to scan while the station tries to join, which it does
+// whenever a configured network is out of reach: stop that attempt first
+// (the supervisor retries) and try a few times.
 static void scan_networks(void)
 {
+    xSemaphoreTake(scan_lock, portMAX_DELAY);
     wifi_scan_config_t config = {.show_hidden = false};
     uint16_t count = MAX_NETWORKS;
     wifi_ap_record_t *records = calloc(MAX_NETWORKS, sizeof(*records));
-    if (!records || esp_wifi_scan_start(&config, true) != ESP_OK ||
-        esp_wifi_scan_get_ap_records(&count, records) != ESP_OK) {
-        free(records);
-        return;
+    esp_err_t err = records ? ESP_FAIL : ESP_ERR_NO_MEM;
+    for (int attempt = 0; records && attempt < 4 && err != ESP_OK; ++attempt) {
+        if (!digits_wifi_online()) esp_wifi_disconnect();
+        if (attempt) vTaskDelay(pdMS_TO_TICKS(500));
+        err = esp_wifi_scan_start(&config, true);
     }
-    network_count = 0;
-    for (unsigned i = 0; i < count; ++i) { // Strongest first; one entry per name.
-        const char *name = (const char *)records[i].ssid;
-        bool seen = !name[0];
-        for (unsigned j = 0; j < network_count && !seen; ++j) seen = !strcmp(networks[j], name);
-        if (!seen) snprintf(networks[network_count++], WIFI_SETUP_SSID_BYTES, "%s", name);
+    if (err == ESP_OK) err = esp_wifi_scan_get_ap_records(&count, records);
+    if (err == ESP_OK) {
+        network_count = 0;
+        for (unsigned i = 0; i < count && network_count < MAX_NETWORKS; ++i) { // Strongest first; one per name.
+            const char *name = (const char *)records[i].ssid;
+            bool seen = !name[0];
+            for (unsigned j = 0; j < network_count && !seen; ++j) seen = !strcmp(networks[j].ssid, name);
+            if (seen) continue;
+            snprintf(networks[network_count].ssid, WIFI_SETUP_SSID_BYTES, "%s", name);
+            networks[network_count].rssi = records[i].rssi;
+            networks[network_count++].open = records[i].authmode == WIFI_AUTH_OPEN;
+        }
+        ESP_LOGI(TAG, "Wi-Fi scan: %u networks", network_count);
+    } else {
+        ESP_LOGW(TAG, "Wi-Fi scan failed: %s", esp_err_to_name(err));
     }
     free(records);
+    xSemaphoreGive(scan_lock);
+}
+
+static void add_networks(cJSON *root)
+{
+    cJSON *list = cJSON_AddArrayToObject(root, "networks");
+    xSemaphoreTake(scan_lock, portMAX_DELAY);
+    for (unsigned i = 0; i < network_count; ++i) {
+        cJSON *n = cJSON_CreateObject();
+        cJSON_AddStringToObject(n, "ssid", networks[i].ssid);
+        cJSON_AddNumberToObject(n, "rssi", networks[i].rssi);
+        cJSON_AddBoolToObject(n, "open", networks[i].open);
+        cJSON_AddItemToArray(list, n);
+    }
+    xSemaphoreGive(scan_lock);
+}
+
+static esp_err_t send_json(httpd_req_t *req, cJSON *root)
+{
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t err = httpd_resp_send(req, text ? text : "{}", HTTPD_RESP_USE_STRLEN);
+    cJSON_free(text);
+    return err;
 }
 
 static esp_err_t root_get(httpd_req_t *req)
@@ -247,7 +293,7 @@ static esp_err_t status_get(httpd_req_t *req)
     char firmware[80];
     snprintf(firmware, sizeof(firmware), "%s (%s %s)", app->version, app->date, app->time);
     cJSON *root = cJSON_CreateObject(), *w = cJSON_AddObjectToObject(root, "wifi"),
-          *s = cJSON_AddObjectToObject(root, "server"), *list = cJSON_AddArrayToObject(root, "networks");
+          *s = cJSON_AddObjectToObject(root, "server");
     cJSON_AddStringToObject(root, "firmware", firmware);
     cJSON_AddStringToObject(w, "ssid", wifi.ssid);
     cJSON_AddBoolToObject(w, "connected", digits_wifi_online());
@@ -255,28 +301,25 @@ static esp_err_t status_get(httpd_req_t *req)
     char address[16] = "";
     digits_wifi_address(address, sizeof(address));
     cJSON_AddStringToObject(w, "ip", address);
+    const char *problem = digits_wifi_problem();
+    cJSON_AddStringToObject(w, "problem", problem ? problem : "");
     cJSON_AddStringToObject(s, "url", wifi.url);
     cJSON_AddBoolToObject(s, "connected", server_connected);
     cJSON_AddStringToObject(root, "number", number);
     cJSON_AddStringToObject(root, "code", code);
     cJSON_AddStringToObject(root, "pairing_page", page);
-    for (unsigned i = 0; i < network_count; ++i) cJSON_AddItemToArray(list, cJSON_CreateString(networks[i]));
-    char *text = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    esp_err_t err = httpd_resp_send(req, text ? text : "{}", HTTPD_RESP_USE_STRLEN);
-    cJSON_free(text);
-    return err;
+    add_networks(root);
+    return send_json(req, root);
 }
 
+// Scans now (a few seconds) and answers with the fresh list.
 static esp_err_t scan_get(httpd_req_t *req)
 {
     if (!allowed(req)) return refuse(req);
     scan_networks();
-    httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/");
-    return httpd_resp_send(req, NULL, 0);
+    cJSON *root = cJSON_CreateObject();
+    add_networks(root);
+    return send_json(req, root);
 }
 
 static int receive_all(httpd_req_t *req, char *body, size_t capacity)

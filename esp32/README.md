@@ -257,8 +257,11 @@ while you type it. Without a password the network is open and the log warns.
 
 1. **Wi-Fi and server**, on the setup network. Joining it opens the page by
    itself, as on hotel Wi-Fi; otherwise go to `http://192.168.4.1`. Network
-   (nearby ones are suggested), password (empty keeps the saved one of the
-   same network) and `ws://HOST:PORT/ws`. Saving restarts the phone; the
+   from a list of nearby ones, strongest first (**Search again** rescans;
+   **Other network** types a hidden one), password (empty keeps the saved one
+   of the same network) and `ws://HOST:PORT/ws`. A scan first stops a
+   running join attempt, since the radio refuses to scan meanwhile. If
+   joining fails, the page says why: network not found, or wrong password. Saving restarts the phone; the
    setup network comes back while it has no number. Reconnected, the page
    says whether Wi-Fi and server work and shows the phone's address on the
    home network.

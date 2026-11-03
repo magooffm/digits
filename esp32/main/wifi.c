@@ -27,16 +27,42 @@
 
 static EventGroupHandle_t events;
 static digits_wifi_config_t current; // Fixed for this boot.
+static uint8_t last_reason;          // Of the last failed join; 0 while connected.
+
+static const char *reason_text(uint8_t reason)
+{
+    switch (reason) {
+    case 0: return NULL;
+    case WIFI_REASON_NO_AP_FOUND:
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD: return "network not found";
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_MIC_FAILURE: return "wrong password";
+    default: return "connection refused";
+    }
+}
+
+const char *digits_wifi_problem(void) { return reason_text(__atomic_load_n(&last_reason, __ATOMIC_RELAXED)); }
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         if (xEventGroupGetBits(events) & ONLINE) ESP_LOGW(TAG, "Disconnected; retrying");
+        uint8_t reason = ((wifi_event_sta_disconnected_t *)data)->reason;
+        // A scan for the setup page ends a join attempt on purpose.
+        if (reason != WIFI_REASON_ASSOC_LEAVE && reason != last_reason) {
+            ESP_LOGW(TAG, "Cannot join %s: %s (reason %u)", current.ssid, reason_text(reason), reason);
+            __atomic_store_n(&last_reason, reason, __ATOMIC_RELAXED);
+        }
         xEventGroupClearBits(events, ONLINE | ASSOCIATED);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
         xEventGroupSetBits(events, ASSOCIATED);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ESP_LOGI(TAG, "Station has IP address");
+        __atomic_store_n(&last_reason, 0, __ATOMIC_RELAXED);
         xEventGroupSetBits(events, ONLINE);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
         ESP_LOGI(TAG, "A device joined the setup network");

@@ -25,6 +25,9 @@ bool digits_wifi_online(void);
 int digits_wifi_rssi(void); // 0 when not connected.
 // Station IPv4 address as text, or false when there is none.
 bool digits_wifi_address(char *out, size_t capacity);
+// Why the last attempt to join failed ("network not found", "wrong
+// password", ...); NULL while connected or before the first attempt.
+const char *digits_wifi_problem(void);
 
 void digits_wifi_config(digits_wifi_config_t *out);
 // Server address for this boot; "" when none is configured.
