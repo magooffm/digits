@@ -651,6 +651,10 @@ The logic is a pure state machine in `phone_fsm.c`, tested on the host by
 `tests/phone_fsm_test.c`. `tests/incoming_ring_test.py` covers ringtone
 suppression races.
 
+`i2c scan` lists the chips on the board's I2C bus with their names: on the
+board ES8311 (0x18), TCA9555 (0x20), ES7210 (0x40) and 0x51; added WM8978
+(0x1A) and ADS1115 (0x48 with ADDR to ground).
+
 For a two-way test against a second phone on the PC, see the helper's
 [live two-way call](../tools/interop/README.md#live-two-way-call).
 

@@ -12,6 +12,10 @@
 esp_err_t digits_audio_board_init(void);
 i2c_master_bus_handle_t digits_audio_i2c_bus(void);
 i2s_chan_handle_t digits_audio_rx_channel(void);
+// Probes 7-bit addresses 0x08-0x77 on that bus `probes` times each; bit
+// (a % 32) of found[a / 32] is set when address a answered every time.
+// flaky counts addresses that answered only sometimes.
+esp_err_t digits_audio_i2c_scan(uint32_t found[4], unsigned probes, unsigned *flaky);
 
 // Waveshare KEY1: TCA9555 P11, active low with an onboard 10 kOhm pull-up.
 // Configuration preserves the adjacent P10 amplifier output. Reads are bounded.

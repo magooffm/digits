@@ -3,6 +3,7 @@
 
 #ifdef CONFIG_DIGITS_WEBRTC_CONSOLE
 #include "webrtc.h"
+#include "audio_board.h"
 #include "phone.h"
 #include "tx_voice.h"
 #include "voicemail.h"
@@ -34,6 +35,46 @@ static int webrtc_command(int argc, char **argv)
         return 1;
     }
     printf("WebRTC %s queued; connection details follow in the logs\n", argv[1]);
+    return 0;
+}
+
+static const char *i2c_chip_name(unsigned address)
+{
+    switch (address) {
+    case 0x18: return "ES8311 speaker codec (board)";
+    case 0x1A: return "WM8978 handset codec";
+    case 0x20: return "TCA9555 expander (board)";
+    case 0x40: return "ES7210 microphones (board)";
+    case 0x48: return "ADS1115 (ADDR to GND)";
+    case 0x49: return "ADS1115 (ADDR to VDD)";
+    case 0x4A: return "ADS1115 (ADDR to SDA)";
+    case 0x4B: return "ADS1115 (ADDR to SCL)";
+    default: return "unknown";
+    }
+}
+
+static int i2c_command(int argc, char **argv)
+{
+    if (argc != 2 || strcmp(argv[1], "scan") != 0) {
+        printf("Usage: i2c scan\n");
+        return 1;
+    }
+    uint32_t found[4];
+    unsigned flaky;
+    esp_err_t err = digits_audio_i2c_scan(found, 3, &flaky);
+    if (err != ESP_OK) {
+        printf("I2C scan failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    unsigned count = 0;
+    for (unsigned address = 0; address < 128; ++address) {
+        if (!(found[address / 32] & (1U << (address % 32)))) continue;
+        printf("0x%02X  %s\n", address, i2c_chip_name(address));
+        ++count;
+    }
+    printf("%u chip%s found (answered 3 of 3 probes)", count, count == 1 ? "" : "s");
+    if (flaky) printf("; %u address%s answered only sometimes", flaky, flaky == 1 ? "" : "es");
+    printf("\n");
     return 0;
 }
 #endif
@@ -93,6 +134,14 @@ esp_err_t digits_webrtc_console_start(void)
     };
     err = esp_console_cmd_register(&wifi);
     if (err != ESP_OK) return err;
+    const esp_console_cmd_t i2c = {
+        .command = "i2c",
+        .help = "I2C bus: scan lists the chips that answer, with their names.",
+        .hint = "scan",
+        .func = i2c_command,
+    };
+    err = esp_console_cmd_register(&i2c);
+    if (err != ESP_OK) return err;
 
     esp_console_repl_config_t config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     config.prompt = "digits>";
@@ -112,6 +161,7 @@ esp_err_t digits_webrtc_console_start(void)
         (void)esp_console_cmd_deregister("vm");
         (void)esp_console_cmd_deregister("voice");
         (void)esp_console_cmd_deregister("wifi");
+        (void)esp_console_cmd_deregister("i2c");
         return err;
     }
     err = esp_console_start_repl(console);

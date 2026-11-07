@@ -202,6 +202,30 @@ fail:
 
 i2c_master_bus_handle_t digits_audio_i2c_bus(void) { return board.bus; }
 
+esp_err_t digits_audio_i2c_scan(uint32_t found[4], unsigned probes, unsigned *flaky)
+{
+    *flaky = 0;
+    memset(found, 0, 4 * sizeof(found[0]));
+    if (!board.bus) return ESP_ERR_INVALID_STATE;
+    for (uint16_t address = 0x08; address <= 0x77; ++address) {
+        unsigned answers = 0;
+        // A one-byte write (register pointer 0) through a temporary device:
+        // i2c_master_probe reports false answers on this bus while the
+        // phone polls the expander.
+        i2c_device_config_t config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = address, .scl_speed_hz = 100000,
+        };
+        i2c_master_dev_handle_t device;
+        if (i2c_master_bus_add_device(board.bus, &config, &device) != ESP_OK) return ESP_FAIL;
+        const uint8_t pointer = 0;
+        for (unsigned i = 0; i < probes; ++i) answers += i2c_master_transmit(device, &pointer, 1, 50) == ESP_OK;
+        i2c_master_bus_rm_device(device);
+        if (answers == probes) found[address / 32] |= 1U << (address % 32);
+        else if (answers) ++(*flaky);
+    }
+    return ESP_OK;
+}
+
 int digits_audio_speaker_volume(void) { return __atomic_load_n(&speaker_volume, __ATOMIC_RELAXED); }
 
 esp_err_t digits_audio_speaker_set_volume(int volume)
