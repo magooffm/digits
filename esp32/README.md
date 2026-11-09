@@ -655,6 +655,14 @@ suppression races.
 board ES8311 (0x18), TCA9555 (0x20), ES7210 (0x40) and 0x51; added WM8978
 (0x1A) and ADS1115 (0x48 with ADDR to ground).
 
+**Volume knob.** A B10K fader between 3.3 V and GND, wiper on GPIO9 (header
+pin 12, ADC1; `DIGITS_VOLUME_KNOB_GPIO`, -1 disables), sets the speaker
+volume: muted at 80 mV or less, 100 from 2.9 V (the fader tops out near
+3.0 V). Four readings are averaged every 50 ms and applied on a change of 3
+or more, not saved (the fader is read at boot). The status page then shows
+the volume read-only. A phone without a fader needs -1: a free pin reads noise.
+`knob` on the console shows the reading; `knob on|off` traces every reading.
+
 For a two-way test against a second phone on the PC, see the helper's
 [live two-way call](../tools/interop/README.md#live-two-way-call).
 

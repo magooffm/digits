@@ -18,6 +18,7 @@
 #define BOARD_KEYS_MASK (0x7U << BOARD_KEYS_SHIFT)
 #define NVS_NAMESPACE "digits_audio"
 static int speaker_volume = DIGITS_SPEAKER_VOLUME_DEFAULT;
+static bool speaker_on; // Between speaker_start and speaker_silence.
 
 static struct {
     i2c_master_bus_handle_t bus;
@@ -228,13 +229,24 @@ esp_err_t digits_audio_i2c_scan(uint32_t found[4], unsigned probes, unsigned *fl
 
 int digits_audio_speaker_volume(void) { return __atomic_load_n(&speaker_volume, __ATOMIC_RELAXED); }
 
-esp_err_t digits_audio_speaker_set_volume(int volume)
+esp_err_t digits_audio_speaker_apply_volume(int volume)
 {
     if (volume < 0 || volume > 100) return ESP_ERR_INVALID_ARG;
     if (board.device && esp_codec_dev_set_out_vol(board.device, volume) != ESP_CODEC_DEV_OK) return ESP_FAIL;
-    __atomic_store_n(&speaker_volume, volume, __ATOMIC_RELAXED);
+    int previous = __atomic_exchange_n(&speaker_volume, volume, __ATOMIC_RELAXED);
+    // Volume 0 mutes: the codec's lowest step is still -50 dB.
+    if (!board.device || !__atomic_load_n(&speaker_on, __ATOMIC_RELAXED) || (previous == 0) == (volume == 0))
+        return ESP_OK;
+    if (esp_codec_dev_set_out_mute(board.device, volume == 0) != ESP_CODEC_DEV_OK) return ESP_FAIL;
+    return amplifier_set(volume != 0);
+}
+
+esp_err_t digits_audio_speaker_set_volume(int volume)
+{
+    esp_err_t err = digits_audio_speaker_apply_volume(volume);
+    if (err != ESP_OK) return err;
     nvs_handle_t nvs;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) return err;
     err = nvs_set_u8(nvs, "volume", (uint8_t)volume);
     if (err == ESP_OK) err = nvs_commit(nvs);
@@ -293,6 +305,8 @@ void digits_audio_speaker_release(void)
 esp_err_t digits_audio_speaker_start(void)
 {
     if (!board.device) return ESP_ERR_INVALID_STATE;
+    __atomic_store_n(&speaker_on, true, __ATOMIC_RELAXED);
+    if (digits_audio_speaker_volume() == 0) return ESP_OK; // Stays muted.
     if (esp_codec_dev_set_out_mute(board.device, false) != ESP_CODEC_DEV_OK) return ESP_FAIL;
     return amplifier_set(true);
 }
@@ -307,6 +321,7 @@ esp_err_t digits_audio_speaker_write(const int16_t *stereo, size_t bytes,
 bool digits_audio_speaker_silence(void)
 {
     if (!board.device) return false;
+    __atomic_store_n(&speaker_on, false, __ATOMIC_RELAXED);
     // Hardware gate first; codec mute API can hide an underlying I2C failure.
     esp_err_t err = amplifier_set(false);
     bool disabled = err == ESP_OK;

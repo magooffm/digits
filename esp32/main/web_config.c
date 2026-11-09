@@ -13,6 +13,7 @@
 #include "tx_voice.h"
 #include "voicemail.h"
 #include "greeting_record.h"
+#include "knobs.h"
 #include "webrtc.h"
 #include "wifi_setup_form.h"
 #include <stdarg.h>
@@ -250,9 +251,10 @@ static esp_err_t config_get(httpd_req_t *req)
     bool hear_greeting, hear_caller;
     digits_voicemail_listen(&hear_greeting, &hear_caller);
     at = append(out, at, CONFIG_JSON_BYTES, "],\"listen\":{\"greeting\":%s,\"caller\":%s},"
-                "\"mic\":{\"gain_db\":%d,\"max_db\":%d},\"speaker\":{\"volume\":%d",
+                "\"mic\":{\"gain_db\":%d,\"max_db\":%d},\"speaker\":{\"volume\":%d,\"knob\":%s",
                 hear_greeting ? "true" : "false", hear_caller ? "true" : "false", tx_voice_gain_db(),
-                TX_VOICE_GAIN_MAX_DB, digits_audio_speaker_volume());
+                TX_VOICE_GAIN_MAX_DB, digits_audio_speaker_volume(),
+                digits_knobs_volume_active() ? "true" : "false");
     at = append(out, at, CONFIG_JSON_BYTES,
                 "},\"card\":\"%s\",\"greeting\":{\"kind\":\"%s\",\"seconds\":%u,"
                 "\"recording\":{\"state\":\"%s\",\"seconds\":%u.%u,\"message\":\"%s\"}}}",

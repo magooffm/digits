@@ -6,6 +6,7 @@
 #include "audio_board.h"
 #include "incoming_ring.h"
 #include "led_ring.h"
+#include "knobs.h"
 #include "call_tones.h"
 #include "ringtones.h"
 #include "ring_select.h"
@@ -554,6 +555,7 @@ static void phone_task(void *arg)
             }
         }
         if (++polls % SELECTOR_POLL_DIVIDER == 0) selectors_poll(selector_previous);
+        digits_knobs_poll(now);
         vTaskDelay(poll_ticks);
     }
 }
@@ -568,6 +570,7 @@ esp_err_t digits_phone_start(void)
     load_numbers();
     selectors_init();
     digits_led_ring_init(); // Optional; logs why when it fails.
+    digits_knobs_init();    // Optional too.
     digits_webrtc_set_ringtone_resolver(resolve_ringtone);
     esp_err_t err = inputs_init();
     if (err == ESP_OK &&

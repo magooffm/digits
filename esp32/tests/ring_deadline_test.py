@@ -190,6 +190,7 @@ static int i2s_channel_write(void *tx, const void *data, size_t size,
     *written = size;
     return ESP_OK;
 }
+static bool speaker_on; // Copied silence() clears it.
 static int digits_audio_speaker_start(void) {return amplifier_set(true);}
 static int digits_audio_speaker_write(const int16_t *pcm, size_t size,
                                       size_t *written, unsigned timeout_ms)

@@ -208,6 +208,15 @@ menu "Digits development configuration"
             int "LED ring brightness (percent)"
             range 1 100
             default 30
+        config DIGITS_VOLUME_KNOB_GPIO
+            int "Volume fader ADC1 GPIO (-1: no fader)"
+            range -1 10
+            default 9
+            help
+                A pot between 3.3 V and GND with its wiper on this pin
+                (ADC1: GPIO1-10; GPIO9 is header pin 12) sets the speaker
+                volume; the bottom stop mutes. Without a fader, leave the
+                pin free or set -1, and the status page sets the volume.
     endmenu
     menu "Answering machine"
         config DIGITS_VOICEMAIL

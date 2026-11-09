@@ -4,6 +4,7 @@
 #ifdef CONFIG_DIGITS_WEBRTC_CONSOLE
 #include "webrtc.h"
 #include "audio_board.h"
+#include "knobs.h"
 #include "phone.h"
 #include "tx_voice.h"
 #include "voicemail.h"
@@ -51,6 +52,20 @@ static const char *i2c_chip_name(unsigned address)
     case 0x4B: return "ADS1115 (ADDR to SCL)";
     default: return "unknown";
     }
+}
+
+static int knob_command(int argc, char **argv)
+{
+    bool on = argc == 2 && strcmp(argv[1], "on") == 0, off = argc == 2 && strcmp(argv[1], "off") == 0;
+    if (argc > 2 || (argc == 2 && !on && !off)) {
+        printf("Usage: knob [on|off]\n");
+        return 1;
+    }
+    if (on || off) digits_knobs_set_trace(on);
+    if (!digits_knobs_volume_active()) printf("Volume knob off (disabled or its ADC failed; see the boot log)\n");
+    else printf("Volume knob: %d mV, volume %d, %u read errors, trace %s\n", digits_knobs_volume_mv(),
+                digits_audio_speaker_volume(), digits_knobs_read_errors(), digits_knobs_trace() ? "on" : "off");
+    return 0;
 }
 
 static int i2c_command(int argc, char **argv)
@@ -142,6 +157,15 @@ esp_err_t digits_webrtc_console_start(void)
     };
     err = esp_console_cmd_register(&i2c);
     if (err != ESP_OK) return err;
+    const esp_console_cmd_t knob = {
+        .command = "knob",
+        .help = "Volume knob: reading, volume and read errors; on|off switches the serial trace "
+                "of each reading (on at boot).",
+        .hint = "[on|off]",
+        .func = knob_command,
+    };
+    err = esp_console_cmd_register(&knob);
+    if (err != ESP_OK) return err;
 
     esp_console_repl_config_t config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     config.prompt = "digits>";
@@ -162,6 +186,7 @@ esp_err_t digits_webrtc_console_start(void)
         (void)esp_console_cmd_deregister("voice");
         (void)esp_console_cmd_deregister("wifi");
         (void)esp_console_cmd_deregister("i2c");
+        (void)esp_console_cmd_deregister("knob");
         return err;
     }
     err = esp_console_start_repl(console);
