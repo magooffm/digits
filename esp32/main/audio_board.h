@@ -29,10 +29,10 @@ esp_err_t digits_audio_record_button_read(bool *pressed);
 esp_err_t digits_audio_board_keys_init(void);
 esp_err_t digits_audio_board_keys_read(uint8_t *pressed);
 
-// Button lights: Extend_IO0 and Extend_IO1 (TCA9555 P00, P01; header P1
-// pins 14 and 16) drive ULN2003 inputs, high = light on. Index 0 is
-// contact A's button.
-#define DIGITS_BOARD_LIGHT_COUNT 2
+// Button lights: Extend_IO0-2 (TCA9555 P00-P02; header P1 pins 14, 16 and
+// 18) drive ULN2003 inputs, high = light on: contact A, contact B, speaker.
+#define DIGITS_BOARD_LIGHT_COUNT 3
+#define DIGITS_BOARD_LIGHT_SPEAKER 2
 esp_err_t digits_audio_board_lights_init(void);
 esp_err_t digits_audio_board_light_set(unsigned index, bool on);
 

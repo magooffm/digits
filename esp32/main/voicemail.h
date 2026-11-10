@@ -32,6 +32,11 @@ bool digits_voicemail_full(void);
 // the end is marked heard.
 esp_err_t digits_voicemail_play(uint32_t number);
 esp_err_t digits_voicemail_play_greeting(void);
+// A contact's messages: the unheard ones oldest first, or, with none
+// unheard, their newest message once. Same rules as play().
+esp_err_t digits_voicemail_play_from(const char *caller);
+// Playing or about to play (any request).
+bool digits_voicemail_playing(void);
 
 // The greeting callers hear: one recorded on the phone (greeting.wav), else
 // an uploaded MP3 (greeting.mp3), else the built-in one.

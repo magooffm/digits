@@ -249,8 +249,8 @@ its MAC address) only when needed:
 - 2 minutes without reaching the Wi-Fi or the server (meanwhile it retries
   every 30 seconds and closes the setup network once both work again, so a
   router that boots slower than the phone after a power cut needs nothing),
-- on request, for 30 minutes: hold call button A or B for 8 seconds with the
-  handset down (a short ring confirms), press **Recovery mode** on the
+- on request, for 30 minutes: hold the (momentary) speaker button for 8
+  seconds with the handset down (a short ring confirms), press **Recovery mode** on the
   phone's page in the web UI (nothing is erased; the web UI calls the
   network "Digits-Recovery"), or type `wifi setup`.
 
@@ -663,11 +663,40 @@ or more, not saved (the fader is read at boot). The status page then shows
 the volume read-only. A phone without a fader needs -1: a free pin reads noise.
 `knob` on the console shows the reading; `knob on|off` traces every reading.
 
-**Button lights.** Extend_IO0 and Extend_IO1 (header pins 14 and 16) drive
-ULN2003 inputs for the lights of call buttons A and B: flashing (400 ms)
-while a call with that contact rings here or there, on during the call, a
-200 ms blink every 2 s while that contact has unheard messages, off
-otherwise. A contact without a number never lights.
+**Button ladder.** Ring A, ring B and speaker buttons on ADS1115 A3
+(`DIGITS_BUTTON_LADDER_CHANNEL`, -1 disables): 33k pull-up to 3.3 V, each
+button to GND through 10k, 20k or 33k. Levels and limits are in
+`button_ladder_map.h`, tested by `tests/button_ladder_test.c`. Ring A and B
+act as call buttons A and B next to the board keys. Ring A or B held from
+boot is ignored until released once, so a wiring fault cannot hold a
+button. Without the ADS1115 the ladder is off.
+
+**Handset, speaker and messages.** Built for kids: the phone always
+returns to idle by itself.
+
+| Situation | Action | Result |
+| --- | --- | --- |
+| Idle | lift handset / press speaker | dial tone (handset / speaker) |
+| Dial tone | press A or B | calls that contact |
+| Ringing | lift handset or press speaker | answers |
+| Call on handset | press speaker | moves to the speaker |
+| Call on speaker | lift handset / press speaker | moves to the handset / hangs up |
+| Handset down, line closed | press A or B | that contact's new messages, oldest first, or else their newest once; press again to stop |
+| Messages playing | lift handset | keeps playing (in the earpiece once handset audio exists); dial tone after the last one |
+
+The speaker is a firmware state (`phone_speaker_step` in `phone_fsm.c`),
+shown by the speaker light: a call ending, or an unused dial tone running
+out, switches it off with the handset down. KEY1 stands in for the handset
+until the hook switch exists. The button should be momentary;
+`DIGITS_SPEAKER_BUTTON_LATCHING` makes each change of a latching one count
+as a press (no 8 s hold then). Console: `phone speaker` simulates a press.
+
+**Button lights.** Extend_IO0-2 (header pins 14, 16 and 18) drive ULN2003
+inputs for the lights of call buttons A and B and the speaker button. The
+speaker light shows the speakerphone. A and B: flashing (400 ms) while a
+call with that contact rings here or there, on during the call or while
+their messages play, a 200 ms blink every 2 s while that contact has
+unheard messages, off otherwise. A contact without a number never lights.
 
 For a two-way test against a second phone on the PC, see the helper's
 [live two-way call](../tools/interop/README.md#live-two-way-call).

@@ -347,6 +347,24 @@ static void test_lift_takes_over_answering_machine(void)
     assert(step().action == PHONE_ACTION_NONE);
 }
 
+static void test_speaker(void)
+{
+    // Handset down: press opens the line on the speaker, press again closes it.
+    assert(phone_speaker_step(false, true, false, false, PHONE_LINE_IDLE));
+    assert(!phone_speaker_step(true, true, false, false, PHONE_LINE_CALL));
+    // Lifting the handset takes over; the speaker can be switched back on.
+    assert(!phone_speaker_step(true, false, true, true, PHONE_LINE_CALL));
+    assert(phone_speaker_step(false, true, true, false, PHONE_LINE_CALL));
+    // Lift and press in the same poll: the press wins (speaker on).
+    assert(phone_speaker_step(true, true, true, true, PHONE_LINE_CALL));
+    // Call over, handset down: lockout switches the speaker off by itself.
+    assert(!phone_speaker_step(true, false, false, false, PHONE_LINE_LOCKOUT));
+    // With the handset up the speaker stays as chosen.
+    assert(phone_speaker_step(true, false, true, false, PHONE_LINE_LOCKOUT));
+    // A press is never undone in the same poll by a stale lockout.
+    assert(phone_speaker_step(false, true, false, false, PHONE_LINE_LOCKOUT));
+}
+
 static void test_boot_off_hook(void)
 {
     reset(true, PHONE_PHASE_IDLE);
@@ -377,6 +395,7 @@ int main(void)
     test_tones_lift_during_console_call();
     test_lift_takes_over_answering_machine();
     test_boot_off_hook();
+    test_speaker();
     puts("phone_fsm_test: all cases passed");
     return 0;
 }

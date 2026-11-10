@@ -7,6 +7,7 @@
 #include "incoming_ring.h"
 #include "led_ring.h"
 #include "knobs.h"
+#include "button_ladder.h"
 #include "call_tones.h"
 #include "ringtones.h"
 #include "ring_select.h"
@@ -35,7 +36,7 @@
 #define NUMBER_CAPACITY 32
 #define NVS_NAMESPACE "digits_phone"
 #define ERROR_LOG_INTERVAL_US 1000000LL
-#define SETUP_HOLD_US 8000000LL // Hold a call button this long, on hook, to open the setup network.
+#define SETUP_HOLD_US 8000000LL // Hold the speaker button this long, handset down, to open the setup network.
 #define TASK_STACK_BYTES 4096
 #define TASK_PRIORITY 3
 
@@ -74,9 +75,12 @@ static struct {
     int preview_request; // Ringtone to preview, or -1.
     int sim_hook; // -1 none pending, 0 replace, 1 lift.
     uint32_t sim_presses[PHONE_CALL_TARGETS];
-    bool off_hook;
+    uint32_t sim_speaker; // Simulated speaker button presses.
+    bool off_hook;        // Line open: handset up or speaker on.
+    bool handset_up, speaker_on;
+    int playing_contact;  // Messages playing for this contact, or -1.
     bool inputs_ok;
-} shared = {.sim_hook = -1, .preview_request = -1};
+} shared = {.sim_hook = -1, .preview_request = -1, .playing_contact = -1};
 
 #if CONFIG_DIGITS_PHONE_INPUT_BOARD_KEYS
 #define HOOK_IS_TOGGLE 1
@@ -417,9 +421,11 @@ static void run_action(phone_fsm_t *fsm, const phone_output_t *out,
                  call->online ? "online" : "offline", call->paired ? "paired" : "unpaired");
 }
 
-// Button lights (A and B): flashing while a call with that contact rings
+// Button lights. A and B: flashing while a call with that contact rings
 // here or there, on during the call, a short blink every 2 s while it left
-// unheard messages, off otherwise.
+// unheard messages, on while their messages play, off otherwise. Speaker:
+// on while the speakerphone is on.
+#define CONTACT_LIGHTS 2
 #define LIGHT_FLASH_HALF_US 400000LL // As the LED ring.
 #define LIGHT_BLINK_PERIOD_US 2000000LL
 #define LIGHT_BLINK_ON_US 200000LL
@@ -428,23 +434,24 @@ static void run_action(phone_fsm_t *fsm, const phone_output_t *out,
 typedef struct {
     bool ready, shown[DIGITS_BOARD_LIGHT_COUNT];
     int unheard_total; // Count the per-contact flags were computed for.
-    bool messages[DIGITS_BOARD_LIGHT_COUNT];
+    bool messages[CONTACT_LIGHTS];
     int64_t messages_at, next_error_log;
 } lights_t;
 
-static void lights_poll(lights_t *l, const digits_webrtc_call_state_t *call, int64_t now)
+static void lights_poll(lights_t *l, const digits_webrtc_call_state_t *call, bool speaker, int playing_contact,
+                        int64_t now)
 {
     if (!l->ready) return;
-    char numbers[DIGITS_BOARD_LIGHT_COUNT][NUMBER_CAPACITY];
+    char numbers[CONTACT_LIGHTS][NUMBER_CAPACITY];
     portENTER_CRITICAL(&shared_mux);
-    for (unsigned i = 0; i < DIGITS_BOARD_LIGHT_COUNT; ++i) memcpy(numbers[i], shared.numbers[i], NUMBER_CAPACITY);
+    for (unsigned i = 0; i < CONTACT_LIGHTS; ++i) memcpy(numbers[i], shared.numbers[i], NUMBER_CAPACITY);
     portEXIT_CRITICAL(&shared_mux);
     // Per-contact messages: refreshed when the unheard count changes, and
     // every 10 s for changed contact numbers. Never waits for the SD card.
     int total = digits_voicemail_unheard();
     if (total != l->unheard_total || now - l->messages_at >= LIGHT_MESSAGES_REFRESH_US) {
-        bool fresh[DIGITS_BOARD_LIGHT_COUNT], complete = true;
-        for (unsigned i = 0; i < DIGITS_BOARD_LIGHT_COUNT && complete; ++i) {
+        bool fresh[CONTACT_LIGHTS], complete = true;
+        for (unsigned i = 0; i < CONTACT_LIGHTS && complete; ++i) {
             int count = total > 0 && numbers[i][0] ? digits_voicemail_unheard_from(numbers[i], 0) : 0;
             if (count < 0 && digits_voicemail_ready()) complete = false; // Busy: next poll.
             fresh[i] = count > 0;
@@ -458,14 +465,21 @@ static void lights_poll(lights_t *l, const digits_webrtc_call_state_t *call, int
     bool ringing = call->phase == DIGITS_CALL_CALLING || call->phase == DIGITS_CALL_RINGING;
     bool talking = call->phase >= DIGITS_CALL_CONNECTING;
     for (unsigned i = 0; i < DIGITS_BOARD_LIGHT_COUNT; ++i) {
-        bool with = (ringing || talking) && numbers[i][0] && !strcmp(call->remote, numbers[i]);
-        bool on = with ? (talking || (now / LIGHT_FLASH_HALF_US) % 2 == 0) :
-                  l->messages[i] && now % LIGHT_BLINK_PERIOD_US < LIGHT_BLINK_ON_US;
+        bool on;
+        if (i == DIGITS_BOARD_LIGHT_SPEAKER) {
+            on = speaker;
+        } else {
+            bool with = (ringing || talking) && numbers[i][0] && !strcmp(call->remote, numbers[i]);
+            on = with ? (talking || (now / LIGHT_FLASH_HALF_US) % 2 == 0) :
+                 (int)i == playing_contact ||
+                 (l->messages[i] && now % LIGHT_BLINK_PERIOD_US < LIGHT_BLINK_ON_US);
+        }
         if (on == l->shown[i]) continue;
         esp_err_t err = digits_audio_board_light_set(i, on);
         if (err == ESP_OK) l->shown[i] = on;
         else if (now >= l->next_error_log) {
-            ESP_LOGW(TAG, "Button light %c failed: %s", 'A' + i, esp_err_to_name(err));
+            ESP_LOGW(TAG, "Button light %s failed: %s", i == DIGITS_BOARD_LIGHT_SPEAKER ? "speaker" :
+                     i ? "B" : "A", esp_err_to_name(err));
             l->next_error_log = now + ERROR_LOG_INTERVAL_US * 10;
         }
     }
@@ -486,11 +500,18 @@ static void phone_task(void *arg)
     bool previewing = false;
     int selector_previous[PHONE_CALL_TARGETS] = {-1, -1, -1};
     unsigned polls = 0;
-    int64_t held_since[PHONE_CALL_TARGETS] = {0};
-    bool hold_used[PHONE_CALL_TARGETS] = {false};
+    int64_t speaker_held_since = 0;
+    bool speaker_hold_used = false;
+    bool handset_up = false, speaker_on = false;
+    int playing_contact = -1, route = 0;
+    uint32_t presses_seen[PHONE_CALL_TARGETS] = {0}, fsm_presses[PHONE_CALL_TARGETS] = {0};
+    uint32_t speaker_sim_seen = 0;
     uint32_t led_ended_calls = 0; // The worker counts from 0 too.
     bool reached_server = false;
     lights_t lights = {.unheard_total = -1};
+    phone_debounce_t speaker_button = {0};
+    int64_t next_ladder_error_log = 0;
+    bool ladder_released = false;
     esp_err_t lights_err = digits_audio_board_lights_init();
     lights.ready = lights_err == ESP_OK;
     if (!lights.ready) ESP_LOGW(TAG, "Button lights unavailable: %s", esp_err_to_name(lights_err));
@@ -499,7 +520,46 @@ static void phone_task(void *arg)
         int64_t now = esp_timer_get_time();
         bool hook_raw = false, raw[PHONE_CALL_TARGETS] = {false};
         esp_err_t err = inputs_read(&hook_raw, raw);
-        bool previous_hook = off_hook;
+        // The button ladder adds ring A and B next to the board keys.
+        bool speaker_raw = false;
+        if (err == ESP_OK && digits_button_ladder_active()) {
+            unsigned pressed;
+            int mv;
+            esp_err_t ladder_err = digits_button_ladder_read(&pressed, &mv);
+            // Ring A or B held from boot is a wiring fault or a stuck key,
+            // not a press: they count only after reading released once. The
+            // speaker button latches, so it may be on at boot.
+            if (ladder_err == ESP_OK) speaker_raw = pressed & BUTTON_LADDER_SPEAKER;
+            if (ladder_err == ESP_OK && !ladder_released && !(pressed & (BUTTON_LADDER_A | BUTTON_LADDER_B))) {
+                ladder_released = true;
+                ESP_LOGI(TAG, "Button ladder ready (%d mV): ring A and B active", mv);
+            } else if (ladder_err == ESP_OK && !ladder_released) {
+                if (now >= next_ladder_error_log) {
+                    ESP_LOGW(TAG, "Button ladder reads %d mV: ring A or B held since boot; both ignored "
+                             "until released", mv);
+                    next_ladder_error_log = now + ERROR_LOG_INTERVAL_US * 30;
+                }
+            } else if (ladder_err == ESP_OK) {
+                raw[0] = raw[0] || (pressed & BUTTON_LADDER_A);
+                raw[1] = raw[1] || (pressed & BUTTON_LADDER_B);
+            } else if (now >= next_ladder_error_log) {
+                ESP_LOGW(TAG, "Button ladder read failed: %s", esp_err_to_name(ladder_err));
+                next_ladder_error_log = now + ERROR_LOG_INTERVAL_US * 10;
+            }
+        }
+        // Speaker button: momentary, each press counts; a latching one
+        // counts each change of position as a press.
+        bool speaker_before = speaker_button.stable;
+        uint32_t speaker_presses_before = speaker_button.presses;
+        phone_debounce_update(&speaker_button, speaker_raw, now);
+#if CONFIG_DIGITS_SPEAKER_BUTTON_LATCHING
+        unsigned speaker_pressed = speaker_button.stable != speaker_before;
+        (void)speaker_presses_before;
+#else
+        unsigned speaker_pressed = speaker_button.presses - speaker_presses_before;
+        (void)speaker_before;
+#endif
+        bool previous_hook = off_hook, previous_handset = handset_up;
         const char *source = NULL;
         if (err == ESP_OK) {
             inputs_ok = true;
@@ -509,14 +569,14 @@ static void phone_task(void *arg)
             (void)hook_level;
             if (hook_input.presses != hook_presses) {
                 hook_presses = hook_input.presses;
-                off_hook = !off_hook;
+                handset_up = !handset_up;
                 source = "KEY1";
             }
 #else
             // Level switch: follow it, including its position at boot.
-            if (!hook_known || hook_level != off_hook) {
+            if (!hook_known || hook_level != handset_up) {
                 if (hook_known) source = "hook switch";
-                off_hook = hook_level;
+                handset_up = hook_level;
                 hook_known = true;
             }
 #endif
@@ -535,34 +595,113 @@ static void phone_task(void *arg)
         }
 
         phone_inputs_t inputs = {0};
+        uint32_t presses_now[PHONE_CALL_TARGETS];
+        char numbers[PHONE_CALL_TARGETS][NUMBER_CAPACITY];
         portENTER_CRITICAL(&shared_mux);
         if (shared.sim_hook >= 0) {
-            off_hook = shared.sim_hook == 1;
+            handset_up = shared.sim_hook == 1;
             shared.sim_hook = -1;
             source = "console";
         }
+        speaker_pressed += shared.sim_speaker - speaker_sim_seen;
+        speaker_sim_seen = shared.sim_speaker;
         for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i)
-            inputs.presses[i] = buttons[i].presses + shared.sim_presses[i];
-        shared.off_hook = off_hook;
-        shared.inputs_ok = inputs_ok;
+            presses_now[i] = buttons[i].presses + shared.sim_presses[i];
+        memcpy(numbers, shared.numbers, sizeof(numbers));
         portEXIT_CRITICAL(&shared_mux);
-
-        if (off_hook != previous_hook && source)
-            ESP_LOGI(TAG, "Handset %s (%s)", off_hook ? "lifted" : "replaced", source);
-        if (off_hook != previous_hook) digits_incoming_ring_set_suppressed(off_hook);
-        if (off_hook && !previous_hook) digits_voicemail_stop(); // Dial tone needs the speaker.
-        digits_silence_poll();
+        if (handset_up != previous_handset && source)
+            ESP_LOGI(TAG, "Handset %s (%s)", handset_up ? "lifted" : "replaced", source);
+        if (speaker_pressed) ESP_LOGI(TAG, "Speaker button pressed");
 
         digits_webrtc_call_state_t call;
         digits_webrtc_call_state(&call);
+        bool playing = digits_voicemail_playing();
+        if (!playing) playing_contact = -1;
+        // A speaker press during playback means "I want to call": stop it.
+        if (speaker_pressed && playing && !off_hook) {
+            digits_voicemail_stop();
+            playing_contact = -1;
+        }
+        bool was_speaker = speaker_on;
+        speaker_on = phone_speaker_step(speaker_on, speaker_pressed % 2, handset_up,
+                                        handset_up && !previous_handset, fsm.line);
+#if !CONFIG_DIGITS_SPEAKER_BUTTON_LATCHING
+        // Hold the speaker button 8 s, handset down, no call: setup network.
+        bool holding = err == ESP_OK && speaker_button.stable && !handset_up && call.phase == DIGITS_CALL_IDLE;
+        if (!holding) {
+            speaker_held_since = 0;
+            speaker_hold_used = false;
+        } else if (!speaker_held_since) {
+            speaker_held_since = now;
+        } else if (!speaker_hold_used && now - speaker_held_since >= SETUP_HOLD_US) {
+            speaker_hold_used = true;
+            speaker_on = false;
+            ESP_LOGI(TAG, "Speaker button held: opening the setup network");
+            digits_setup_request("speaker button held");
+            digits_ring_test_request(); // Short ring as confirmation.
+        }
+#else
+        (void)speaker_held_since;
+        (void)speaker_hold_used;
+#endif
+        if (speaker_on != was_speaker) ESP_LOGI(TAG, "Speaker %s", speaker_on ? "on" : "off");
+        off_hook = handset_up || speaker_on; // The line is open.
+        if (off_hook != previous_hook) digits_incoming_ring_set_suppressed(off_hook);
+        // Messages keep playing when the line opens (lift the handset to
+        // listen privately); the line state machine sees the open line, and
+        // dial tone starts, only once they end.
+        bool fsm_off_hook = off_hook && !playing;
+
+        // Call buttons: to the line while it is open, otherwise messages.
+        for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {
+            uint32_t fresh = presses_now[i] - presses_seen[i];
+            presses_seen[i] = presses_now[i];
+            if (!fresh) continue;
+            if (fsm_off_hook) {
+                fsm_presses[i] += fresh;
+            } else if (playing && playing_contact == (int)i) {
+                ESP_LOGI(TAG, "Messages from %s stopped", target_names[i]);
+                digits_voicemail_stop();
+                playing_contact = -1;
+            } else if (call.phase != DIGITS_CALL_IDLE) {
+                ESP_LOGI(TAG, "Call button %s: no messages during a call", target_names[i]);
+            } else if (!numbers[i][0]) {
+                ESP_LOGI(TAG, "Call button %s has no number: no messages", target_names[i]);
+            } else {
+                esp_err_t play_err = digits_voicemail_play_from(numbers[i]);
+                if (play_err == ESP_OK) {
+                    ESP_LOGI(TAG, "Messages from %s (%s)", target_names[i], numbers[i]);
+                    playing_contact = (int)i;
+                    playing = true;
+                } else {
+                    ESP_LOGW(TAG, "Messages from %s unavailable: %s", target_names[i], esp_err_to_name(play_err));
+                }
+            }
+        }
+        fsm_off_hook = off_hook && !playing;
+        for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) inputs.presses[i] = fsm_presses[i];
+        portENTER_CRITICAL(&shared_mux);
+        shared.off_hook = off_hook;
+        shared.handset_up = handset_up;
+        shared.speaker_on = speaker_on;
+        shared.playing_contact = playing_contact;
+        shared.inputs_ok = inputs_ok;
+        portEXIT_CRITICAL(&shared_mux);
+        // Where sound goes: logged until the handset audio exists.
+        int new_route = !off_hook && !playing ? 0 : handset_up && !speaker_on ? 1 : 2;
+        if (new_route && new_route != route)
+            ESP_LOGI(TAG, "Sound: %s", new_route == 1 ? "handset (no handset audio yet: speaker plays)" : "speaker");
+        route = new_route;
+        digits_silence_poll();
+
         inputs.now_us = now;
-        inputs.off_hook = off_hook;
+        inputs.off_hook = fsm_off_hook;
         inputs.phase = (phone_phase_t)call.phase;
         inputs.ended_calls = call.ended_calls;
         inputs.last_end = (phone_end_t)call.last_end;
         inputs.last_connected = call.last_connected;
         phone_output_t out = phone_fsm_step(&fsm, &inputs);
-        run_action(&fsm, &out, &call, off_hook, now);
+        run_action(&fsm, &out, &call, fsm_off_hook, now);
         // A rejected call switches tone in the same poll, not the next one.
         if (out.action == PHONE_ACTION_CALL && fsm.line != PHONE_LINE_CALL)
             out.tone = TONE_GEN_NONE;
@@ -597,24 +736,9 @@ static void phone_task(void *arg)
                              fsm.line == PHONE_LINE_BUSY || fsm.line == PHONE_LINE_REORDER ? DIGITS_LED_RING_ENDED :
                              reached_server ? DIGITS_LED_RING_OFF : DIGITS_LED_RING_STARTING,
                              now);
-        // Long press on hook with an idle line: open the setup network.
-        for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {
-            bool holding = err == ESP_OK && buttons[i].stable && !off_hook && call.phase == DIGITS_CALL_IDLE;
-            if (!holding) {
-                held_since[i] = 0;
-                hold_used[i] = false;
-            } else if (!held_since[i]) {
-                held_since[i] = now;
-            } else if (!hold_used[i] && now - held_since[i] >= SETUP_HOLD_US) {
-                hold_used[i] = true;
-                ESP_LOGI(TAG, "Call button %s held: opening the setup network", target_names[i]);
-                digits_setup_request("call button held");
-                digits_ring_test_request(); // Short ring as confirmation.
-            }
-        }
         if (++polls % SELECTOR_POLL_DIVIDER == 0) selectors_poll(selector_previous);
         digits_knobs_poll(now);
-        lights_poll(&lights, &call, now);
+        lights_poll(&lights, &call, speaker_on, playing_contact, now);
         vTaskDelay(poll_ticks);
     }
 }
@@ -630,6 +754,7 @@ esp_err_t digits_phone_start(void)
     selectors_init();
     digits_led_ring_init(); // Optional; logs why when it fails.
     digits_knobs_init();    // Optional too.
+    digits_button_ladder_init();
     digits_webrtc_set_ringtone_resolver(resolve_ringtone);
     esp_err_t err = inputs_init();
     if (err == ESP_OK &&
@@ -776,6 +901,8 @@ static void print_status(void)
     bool hardware[PHONE_CALL_TARGETS];
     portENTER_CRITICAL(&shared_mux);
     bool off_hook = shared.off_hook, inputs_ok = shared.inputs_ok, started = shared.started;
+    bool handset_up = shared.handset_up, speaker_on = shared.speaker_on;
+    int playing_contact = shared.playing_contact;
     memcpy(numbers, shared.numbers, sizeof(numbers));
     memcpy(ringtones, shared.ringtones, sizeof(ringtones));
     memcpy(selector, shared.selector, sizeof(selector));
@@ -786,9 +913,10 @@ static void print_status(void)
     effective_map(&effective);
     digits_webrtc_call_state_t call;
     digits_webrtc_call_state(&call);
-    printf("Phone: %s, handset %s, inputs %s (%s)\n", started ? "running" : "stopped",
-           off_hook ? "lifted" : "on hook", inputs_ok ? "ok" : "not read yet or failing",
-           INPUT_DESCRIPTION);
+    printf("Phone: %s, handset %s, speaker %s, line %s, inputs %s (%s)\n", started ? "running" : "stopped",
+           handset_up ? "lifted" : "on hook", speaker_on ? "on" : "off", off_hook ? "open" : "closed",
+           inputs_ok ? "ok" : "not read yet or failing", INPUT_DESCRIPTION);
+    if (playing_contact >= 0) printf("Messages: playing contact %s's\n", target_names[playing_contact]);
     printf("Call: %s%s%s, signaling %s, %s\n", phase_names[call.phase],
            call.remote[0] ? " with " : "", call.remote,
            call.online ? "online" : "offline", call.paired ? "paired" : "unpaired");
@@ -886,6 +1014,13 @@ int digits_phone_console(int argc, char **argv)
         shared.sim_hook = !strcmp(argv[2], "up");
         portEXIT_CRITICAL(&shared_mux);
         printf("Simulated handset %s\n", !strcmp(argv[2], "up") ? "lift" : "replace");
+        return 0;
+    }
+    if (!strcmp(verb, "speaker") && argc == 2) {
+        portENTER_CRITICAL(&shared_mux);
+        ++shared.sim_speaker;
+        portEXIT_CRITICAL(&shared_mux);
+        printf("Simulated speaker button press\n");
         return 0;
     }
     if (!strcmp(verb, "press") && argc == 3 && target >= 0) {

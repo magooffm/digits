@@ -142,3 +142,11 @@ phone_output_t phone_fsm_step(phone_fsm_t *fsm, const phone_inputs_t *in)
     out.tone = line_tone(fsm, in);
     return out;
 }
+
+bool phone_speaker_step(bool speaker_on, bool pressed, bool handset_up, bool handset_lifted, phone_line_t line)
+{
+    if (handset_lifted) speaker_on = false;
+    if (pressed) speaker_on = !speaker_on;
+    if (!pressed && speaker_on && !handset_up && line == PHONE_LINE_LOCKOUT) speaker_on = false;
+    return speaker_on;
+}

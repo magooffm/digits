@@ -102,3 +102,11 @@ phone_output_t phone_fsm_step(phone_fsm_t *fsm, const phone_inputs_t *inputs);
 // The CALL action could not be issued (no number, worker rejected it):
 // play the failure treatment instead of ringback.
 void phone_fsm_call_rejected(phone_fsm_t *fsm, int64_t now_us);
+
+// Speakerphone, a firmware state behind a momentary speaker button (the
+// light shows it). The line is open while the handset is up or the speaker
+// is on. A press toggles the speaker; lifting the handset takes the call
+// over from the speaker; with the handset down, a line that has gone silent
+// (lockout after a call or an unused dial tone) switches the speaker off,
+// so the phone always returns to idle by itself.
+bool phone_speaker_step(bool speaker_on, bool pressed, bool handset_up, bool handset_lifted, phone_line_t line);

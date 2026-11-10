@@ -149,11 +149,12 @@ static struct {
 } rec;
 
 // Player requests.
-typedef enum { PLAY_NONE, PLAY_UNHEARD, PLAY_ONE, PLAY_GREETING } play_kind_t;
+typedef enum { PLAY_NONE, PLAY_UNHEARD, PLAY_ONE, PLAY_GREETING, PLAY_CALLER } play_kind_t;
 static portMUX_TYPE play_mux = portMUX_INITIALIZER_UNLOCKED;
 static struct {
     play_kind_t kind;
     uint32_t number;
+    char caller[VM_STORE_CALLER_BYTES]; // PLAY_CALLER.
     bool stop;
     bool busy;
 } play;
@@ -457,13 +458,30 @@ static bool play_greeting(player_buffers_t *b)
     return true;
 }
 
-// Next message for a request: its path and number, or false when done.
-static bool next_message(play_kind_t kind, uint32_t number, uint32_t played, char path[VM_STORE_PATH_BYTES],
-                         vm_message_t *out)
+// PLAY_CALLER: the caller's oldest unheard message; with none left before
+// the first one played, their newest message once (*replay).
+static const vm_message_t *next_from_caller(const char *caller, uint32_t played, bool *replay)
 {
+    const vm_message_t *newest = NULL;
+    for (unsigned i = 0; i < store.count; ++i) {
+        const vm_message_t *m = &store.messages[i];
+        if (strcmp(m->caller, caller)) continue;
+        if (!m->heard) return m;
+        newest = m; // Ascending by number: the last match is the newest.
+    }
+    *replay = !played && newest;
+    return *replay ? newest : NULL;
+}
+
+// Next message for a request: its path and number, or false when done.
+static bool next_message(play_kind_t kind, uint32_t number, const char *caller, uint32_t played,
+                         char path[VM_STORE_PATH_BYTES], vm_message_t *out, bool *replay)
+{
+    *replay = false;
     lock();
     const vm_message_t *m = kind == PLAY_ONE ? (played ? NULL : vm_store_find(&store, number))
-                                             : vm_store_next_unheard(&store);
+                          : kind == PLAY_CALLER ? next_from_caller(caller, played, replay)
+                                                : vm_store_next_unheard(&store);
     bool found = m && vm_store_path(&store, m, path);
     if (found) *out = *m;
     unlock();
@@ -479,6 +497,8 @@ static void player_task(void *arg)
         portENTER_CRITICAL(&play_mux);
         play_kind_t kind = play.kind;
         uint32_t number = play.number;
+        char caller[VM_STORE_CALLER_BYTES];
+        memcpy(caller, play.caller, sizeof(caller));
         play.kind = PLAY_NONE;
         play.stop = false;
         play.busy = kind != PLAY_NONE;
@@ -494,18 +514,22 @@ static void player_task(void *arg)
                 char path[VM_STORE_PATH_BYTES];
                 vm_message_t m;
                 uint32_t played = 0;
-                while (keep_playing() && next_message(kind, number, played, path, &m)) {
-                    ESP_LOGI(TAG, "Playing message %u from %s", (unsigned)m.number, m.caller);
+                bool replay;
+                while (keep_playing() && next_message(kind, number, caller, played, path, &m, &replay)) {
+                    ESP_LOGI(TAG, "Playing %smessage %u from %s", replay ? "the last heard " : "",
+                             (unsigned)m.number, m.caller);
                     ++played;
                     if (!play_message(b, path)) break;
                     lock();
                     vm_store_mark_heard(&store, m.number);
                     unlock();
-                    if (kind == PLAY_ONE) break;
+                    if (kind == PLAY_ONE || replay) break;
                     int16_t gap[960] = {0};
                     speak(b, gap, 960);
                 }
-                if (!played) ESP_LOGI(TAG, "%s", kind == PLAY_ONE ? "No such message" : "No new messages");
+                if (!played)
+                    ESP_LOGI(TAG, "%s", kind == PLAY_ONE ? "No such message" :
+                                        kind == PLAY_CALLER ? "No messages from this caller" : "No new messages");
             }
             digits_audio_speaker_silence();
             digits_audio_speaker_release();
@@ -518,7 +542,7 @@ static void player_task(void *arg)
     }
 }
 
-static esp_err_t request(play_kind_t kind, uint32_t number)
+static esp_err_t request(play_kind_t kind, uint32_t number, const char *caller)
 {
     if (!digits_voicemail_ready()) return ESP_ERR_INVALID_STATE;
     digits_webrtc_call_state_t call;
@@ -529,13 +553,28 @@ static esp_err_t request(play_kind_t kind, uint32_t number)
     if (busy) play.stop = true;
     play.kind = kind;
     play.number = number;
+    snprintf(play.caller, sizeof(play.caller), "%s", caller ? caller : "");
     portEXIT_CRITICAL(&play_mux);
     xTaskNotifyGive(player);
     return ESP_OK;
 }
 
-esp_err_t digits_voicemail_play(uint32_t number) { return request(number ? PLAY_ONE : PLAY_UNHEARD, number); }
-esp_err_t digits_voicemail_play_greeting(void) { return request(PLAY_GREETING, 0); }
+esp_err_t digits_voicemail_play(uint32_t number) { return request(number ? PLAY_ONE : PLAY_UNHEARD, number, NULL); }
+esp_err_t digits_voicemail_play_greeting(void) { return request(PLAY_GREETING, 0, NULL); }
+
+esp_err_t digits_voicemail_play_from(const char *caller)
+{
+    if (!caller || !caller[0]) return ESP_ERR_INVALID_ARG;
+    return request(PLAY_CALLER, 0, caller);
+}
+
+bool digits_voicemail_playing(void)
+{
+    portENTER_CRITICAL(&play_mux);
+    bool playing = play.busy || play.kind != PLAY_NONE;
+    portEXIT_CRITICAL(&play_mux);
+    return playing;
+}
 
 void digits_voicemail_stop(void)
 {
@@ -791,6 +830,8 @@ esp_err_t digits_voicemail_play(uint32_t number)
     return ESP_ERR_NOT_SUPPORTED;
 }
 esp_err_t digits_voicemail_play_greeting(void) { return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t digits_voicemail_play_from(const char *caller) { (void)caller; return ESP_ERR_NOT_SUPPORTED; }
+bool digits_voicemail_playing(void) { return false; }
 const char *digits_voicemail_greeting_kind(void) { return "built-in"; }
 unsigned digits_voicemail_greeting_seconds(void) { return 0; }
 esp_err_t digits_voicemail_greeting_reload(void) { return ESP_ERR_NOT_SUPPORTED; }

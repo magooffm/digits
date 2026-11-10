@@ -208,6 +208,25 @@ menu "Digits development configuration"
             int "LED ring brightness (percent)"
             range 1 100
             default 30
+        config DIGITS_BUTTON_LADDER_CHANNEL
+            int "Button ladder ADS1115 input (-1: none)"
+            range -1 3
+            default 3
+            help
+                Ring A, ring B and speaker buttons as a resistor ladder on
+                this input of an ADS1115 at I2C 0x48 (33k pull-up; 10k, 20k,
+                33k to GND). Ring A and B work like call buttons A and B,
+                next to the board keys. Without the chip it stays off.
+        config DIGITS_SPEAKER_BUTTON_LATCHING
+            bool "Speaker button latches (stays pressed)"
+            default n
+            help
+                The speaker button should be momentary: each press switches
+                the speakerphone, its light shows the state, and holding it
+                8 s with the handset down opens the setup network. A
+                latching button works too: each change of position counts
+                as one press (no hold), but its position may not match the
+                light.
         config DIGITS_VOLUME_KNOB_GPIO
             int "Volume fader ADC1 GPIO (-1: no fader)"
             range -1 10
