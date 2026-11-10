@@ -417,6 +417,60 @@ static void run_action(phone_fsm_t *fsm, const phone_output_t *out,
                  call->online ? "online" : "offline", call->paired ? "paired" : "unpaired");
 }
 
+// Button lights (A and B): flashing while a call with that contact rings
+// here or there, on during the call, a short blink every 2 s while it left
+// unheard messages, off otherwise.
+#define LIGHT_FLASH_HALF_US 400000LL // As the LED ring.
+#define LIGHT_BLINK_PERIOD_US 2000000LL
+#define LIGHT_BLINK_ON_US 200000LL
+#define LIGHT_MESSAGES_REFRESH_US 10000000LL
+
+typedef struct {
+    bool ready, shown[DIGITS_BOARD_LIGHT_COUNT];
+    int unheard_total; // Count the per-contact flags were computed for.
+    bool messages[DIGITS_BOARD_LIGHT_COUNT];
+    int64_t messages_at, next_error_log;
+} lights_t;
+
+static void lights_poll(lights_t *l, const digits_webrtc_call_state_t *call, int64_t now)
+{
+    if (!l->ready) return;
+    char numbers[DIGITS_BOARD_LIGHT_COUNT][NUMBER_CAPACITY];
+    portENTER_CRITICAL(&shared_mux);
+    for (unsigned i = 0; i < DIGITS_BOARD_LIGHT_COUNT; ++i) memcpy(numbers[i], shared.numbers[i], NUMBER_CAPACITY);
+    portEXIT_CRITICAL(&shared_mux);
+    // Per-contact messages: refreshed when the unheard count changes, and
+    // every 10 s for changed contact numbers. Never waits for the SD card.
+    int total = digits_voicemail_unheard();
+    if (total != l->unheard_total || now - l->messages_at >= LIGHT_MESSAGES_REFRESH_US) {
+        bool fresh[DIGITS_BOARD_LIGHT_COUNT], complete = true;
+        for (unsigned i = 0; i < DIGITS_BOARD_LIGHT_COUNT && complete; ++i) {
+            int count = total > 0 && numbers[i][0] ? digits_voicemail_unheard_from(numbers[i], 0) : 0;
+            if (count < 0 && digits_voicemail_ready()) complete = false; // Busy: next poll.
+            fresh[i] = count > 0;
+        }
+        if (complete) {
+            memcpy(l->messages, fresh, sizeof(fresh));
+            l->unheard_total = total;
+            l->messages_at = now;
+        }
+    }
+    bool ringing = call->phase == DIGITS_CALL_CALLING || call->phase == DIGITS_CALL_RINGING;
+    bool talking = call->phase >= DIGITS_CALL_CONNECTING;
+    for (unsigned i = 0; i < DIGITS_BOARD_LIGHT_COUNT; ++i) {
+        bool with = (ringing || talking) && numbers[i][0] && !strcmp(call->remote, numbers[i]);
+        bool on = with ? (talking || (now / LIGHT_FLASH_HALF_US) % 2 == 0) :
+                  l->messages[i] && now % LIGHT_BLINK_PERIOD_US < LIGHT_BLINK_ON_US;
+        if (on == l->shown[i]) continue;
+        esp_err_t err = digits_audio_board_light_set(i, on);
+        if (err == ESP_OK) l->shown[i] = on;
+        else if (now >= l->next_error_log) {
+            ESP_LOGW(TAG, "Button light %c failed: %s", 'A' + i, esp_err_to_name(err));
+            l->next_error_log = now + ERROR_LOG_INTERVAL_US * 10;
+        }
+    }
+}
+
 static void phone_task(void *arg)
 {
     (void)arg;
@@ -436,6 +490,10 @@ static void phone_task(void *arg)
     bool hold_used[PHONE_CALL_TARGETS] = {false};
     uint32_t led_ended_calls = 0; // The worker counts from 0 too.
     bool reached_server = false;
+    lights_t lights = {.unheard_total = -1};
+    esp_err_t lights_err = digits_audio_board_lights_init();
+    lights.ready = lights_err == ESP_OK;
+    if (!lights.ready) ESP_LOGW(TAG, "Button lights unavailable: %s", esp_err_to_name(lights_err));
     TickType_t poll_ticks = pdMS_TO_TICKS(POLL_MS) ? pdMS_TO_TICKS(POLL_MS) : 1;
     for (;;) {
         int64_t now = esp_timer_get_time();
@@ -556,6 +614,7 @@ static void phone_task(void *arg)
         }
         if (++polls % SELECTOR_POLL_DIVIDER == 0) selectors_poll(selector_previous);
         digits_knobs_poll(now);
+        lights_poll(&lights, &call, now);
         vTaskDelay(poll_ticks);
     }
 }

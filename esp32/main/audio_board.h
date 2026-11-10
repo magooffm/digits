@@ -29,6 +29,13 @@ esp_err_t digits_audio_record_button_read(bool *pressed);
 esp_err_t digits_audio_board_keys_init(void);
 esp_err_t digits_audio_board_keys_read(uint8_t *pressed);
 
+// Button lights: Extend_IO0 and Extend_IO1 (TCA9555 P00, P01; header P1
+// pins 14 and 16) drive ULN2003 inputs, high = light on. Index 0 is
+// contact A's button.
+#define DIGITS_BOARD_LIGHT_COUNT 2
+esp_err_t digits_audio_board_lights_init(void);
+esp_err_t digits_audio_board_light_set(unsigned index, bool on);
+
 // Speaker volume 0-100 (the codec maps 1-100 to -50..0 dB; 0 mutes), saved in NVS.
 // Applies at once, also mid-call; set it from an internal-RAM stack.
 #define DIGITS_SPEAKER_VOLUME_DEFAULT 50

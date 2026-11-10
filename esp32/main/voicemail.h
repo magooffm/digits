@@ -61,6 +61,9 @@ typedef struct {
 unsigned digits_voicemail_list(digits_voicemail_message_t *out, unsigned max);
 bool digits_voicemail_file(uint32_t number, char *path, size_t capacity);
 esp_err_t digits_voicemail_mark_heard(uint32_t number);
+// Unheard messages from this caller, or -1 while the store is busy for
+// longer than timeout_ms (or the answering machine is off).
+int digits_voicemail_unheard_from(const char *caller, uint32_t timeout_ms);
 esp_err_t digits_voicemail_delete(uint32_t number);
 
 // Console: vm [status] | list | play [N] | greeting | stop | heard N |

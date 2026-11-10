@@ -638,6 +638,17 @@ unsigned digits_voicemail_list(digits_voicemail_message_t *out, unsigned max)
     return count;
 }
 
+int digits_voicemail_unheard_from(const char *caller, uint32_t timeout_ms)
+{
+    if (!digits_voicemail_ready() || !caller || !caller[0]) return -1;
+    if (xSemaphoreTake(store_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return -1;
+    int count = 0;
+    for (unsigned i = 0; i < store.count; ++i)
+        count += !store.messages[i].heard && !strcmp(store.messages[i].caller, caller);
+    unlock();
+    return count;
+}
+
 bool digits_voicemail_file(uint32_t number, char *path, size_t capacity)
 {
     if (!digits_voicemail_ready() || capacity < VM_STORE_PATH_BYTES) return false;
@@ -792,6 +803,7 @@ esp_err_t digits_voicemail_set_listen(bool greeting, bool caller) { return ESP_E
 void digits_voicemail_stop(void) {}
 unsigned digits_voicemail_list(digits_voicemail_message_t *out, unsigned max) { return 0; }
 bool digits_voicemail_file(uint32_t number, char *path, size_t capacity) { return false; }
+int digits_voicemail_unheard_from(const char *caller, uint32_t timeout_ms) { return -1; }
 esp_err_t digits_voicemail_mark_heard(uint32_t number) { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t digits_voicemail_delete(uint32_t number) { return ESP_ERR_NOT_SUPPORTED; }
 int digits_voicemail_console(int argc, char **argv)

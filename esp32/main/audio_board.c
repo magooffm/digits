@@ -9,6 +9,8 @@
 
 // Waveshare v1.1: PA_CTRL is Extend_IO8 / TCA9555 P10, active high.
 #define PA_BIT (1U << 0)
+#define TCA_OUTPUT_0 0x02 // Extend_IO0-7 (P00-P07); IO0-IO2 reach header P1.
+#define TCA_CONFIG_0 0x06
 #define TCA_OUTPUT_1 0x03
 #define TCA_CONFIG_1 0x07
 #define TCA_POLARITY_1 0x05
@@ -254,6 +256,23 @@ esp_err_t digits_audio_speaker_set_volume(int volume)
     return err;
 }
 i2s_chan_handle_t digits_audio_rx_channel(void) { return board.rx; }
+
+esp_err_t digits_audio_board_lights_init(void)
+{
+    if (!board.expander || !board.expander_lock) return ESP_ERR_INVALID_STATE;
+    const uint8_t mask = (1U << DIGITS_BOARD_LIGHT_COUNT) - 1;
+    // Latch off before switching the pins from input to output.
+    esp_err_t err = update_expander(TCA_OUTPUT_0, mask, false);
+    if (err == ESP_OK) err = update_expander(TCA_CONFIG_0, mask, false);
+    return err;
+}
+
+esp_err_t digits_audio_board_light_set(unsigned index, bool on)
+{
+    if (index >= DIGITS_BOARD_LIGHT_COUNT) return ESP_ERR_INVALID_ARG;
+    if (!board.expander || !board.expander_lock) return ESP_ERR_INVALID_STATE;
+    return update_expander(TCA_OUTPUT_0, (uint8_t)(1U << index), on);
+}
 
 esp_err_t digits_audio_record_button_init(void)
 {

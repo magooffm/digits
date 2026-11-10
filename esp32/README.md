@@ -663,6 +663,12 @@ or more, not saved (the fader is read at boot). The status page then shows
 the volume read-only. A phone without a fader needs -1: a free pin reads noise.
 `knob` on the console shows the reading; `knob on|off` traces every reading.
 
+**Button lights.** Extend_IO0 and Extend_IO1 (header pins 14 and 16) drive
+ULN2003 inputs for the lights of call buttons A and B: flashing (400 ms)
+while a call with that contact rings here or there, on during the call, a
+200 ms blink every 2 s while that contact has unheard messages, off
+otherwise. A contact without a number never lights.
+
 For a two-way test against a second phone on the PC, see the helper's
 [live two-way call](../tools/interop/README.md#live-two-way-call).
 
