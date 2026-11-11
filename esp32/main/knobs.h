@@ -15,7 +15,7 @@ void digits_knobs_poll(int64_t now_us);
 bool digits_knobs_volume_active(void);
 // Last reading in millivolts, -1 before the first one.
 int digits_knobs_volume_mv(void);
-// Serial trace (on at boot): each reading that moved 5 mV or set the volume,
+// Serial trace (off at boot): each reading that moved 5 mV or set the volume,
 // and read errors. Printed with printf, so it stays out of the web log.
 void digits_knobs_set_trace(bool on);
 bool digits_knobs_trace(void);

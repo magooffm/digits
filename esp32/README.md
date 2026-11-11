@@ -655,13 +655,27 @@ suppression races.
 board ES8311 (0x18), TCA9555 (0x20), ES7210 (0x40) and 0x51; added WM8978
 (0x1A) and ADS1115 (0x48 with ADDR to ground).
 
+**Handset codec (test stage).** WM8978 on I2S1: MCK GPIO3, SCK GPIO4, FSA
+GPIO5, data GPIO6 and GPIO7, 48 kHz. The first `handset` command resets the
+codec and listens on both data pins to find its microphone output. Nothing
+runs at boot and calls do not use it yet.
+
+```
+handset                  # find the codec and its data pins
+handset tone [S]         # 440 Hz on the audio out jack
+handset mic [S]          # input levels, left and right
+handset echo [S]         # input played back on the output
+handset input mic|line   # LIP/LIN and RIP/RIN, or L2/R2
+handset volume DB        # output -57..6 dB, default -9
+```
+
 **Volume knob.** A B10K fader between 3.3 V and GND, wiper on GPIO9 (header
 pin 12, ADC1; `DIGITS_VOLUME_KNOB_GPIO`, -1 disables), sets the speaker
 volume: muted at 80 mV or less, 100 from 2.9 V (the fader tops out near
 3.0 V). Four readings are averaged every 50 ms and applied on a change of 3
 or more, not saved (the fader is read at boot). The status page then shows
 the volume read-only. A phone without a fader needs -1: a free pin reads noise.
-`knob` on the console shows the reading; `knob on|off` traces every reading.
+`knob` on the console shows the reading; `knob on|off` traces every reading (off at boot).
 
 **Button ladder.** Ring A, ring B and speaker buttons on ADS1115 A3
 (`DIGITS_BUTTON_LADDER_CHANNEL`, -1 disables): 33k pull-up to 3.3 V, each

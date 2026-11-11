@@ -25,7 +25,7 @@ static int64_t next_poll;
 static int last_mv = -1;
 static int samples[AVERAGE], sample_count, sample_next;
 static int64_t changed_at; // 0: nothing to log.
-static volatile bool trace = true; // Serial only; `knob off` stops it.
+static volatile bool trace; // Serial only; `knob on` starts it.
 static int traced_mv = -1000;
 static unsigned read_errors;
 

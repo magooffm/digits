@@ -4,6 +4,7 @@
 #ifdef CONFIG_DIGITS_WEBRTC_CONSOLE
 #include "webrtc.h"
 #include "audio_board.h"
+#include "handset.h"
 #include "knobs.h"
 #include "phone.h"
 #include "tx_voice.h"
@@ -11,6 +12,7 @@
 #include "wifi.h"
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "esp_console.h"
 #include "esp_log.h"
@@ -65,6 +67,37 @@ static int knob_command(int argc, char **argv)
     if (!digits_knobs_volume_active()) printf("Volume knob off (disabled or its ADC failed; see the boot log)\n");
     else printf("Volume knob: %d mV, volume %d, %u read errors, trace %s\n", digits_knobs_volume_mv(),
                 digits_audio_speaker_volume(), digits_knobs_read_errors(), digits_knobs_trace() ? "on" : "off");
+    return 0;
+}
+
+static int handset_command(int argc, char **argv)
+{
+    const char *what = argc >= 2 ? argv[1] : "status";
+    int value = argc == 3 ? atoi(argv[2]) : 0;
+    esp_err_t err = ESP_OK;
+    if (strcmp(what, "status") == 0 && argc <= 2) {
+        err = digits_handset_init();
+        if (err == ESP_OK)
+            printf("WM8978 ready: microphone data on GPIO%d, input %s, output %d dB\n", digits_handset_adc_gpio(),
+                   digits_handset_input() == HANDSET_INPUT_MIC ? "mic" : "line", digits_handset_output_db());
+    } else if ((strcmp(what, "tone") == 0 || strcmp(what, "mic") == 0 || strcmp(what, "echo") == 0) && argc <= 3) {
+        unsigned seconds = argc == 3 ? (unsigned)value : 3;
+        if (seconds < 1 || seconds > 30) seconds = 3;
+        err = what[0] == 't' ? digits_handset_tone(seconds)
+            : what[0] == 'm' ? digits_handset_mic(seconds) : digits_handset_echo(seconds);
+    } else if (strcmp(what, "input") == 0 && argc == 3 &&
+               (strcmp(argv[2], "mic") == 0 || strcmp(argv[2], "line") == 0)) {
+        err = digits_handset_set_input(argv[2][0] == 'm' ? HANDSET_INPUT_MIC : HANDSET_INPUT_LINE);
+    } else if (strcmp(what, "volume") == 0 && argc == 3) {
+        err = digits_handset_set_output_db(value);
+    } else {
+        printf("Usage: handset [status] | handset tone|mic|echo [SECONDS] | handset input mic|line | handset volume DB\n");
+        return 1;
+    }
+    if (err != ESP_OK) {
+        printf("Handset: %s\n", esp_err_to_name(err));
+        return 1;
+    }
     return 0;
 }
 
@@ -160,11 +193,21 @@ esp_err_t digits_webrtc_console_start(void)
     const esp_console_cmd_t knob = {
         .command = "knob",
         .help = "Volume knob: reading, volume and read errors; on|off switches the serial trace "
-                "of each reading (on at boot).",
+                "of each reading (off at boot).",
         .hint = "[on|off]",
         .func = knob_command,
     };
     err = esp_console_cmd_register(&knob);
+    if (err != ESP_OK) return err;
+    const esp_console_cmd_t handset = {
+        .command = "handset",
+        .help = "WM8978 handset codec tests: status finds the codec and its data pins; tone plays 440 Hz, "
+                "mic prints input levels, echo plays the input back (default 3 s); input mic|line; "
+                "volume -57..6 dB for the output.",
+        .hint = "[status|tone|mic|echo [S]|input mic|line|volume DB]",
+        .func = handset_command,
+    };
+    err = esp_console_cmd_register(&handset);
     if (err != ESP_OK) return err;
 
     esp_console_repl_config_t config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -187,6 +230,7 @@ esp_err_t digits_webrtc_console_start(void)
         (void)esp_console_cmd_deregister("wifi");
         (void)esp_console_cmd_deregister("i2c");
         (void)esp_console_cmd_deregister("knob");
+        (void)esp_console_cmd_deregister("handset");
         return err;
     }
     err = esp_console_start_repl(console);
