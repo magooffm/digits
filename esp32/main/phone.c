@@ -687,15 +687,21 @@ static void phone_task(void *arg)
         shared.playing_contact = playing_contact;
         shared.inputs_ok = inputs_ok;
         portEXIT_CRITICAL(&shared_mux);
-        // Where sound goes: logged until the handset audio exists.
+        // Where sound goes: the earpiece while the handset is up (with the
+        // WM8978 fitted), else the board speaker. Ringing happens on-hook only.
         int new_route = !off_hook && !playing ? 0 : handset_up && !speaker_on ? 1 : 2;
-        if (new_route && new_route != route)
-            ESP_LOGI(TAG, "Sound: %s", new_route == 1 ? "handset (no handset audio yet: speaker plays)" : "speaker");
+        if (new_route != route) {
+            digits_audio_set_handset_route(new_route == 1);
+            if (new_route)
+                ESP_LOGI(TAG, "Sound: %s", new_route == 2 ? "speaker"
+                         : digits_audio_handset_route() ? "handset" : "handset (no handset codec: speaker plays)");
+        }
         route = new_route;
         digits_silence_poll();
 
         inputs.now_us = now;
         inputs.off_hook = fsm_off_hook;
+        inputs.speaker_pressed = speaker_pressed != 0;
         inputs.phase = (phone_phase_t)call.phase;
         inputs.ended_calls = call.ended_calls;
         inputs.last_end = (phone_end_t)call.last_end;

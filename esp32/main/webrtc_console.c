@@ -76,20 +76,18 @@ static int handset_command(int argc, char **argv)
     int value = argc == 3 ? atoi(argv[2]) : 0;
     esp_err_t err = ESP_OK;
     if (strcmp(what, "status") == 0 && argc <= 2) {
-        err = digits_handset_init();
-        if (err == ESP_OK)
-            printf("WM8978 ready: microphone data on GPIO%d, input %s, output %d dB\n", digits_handset_adc_gpio(),
-                   digits_handset_input() == HANDSET_INPUT_MIC ? "mic" : "line", digits_handset_output_db());
+        digits_handset_status();
     } else if ((strcmp(what, "tone") == 0 || strcmp(what, "mic") == 0 || strcmp(what, "echo") == 0) && argc <= 3) {
         unsigned seconds = argc == 3 ? (unsigned)value : 3;
         if (seconds < 1 || seconds > 30) seconds = 3;
         err = what[0] == 't' ? digits_handset_tone(seconds)
             : what[0] == 'm' ? digits_handset_mic(seconds) : digits_handset_echo(seconds);
+        if (err == ESP_ERR_INVALID_STATE) printf("Handset: busy (handset up, or other sound playing)\n");
     } else if (strcmp(what, "input") == 0 && argc == 3 &&
                (strcmp(argv[2], "mic") == 0 || strcmp(argv[2], "line") == 0)) {
         err = digits_handset_set_input(argv[2][0] == 'm' ? HANDSET_INPUT_MIC : HANDSET_INPUT_LINE);
     } else if (strcmp(what, "volume") == 0 && argc == 3) {
-        err = digits_handset_set_output_db(value);
+        err = digits_handset_set_test_db(value);
     } else {
         printf("Usage: handset [status] | handset tone|mic|echo [SECONDS] | handset input mic|line | handset volume DB\n");
         return 1;
@@ -201,9 +199,9 @@ esp_err_t digits_webrtc_console_start(void)
     if (err != ESP_OK) return err;
     const esp_console_cmd_t handset = {
         .command = "handset",
-        .help = "WM8978 handset codec tests: status finds the codec and its data pins; tone plays 440 Hz, "
-                "mic prints input levels, echo plays the input back (default 3 s); input mic|line; "
-                "volume -57..6 dB for the output.",
+        .help = "WM8978 handset codec: status shows its data pins and route; tests with the handset down: "
+                "tone plays 440 Hz, mic prints input levels, echo plays the input back (default 3 s); "
+                "input mic|line; volume -57..6 dB for tone and echo (calls follow the volume knob).",
         .hint = "[status|tone|mic|echo [S]|input mic|line|volume DB]",
         .func = handset_command,
     };

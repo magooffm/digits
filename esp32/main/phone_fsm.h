@@ -57,6 +57,7 @@ typedef struct {
     uint32_t ended_calls;                 // Monotonic, from the worker.
     phone_end_t last_end;
     bool last_connected;
+    bool speaker_pressed; // A finished line (busy, reorder, lockout) gets dial tone again.
 } phone_inputs_t;
 
 typedef enum {

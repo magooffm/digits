@@ -44,6 +44,13 @@ esp_err_t digits_audio_speaker_set_volume(int volume);
 // The same without saving, for the volume knob (any stack).
 esp_err_t digits_audio_speaker_apply_volume(int volume);
 
+// Sound route: false = board speaker and microphones, true = handset
+// earpiece and microphone (WM8978, handset.h; ignored without it). Set by
+// the phone task; the speaker functions below follow it, also mid-sound.
+// The volume applies to both outputs.
+void digits_audio_set_handset_route(bool handset);
+bool digits_audio_handset_route(void);
+
 // Reserve output across recording/playback; never acquire from the WS callback.
 bool digits_audio_speaker_acquire(uint32_t timeout_ms);
 void digits_audio_speaker_release(void);

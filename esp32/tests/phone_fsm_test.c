@@ -84,10 +84,10 @@ static void test_remote_hangup_then_redial(void)
     in.phase = PHONE_PHASE_IDLE; // Remote hung up, handset still lifted.
     end_call(PHONE_END_REMOTE_HANGUP, true);
     assert(step().action == PHONE_ACTION_NONE);
-    in.presses[0] = 1; // Like the Pi: hang up first, no redial from reorder.
-    assert(step().action == PHONE_ACTION_IGNORED_PRESS);
+    in.presses[0] = 1; // Unlike the Pi: calls again without hanging up.
+    assert(step().action == PHONE_ACTION_CALL);
     in.off_hook = false;
-    assert(step().action == PHONE_ACTION_NONE); // Nothing left to end.
+    assert(step().action == PHONE_ACTION_NONE); // The new call never started.
     in.off_hook = true;
     assert(step().tone == TONE_GEN_DIAL);
     in.presses[0] = 2;
@@ -217,10 +217,11 @@ static void test_tones_busy(void)
     assert(step().tone == TONE_GEN_BUSY);
     at(50);
     assert(step().tone == TONE_GEN_NONE && fsm.line == PHONE_LINE_LOCKOUT); // Silent until replaced.
-    in.presses[1] = 2;
-    assert(step().action == PHONE_ACTION_IGNORED_PRESS);
+    in.presses[1] = 2; // Or a call button calls again.
+    phone_output_t out = step();
+    assert(out.action == PHONE_ACTION_CALL && out.target == 1 && out.tone == TONE_GEN_RINGBACK);
     in.off_hook = false;
-    assert(step().tone == TONE_GEN_NONE);
+    assert(step().action == PHONE_ACTION_NONE && fsm.line == PHONE_LINE_IDLE);
 }
 
 static void test_tones_far_end_gone_while_ringing_out(void)
@@ -285,8 +286,26 @@ static void test_tones_dial_timeout(void)
     assert(step().tone == TONE_GEN_NONE);
     at(10 + 160);
     assert(step().tone == TONE_GEN_REORDER);
-    in.presses[0] = 1;
-    assert(step().action == PHONE_ACTION_IGNORED_PRESS);
+    in.presses[0] = 1; // Calls straight from reorder.
+    assert(step().action == PHONE_ACTION_CALL && fsm.line == PHONE_LINE_CALL);
+}
+
+static void test_speaker_press_restarts_dial_tone(void)
+{
+    reset(false, PHONE_PHASE_IDLE);
+    in.off_hook = true;
+    assert(step().tone == TONE_GEN_DIAL);
+    at(150);
+    step();
+    at(220);
+    assert(step().tone == TONE_GEN_NONE && fsm.line == PHONE_LINE_LOCKOUT);
+    in.speaker_pressed = true;
+    assert(step().tone == TONE_GEN_DIAL && fsm.line == PHONE_LINE_DIAL);
+    in.speaker_pressed = false;
+    at(220 + 149);
+    assert(step().tone == TONE_GEN_DIAL); // A full new dial tone period.
+    in.speaker_pressed = true; // Dial tone already: no change.
+    assert(step().tone == TONE_GEN_DIAL);
 }
 
 static void test_tones_incoming(void)
@@ -390,6 +409,7 @@ int main(void)
     test_tones_call_never_started();
     test_tones_call_rejected();
     test_tones_dial_timeout();
+    test_speaker_press_restarts_dial_tone();
     test_tones_incoming();
     test_tones_foreign_ring_keeps_dial_tone();
     test_tones_lift_during_console_call();

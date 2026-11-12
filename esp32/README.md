@@ -359,9 +359,10 @@ commands. Rules follow the Pi controller:
 
 - Lifting the handset while a call rings answers it.
 - Replacing the handset ends any call, outgoing or connected.
-- With the handset lifted and dial tone playing, button A or B calls its number.
-- Buttons pressed on-hook, during a call, or after a call ended (busy or
-  reorder) are logged and ignored. Replace the handset first, as on the Pi.
+- With the handset lifted, button A or B calls its number: from dial tone,
+  and also after busy, reorder or the silence after them (the Pi needs the
+  handset replaced first). A speaker button press after busy or reorder
+  also brings back dial tone. Buttons during a call are logged and ignored.
 - The incoming ringtone is silent while the handset is lifted. If a call
   arrives off-hook, replacing the handset starts ringing; it is not rejected.
 - The board's LED ring (7 WS2812 on GPIO38, `led_ring.c`) is a traffic
@@ -385,7 +386,7 @@ generated in `tone_gen.c` instead of stored as WAV files:
 | Busy, or the far end left while ringing | Busy, 480+620 Hz, 0.5 s on / 0.5 s off |
 | Unreachable, failed, or the other side hung up | 1 s silence, then reorder, 480+620 Hz, 0.25 s on / 0.25 s off |
 | Dial tone unused for 15 s | Same reorder treatment |
-| 5 s of busy or reorder (the Pi: 45 s of reorder, busy without limit) | Silence until the handset is replaced |
+| 5 s of busy or reorder (the Pi: 45 s of reorder, busy without limit) | Silence until the handset is replaced, a call button calls or the speaker button brings back dial tone |
 
 The Pi's spoken announcements and its howler tone are left out: there are no
 recordings on the ESP32, and the howler is too loud for the board speaker.

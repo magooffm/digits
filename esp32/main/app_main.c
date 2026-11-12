@@ -9,6 +9,7 @@
 #include "line_settings.h"
 #include "audio_board.h"
 #include "microphone.h"
+#include "handset.h"
 #include "tx_voice.h"
 #include "phone.h"
 #include "record_playback_test.h"
@@ -59,6 +60,11 @@ void app_main(void)
         if (err != ESP_OK)
             ESP_LOGE("digits", "Call-progress tones unavailable: %s; calls still work", esp_err_to_name(err));
         tx_voice_init();
+        err = digits_handset_init();
+        if (err == ESP_ERR_NOT_FOUND)
+            ESP_LOGI("digits", "No handset codec (WM8978): calls use the board speaker and microphones");
+        else if (err != ESP_OK)
+            ESP_LOGE("digits", "Handset codec unavailable: %s; calls use the board speaker", esp_err_to_name(err));
         err = digits_microphone_init();
         if (err != ESP_OK)
             ESP_LOGE("digits", "Microphone initialization failed: %s; speaker and signaling continue", esp_err_to_name(err));

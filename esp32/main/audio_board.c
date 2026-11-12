@@ -1,5 +1,6 @@
 #include "audio_board.h"
 #include <string.h>
+#include "handset.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_log.h"
@@ -21,6 +22,10 @@
 #define NVS_NAMESPACE "digits_audio"
 static int speaker_volume = DIGITS_SPEAKER_VOLUME_DEFAULT;
 static bool speaker_on; // Between speaker_start and speaker_silence.
+// The phone task sets the route; the speaker holder follows it on its next
+// start or write, so only that task switches the outputs.
+static bool handset_route;
+static bool output_handset; // The output speaker_start or a write enabled.
 
 static struct {
     i2c_master_bus_handle_t bus;
@@ -223,6 +228,7 @@ esp_err_t digits_audio_i2c_scan(uint32_t found[4], unsigned probes, unsigned *fl
         const uint8_t pointer = 0;
         for (unsigned i = 0; i < probes; ++i) answers += i2c_master_transmit(device, &pointer, 1, 50) == ESP_OK;
         i2c_master_bus_rm_device(device);
+        vTaskDelay(1); // Lets the phone task's input reads in between.
         if (answers == probes) found[address / 32] |= 1U << (address % 32);
         else if (answers) ++(*flaky);
     }
@@ -236,8 +242,10 @@ esp_err_t digits_audio_speaker_apply_volume(int volume)
     if (volume < 0 || volume > 100) return ESP_ERR_INVALID_ARG;
     if (board.device && esp_codec_dev_set_out_vol(board.device, volume) != ESP_CODEC_DEV_OK) return ESP_FAIL;
     int previous = __atomic_exchange_n(&speaker_volume, volume, __ATOMIC_RELAXED);
+    if (digits_audio_handset_route()) digits_handset_output(true, volume); // Muted otherwise.
     // Volume 0 mutes: the codec's lowest step is still -50 dB.
-    if (!board.device || !__atomic_load_n(&speaker_on, __ATOMIC_RELAXED) || (previous == 0) == (volume == 0))
+    if (!board.device || !__atomic_load_n(&speaker_on, __ATOMIC_RELAXED) ||
+        __atomic_load_n(&output_handset, __ATOMIC_RELAXED) || (previous == 0) == (volume == 0))
         return ESP_OK;
     if (esp_codec_dev_set_out_mute(board.device, volume == 0) != ESP_CODEC_DEV_OK) return ESP_FAIL;
     return amplifier_set(volume != 0);
@@ -321,19 +329,50 @@ void digits_audio_speaker_release(void)
     xSemaphoreGive(board.speaker_lock);
 }
 
+void digits_audio_set_handset_route(bool handset)
+{
+    if (handset && !digits_handset_ready()) handset = false;
+    if (__atomic_exchange_n(&handset_route, handset, __ATOMIC_RELAXED) == handset) return;
+    // The earpiece stays enabled for the whole route; it plays silence
+    // whenever nothing is written.
+    if (digits_handset_ready()) digits_handset_output(handset, digits_audio_speaker_volume());
+}
+
+bool digits_audio_handset_route(void) { return __atomic_load_n(&handset_route, __ATOMIC_RELAXED); }
+
+static esp_err_t board_speaker_on(void)
+{
+    if (digits_audio_speaker_volume() == 0) return ESP_OK; // Stays muted.
+    if (esp_codec_dev_set_out_mute(board.device, false) != ESP_CODEC_DEV_OK) return ESP_FAIL;
+    return amplifier_set(true);
+}
+
 esp_err_t digits_audio_speaker_start(void)
 {
     if (!board.device) return ESP_ERR_INVALID_STATE;
     __atomic_store_n(&speaker_on, true, __ATOMIC_RELAXED);
-    if (digits_audio_speaker_volume() == 0) return ESP_OK; // Stays muted.
-    if (esp_codec_dev_set_out_mute(board.device, false) != ESP_CODEC_DEV_OK) return ESP_FAIL;
-    return amplifier_set(true);
+    bool handset = digits_audio_handset_route();
+    __atomic_store_n(&output_handset, handset, __ATOMIC_RELAXED);
+    return handset ? ESP_OK : board_speaker_on();
 }
 
 esp_err_t digits_audio_speaker_write(const int16_t *stereo, size_t bytes,
                                     size_t *written, uint32_t timeout_ms)
 {
     if (!board.tx) return ESP_ERR_INVALID_STATE;
+    bool handset = digits_audio_handset_route();
+    if (__atomic_load_n(&speaker_on, __ATOMIC_RELAXED) && handset != __atomic_load_n(&output_handset, __ATOMIC_RELAXED)) {
+        // The handset was lifted or replaced mid-sound: switch outputs.
+        __atomic_store_n(&output_handset, handset, __ATOMIC_RELAXED);
+        if (handset) {
+            amplifier_set(false);
+            esp_codec_dev_set_out_mute(board.device, true);
+        } else if (board_speaker_on() != ESP_OK) {
+            ESP_LOGE("audio_board", "Speaker enable failed after the handset was replaced");
+        }
+    }
+    if (__atomic_load_n(&output_handset, __ATOMIC_RELAXED))
+        return digits_handset_write(stereo, bytes, written, timeout_ms);
     return i2s_channel_write(board.tx, stereo, bytes, written, timeout_ms);
 }
 

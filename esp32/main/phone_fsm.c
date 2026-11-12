@@ -64,7 +64,10 @@ static tone_gen_tone_t line_tone(const phone_fsm_t *fsm, const phone_inputs_t *i
 // ring arriving while off-hook is not answered by that lift; the ringer is
 // suppressed while off-hook and sounds once the handset is replaced. Busy
 // answers and a far end leaving while ringing out play busy; any other end
-// plays reorder after a short silence. Buttons work only from dial tone.
+// plays reorder after a short silence. Unlike the Pi, a call button also
+// calls from busy, reorder or the silent lockout after them, without
+// replacing the handset first, and a speaker button press brings back dial
+// tone: simpler for kids.
 phone_output_t phone_fsm_step(phone_fsm_t *fsm, const phone_inputs_t *in)
 {
     phone_output_t out = {.action = PHONE_ACTION_NONE};
@@ -127,12 +130,19 @@ phone_output_t phone_fsm_step(phone_fsm_t *fsm, const phone_inputs_t *in)
         (fsm->line == PHONE_LINE_BUSY && in->now_us - fsm->line_since_us >= PHONE_HANGUP_TONE_US))
         enter(fsm, PHONE_LINE_LOCKOUT, in->now_us);
 
+    bool finished = fsm->line == PHONE_LINE_BUSY || fsm->line == PHONE_LINE_REORDER ||
+                    fsm->line == PHONE_LINE_LOCKOUT;
+    if (in->speaker_pressed && in->off_hook && finished && in->phase == PHONE_PHASE_IDLE)
+        enter(fsm, PHONE_LINE_DIAL, in->now_us);
+
     for (unsigned i = 0; i < PHONE_CALL_TARGETS; ++i) {
         if (in->presses[i] == fsm->presses[i]) continue;
         fsm->presses[i] = in->presses[i];
         if (out.action != PHONE_ACTION_NONE) continue;
         out.target = i;
-        if (in->off_hook && fsm->line == PHONE_LINE_DIAL && in->phase == PHONE_PHASE_IDLE) {
+        bool line_free = fsm->line == PHONE_LINE_DIAL || fsm->line == PHONE_LINE_BUSY ||
+                         fsm->line == PHONE_LINE_REORDER || fsm->line == PHONE_LINE_LOCKOUT;
+        if (in->off_hook && line_free && in->phase == PHONE_PHASE_IDLE) {
             out.action = PHONE_ACTION_CALL;
             enter_call(fsm, in, true);
         } else {

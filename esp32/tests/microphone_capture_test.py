@@ -59,6 +59,8 @@ static void log_info(const char *, const char *, ...);
 static void log_error(const char *, const char *, ...);
 static const char *esp_err_to_name(int error) { (void)error; return "fake"; }
 static i2s_chan_handle_t digits_audio_rx_channel(void) { return (void *)3; }
+static bool digits_audio_handset_route(void) { return false; }
+static void digits_handset_capture(int16_t *pcm, int16_t *reference, size_t frames, bool use) { (void)pcm; (void)reference; (void)frames; (void)use; }
 static esp_err_t i2s_channel_read(i2s_chan_handle_t, void *, size_t, size_t *, unsigned);
 static int xQueueSend(QueueHandle_t, const void *, unsigned);
 static int xQueueReceive(QueueHandle_t, void *, unsigned);

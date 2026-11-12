@@ -1,6 +1,7 @@
 #include "microphone.h"
 #include "microphone_pcm.h"
 #include "audio_board.h"
+#include "handset.h"
 #include <string.h>
 #include "esp_attr.h"
 #include "esp_codec_dev_defaults.h"
@@ -246,6 +247,9 @@ static void capture_worker(void *arg)
                 microphone_pcm_stats_t *stats = diagnostic ? &mic.levels : NULL;
                 microphone_pcm_split_tdm(mic.tdm, mic.tdm, mic.frame->reference, DIGITS_MIC_FRAME_SAMPLES, stats);
                 microphone_pcm_convert(mic.tdm, mic.frame->pcm, DIGITS_MIC_FRAME_SAMPLES, MONO_SLOT, stats);
+                // Handset up: its microphone replaces the board's.
+                digits_handset_capture(mic.frame->pcm, mic.frame->reference, DIGITS_MIC_FRAME_SAMPLES,
+                                       digits_audio_handset_route());
                 mic.frame->sequence++;
                 mic.frame->flags = discontinuity ? DIGITS_MIC_FRAME_DISCONTINUITY : 0;
                 mic.frame->captured_at_us = esp_timer_get_time();
