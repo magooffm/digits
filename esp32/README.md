@@ -656,18 +656,36 @@ suppression races.
 board ES8311 (0x18), TCA9555 (0x20), ES7210 (0x40) and 0x51; added WM8978
 (0x1A) and ADS1115 (0x48 with ADDR to ground).
 
-**Handset codec (test stage).** WM8978 on I2S1: MCK GPIO3, SCK GPIO4, FSA
-GPIO5, data GPIO6 and GPIO7, 48 kHz. The first `handset` command resets the
-codec and listens on both data pins to find its microphone output. Nothing
-runs at boot and calls do not use it yet.
+**Handset.** WM8978 on I2S1: MCK GPIO3, SCK GPIO4, FSA GPIO5, data GPIO6
+and GPIO7, 48 kHz. At boot the codec is reset and both data pins are
+listened on to find its microphone output; without the module the phone
+keeps the board speaker and microphones. While the handset is up, all sound
+(calls, tones, messages) plays on the earpiece and the handset microphone is
+sent; ringing stays on the speaker. The earpiece sits between tip and ring
+of the audio out jack (the right side is inverted), through capacitors. The
+volume knob sets both outputs.
+
+The cradle's hook contact is read on `DIGITS_HANDSET_HOOK_GPIO` (GPIO8,
+header pin 10; -1: none): high = lifted. 100k from 3.3 V to the red earpiece
+wire on the cradle side of its capacitor, 100k from there to the GPIO, 100 nF
+from the GPIO to GND; the black wires need ground. KEY1 and `phone hook`
+still toggle the handset until the cradle next changes.
+
+The handset microphone (electret, yellow = +, black = ground) goes to the
+tip of the audio in jack, which is the codec's L2 input, taken direct at
++6 dB (the microphone amplifiers latched with L2). The jack supplies no
+bias: 5 V through 1k, 47-100 uF to ground at that point, then 5k (two 10k in
+parallel) to yellow; about 2.7 V on yellow. The firmware adds 12 dB.
+`GET /api/handset-record?s=SECONDS` returns a stereo WAV of the input.
 
 ```
-handset                  # find the codec and its data pins
-handset tone [S]         # 440 Hz on the audio out jack
+handset                  # data pins, route, gaps, failed I2C writes
+handset tone [S]         # 440 Hz on the earpiece (while nothing else plays)
 handset mic [S]          # input levels, left and right
 handset echo [S]         # input played back on the output
-handset input mic|line   # LIP/LIN and RIP/RIN, or L2/R2
-handset volume DB        # output -57..6 dB, default -9
+handset record [S]       # records the input, then plays it (speaker with the handset down)
+handset input mic|line   # audio in jack (L2/R2) at +6 dB or 0 dB
+handset volume DB        # tone and echo level, -57..6 dB, default -9
 ```
 
 **Volume knob.** A B10K fader between 3.3 V and GND, wiper on GPIO9 (header

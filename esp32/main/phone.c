@@ -510,6 +510,16 @@ static void phone_task(void *arg)
     bool reached_server = false;
     lights_t lights = {.unheard_total = -1};
     phone_debounce_t speaker_button = {0};
+    phone_debounce_t cradle = {0};
+    bool cradle_lifted = false;
+#if CONFIG_DIGITS_HANDSET_HOOK_GPIO >= 0
+    const gpio_config_t cradle_pin = {
+        .pin_bit_mask = 1ULL << CONFIG_DIGITS_HANDSET_HOOK_GPIO, .mode = GPIO_MODE_INPUT,
+    };
+    gpio_config(&cradle_pin);
+    ESP_LOGI(TAG, "Handset cradle on GPIO%d: %s", CONFIG_DIGITS_HANDSET_HOOK_GPIO,
+             gpio_get_level(CONFIG_DIGITS_HANDSET_HOOK_GPIO) ? "lifted" : "in the cradle");
+#endif
     int64_t next_ladder_error_log = 0;
     bool ladder_released = false;
     esp_err_t lights_err = digits_audio_board_lights_init();
@@ -593,6 +603,20 @@ static void phone_task(void *arg)
                 next_error_log = now + ERROR_LOG_INTERVAL_US;
             }
         }
+
+#if CONFIG_DIGITS_HANDSET_HOOK_GPIO >= 0
+        // The cradle wins whenever it changes; its position at boot counts.
+        bool cradle_was_known = cradle.known;
+        bool cradle_now = phone_debounce_update(&cradle, gpio_get_level(CONFIG_DIGITS_HANDSET_HOOK_GPIO) != 0, now);
+        if (!cradle_was_known || cradle_now != cradle_lifted) {
+            cradle_lifted = cradle_now;
+            if (handset_up != cradle_now) source = "cradle";
+            handset_up = cradle_now;
+        }
+#else
+        (void)cradle;
+        (void)cradle_lifted;
+#endif
 
         phone_inputs_t inputs = {0};
         uint32_t presses_now[PHONE_CALL_TARGETS];

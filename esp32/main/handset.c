@@ -24,8 +24,12 @@
 #define PIN_DAT GPIO_NUM_6
 #define PIN_SDB GPIO_NUM_7
 #define DEFAULT_TEST_DB (-9)
-#define STREAM_BYTES (4 * DIGITS_MIC_FRAME_SAMPLES * sizeof(int16_t))
-#define PRIME_BYTES (2 * FRAMES * sizeof(int16_t)) // Kept in hand against jitter.
+#define STREAM_BYTES (6 * DIGITS_MIC_FRAME_SAMPLES * sizeof(int16_t))
+// Kept in hand: the microphone task takes a 20 ms frame at a time, with up
+// to 10 ms of jitter against this codec's 5 ms blocks. Less than a frame of
+// margin either way caused clicks in calls (underruns and drops).
+#define PRIME_BYTES (DIGITS_MIC_FRAME_SAMPLES * sizeof(int16_t))
+#define EXCESS_BYTES (3 * DIGITS_MIC_FRAME_SAMPLES * sizeof(int16_t))
 #define PSRAM (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
 
 typedef struct {
@@ -45,8 +49,11 @@ static struct {
     int16_t *scratch; // PSRAM, DIGITS_MIC_FRAME_SAMPLES.
     bool primed;
     volatile bool echo;
+    int16_t *record; // PSRAM, stereo frames; the reader fills it while record_at < record_samples.
+    size_t record_samples;
+    volatile size_t record_at;
     levels_t levels;
-    unsigned rx_overflows, underruns;
+    unsigned rx_overflows, underruns, drops;
     unsigned retried_writes, failed_writes;
     int output_level; // Last value written to R52/R53, -1 unknown.
     int wanted_level; // What R52/R53 should hold, -1 nothing yet.
@@ -116,13 +123,18 @@ static void sync_output(void)
 static esp_err_t apply_input(void)
 {
     bool mic = h.input == HANDSET_INPUT_MIC;
-    esp_err_t err = reg(44, mic ? 0x033 : 0x000); // Mic: LIP/LIN and RIP/RIN to the PGAs.
-    // PGA +18 dB for the mic; muted (bit 6) for line.
-    if (err == ESP_OK) err = reg(45, mic ? 0x028 : 0x040);
-    if (err == ESP_OK) err = reg(46, mic ? 0x128 : 0x140);
-    // Boost: mic +20 dB after the PGA; line L2/R2 at 0 dB.
-    if (err == ESP_OK) err = reg(47, mic ? 0x100 : 0x050);
-    if (err == ESP_OK) err = reg(48, mic ? 0x100 : 0x050);
+    // The module's audio in jack is on L2/R2 (tip left), taken straight into
+    // the boost stage: +6 dB for the microphone, 0 dB for line. The PGAs
+    // stay disconnected and muted: with L2 routed through them they latched
+    // at a rail on a route change (the ADC then reads pure zeros), and their
+    // own pins (LIP/LIN) carry the module's microphone, which an inserted
+    // plug disconnects, leaving an open input that picks up digital noise.
+    uint16_t boost = mic ? 0x070 : 0x050;
+    esp_err_t err = reg(44, 0x000);
+    if (err == ESP_OK) err = reg(45, 0x040);
+    if (err == ESP_OK) err = reg(46, 0x140);
+    if (err == ESP_OK) err = reg(47, boost);
+    if (err == ESP_OK) err = reg(48, boost);
     return err;
 }
 
@@ -139,8 +151,14 @@ static esp_err_t codec_setup(void)
         {4, 0x010},  // I2S, 16-bit.
         {6, 0x000},  // Clock slave, MCLK / 1 (256 fs).
         {7, 0x000},  // Filters for 48 kHz.
-        {10, 0x008}, // DAC 128x oversampling.
+        // DAC 128x oversampling; right side inverted: the earpiece sits
+        // between left and right (tip and ring), which also doubles its level.
+        {10, 0x00A},
         {11, 0x0FF}, {12, 0x1FF}, // DAC 0 dB.
+        // DAC limiter on, +12 dB boost, limit -6 dBFS: the earpiece has no
+        // amplifier, and tones and speech sit well below full scale. The
+        // limit leaves room for the output's +6 dB without clipping.
+        {24, 0x132}, {25, 0x05C},
         {14, 0x108}, // ADC high-pass filter, 128x oversampling.
         {15, 0x0FF}, {16, 0x1FF}, // ADC 0 dB.
         {54, 0x040}, {55, 0x140}, // Speaker outputs muted.
@@ -243,13 +261,70 @@ static esp_err_t find_data_direction(void)
     return ESP_OK;
 }
 
+// Click filter. The microphone wire picks up the board's digital activity
+// as clicks about 5 samples long, as tall as speech peaks once amplified.
+// A sample far from the median of its 11 neighbours, measured against the
+// recent typical distance, is replaced by that median; speech moves slowly
+// at 48 kHz and passes. Output lags by DECLICK_HALF samples.
+#define DECLICK_WINDOW 11
+#define DECLICK_HALF (DECLICK_WINDOW / 2)
+typedef struct {
+    int16_t recent[DECLICK_WINDOW];
+    unsigned at;
+    int typical_x256; // Running mean distance from the median, times 256.
+} declick_t;
+
+static int16_t declick(declick_t *d, int16_t sample)
+{
+    d->recent[d->at] = sample;
+    d->at = (d->at + 1) % DECLICK_WINDOW;
+    int16_t sorted[DECLICK_WINDOW];
+    for (int i = 0; i < DECLICK_WINDOW; ++i) { // Insertion sort.
+        int16_t v = d->recent[i];
+        int j = i;
+        for (; j > 0 && sorted[j - 1] > v; --j) sorted[j] = sorted[j - 1];
+        sorted[j] = v;
+    }
+    int median = sorted[DECLICK_HALF];
+    int centre = d->recent[(d->at + DECLICK_HALF) % DECLICK_WINDOW];
+    int distance = abs(centre - median), limit = 4 * d->typical_x256 / 256;
+    if (limit < 24) limit = 24;
+    if (distance > limit) {
+        centre = median;
+        distance = limit;
+    }
+    d->typical_x256 += distance - d->typical_x256 / 256;
+    return (int16_t)centre;
+}
+
+static int16_t scaled(int16_t sample, int factor)
+{
+    int v = sample * factor;
+    return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+}
+
+// The TH-07 capsule (5 V through 1k + 5k) gives speech near -42 dBFS at the
+// codec's +6 dB; 12 dB more brings it to the board microphones' level.
+#define MIC_FACTOR 4
+// Echo and record playback: plus about the 18 dB a call adds (tx_voice.h).
+static int16_t test_gain(int16_t sample) { return scaled(sample, MIC_FACTOR * 8); }
+
 // Drains the input for good: levels for the mic test, mono samples for the
 // microphone task, and the echo test's loopback.
 static void reader(void *arg)
 {
     static int16_t block[FRAMES * 2], mono[FRAMES], stereo[FRAMES * 2];
+    static declick_t clicks = {.typical_x256 = 20 * 256};
+    unsigned logged = 0;
     for (unsigned n = 0;; ++n) {
         if (n % 100 == 0) sync_output(); // Every 500 ms.
+        if (n % 1000 == 999) { // Every 5 s: clicks in the microphone path, if any.
+            unsigned total = h.underruns + h.drops + h.rx_overflows;
+            if (total != logged)
+                ESP_LOGW(TAG, "Microphone path: %u underruns, %u drops, %u input gaps so far",
+                         h.underruns, h.drops, h.rx_overflows);
+            logged = total;
+        }
         if (read_block(block, sizeof(block)) != ESP_OK) {
             vTaskDelay(1);
             continue;
@@ -261,7 +336,7 @@ static void reader(void *arg)
             if (abs(r) > add.peak[1]) add.peak[1] = abs(r);
             add.sum[0] += (double)l * l;
             add.sum[1] += (double)r * r;
-            mono[i] = (int16_t)((l + r) / 2);
+            mono[i] = declick(&clicks, (int16_t)l); // The handset microphone is on the tip: left.
         }
         portENTER_CRITICAL(&mux);
         for (int c = 0; c < 2; ++c) {
@@ -271,8 +346,14 @@ static void reader(void *arg)
         h.levels.samples += FRAMES;
         portEXIT_CRITICAL(&mux);
         xStreamBufferSend(h.stream, mono, sizeof(mono), 0); // Full: the rest is dropped.
+        size_t at = h.record_at;
+        if (at < h.record_samples) {
+            size_t n = h.record_samples - at < FRAMES ? h.record_samples - at : FRAMES;
+            memcpy(h.record + 2 * at, block, n * 2 * sizeof(int16_t));
+            h.record_at = at + n;
+        }
         if (h.echo) {
-            for (int i = 0; i < FRAMES; ++i) stereo[2 * i] = stereo[2 * i + 1] = mono[i];
+            for (int i = 0; i < FRAMES; ++i) stereo[2 * i] = stereo[2 * i + 1] = test_gain(mono[i]);
             size_t written;
             i2s_channel_write(h.tx, stereo, sizeof(stereo), &written, 20);
         }
@@ -344,7 +425,7 @@ esp_err_t digits_handset_output(bool enabled, int volume)
 {
     if (!h.running) return ESP_ERR_INVALID_STATE;
     if (volume < 0 || volume > 100) return ESP_ERR_INVALID_ARG;
-    return output_level(!enabled || volume == 0, -50 + (volume - 1) * 50 / 99);
+    return output_level(!enabled || volume == 0, -34 + (volume - 1) * 40 / 99);
 }
 
 esp_err_t digits_handset_write(const int16_t *stereo, size_t bytes, size_t *written, uint32_t timeout_ms)
@@ -360,11 +441,14 @@ void digits_handset_capture(int16_t *pcm, int16_t *reference, size_t frames, boo
     size_t available = xStreamBufferBytesAvailable(h.stream);
     if (!h.primed && available >= bytes + PRIME_BYTES) h.primed = true;
     // Both I2S ports run from one clock, so the fill level only moves at
-    // startup; drop any excess to keep the delay short.
-    while (h.primed && available > bytes + 2 * PRIME_BYTES) {
-        size_t excess = available - bytes - PRIME_BYTES;
-        if (excess > bytes) excess = bytes;
-        available -= xStreamBufferReceive(h.stream, h.scratch, excess, 0);
+    // startup or after a stall; drop a large excess to keep the delay short.
+    if (h.primed && available > bytes + EXCESS_BYTES) {
+        ++h.drops;
+        while (available > bytes + PRIME_BYTES) {
+            size_t excess = available - bytes - PRIME_BYTES;
+            if (excess > bytes) excess = bytes;
+            available -= xStreamBufferReceive(h.stream, h.scratch, excess, 0);
+        }
     }
     bool have = h.primed && available >= bytes;
     if (have) xStreamBufferReceive(h.stream, h.scratch, bytes, 0);
@@ -373,12 +457,13 @@ void digits_handset_capture(int16_t *pcm, int16_t *reference, size_t frames, boo
         ++h.underruns;
     }
     if (!use) return;
-    if (have) memcpy(pcm, h.scratch, bytes);
+    if (have) for (size_t i = 0; i < frames; ++i) pcm[i] = scaled(h.scratch[i], MIC_FACTOR);
     else memset(pcm, 0, bytes);
     memset(reference, 0, bytes); // The speaker is off.
 }
 
-// Tests run only while nothing else plays and the handset route is off.
+// Tests run only while nothing else plays (lifted handset: after the dial
+// tone and reorder have ended).
 static esp_err_t test_begin(bool output)
 {
     if (!h.running) {
@@ -386,7 +471,7 @@ static esp_err_t test_begin(bool output)
         if (err != ESP_OK) return err;
     }
     if (!output) return ESP_OK;
-    if (digits_audio_handset_route() || !digits_audio_speaker_acquire(0)) return ESP_ERR_INVALID_STATE;
+    if (!digits_audio_speaker_acquire(0)) return ESP_ERR_INVALID_STATE;
     esp_err_t err = output_level(false, h.test_db);
     if (err != ESP_OK) digits_audio_speaker_release();
     return err;
@@ -394,7 +479,8 @@ static esp_err_t test_begin(bool output)
 
 static void test_end(void)
 {
-    output_level(true, 0);
+    // Back to what the route wants.
+    digits_handset_output(digits_audio_handset_route(), digits_audio_speaker_volume());
     digits_audio_speaker_release();
 }
 
@@ -455,13 +541,78 @@ esp_err_t digits_handset_echo(unsigned seconds)
 {
     esp_err_t err = test_begin(true);
     if (err != ESP_OK) return err;
-    printf("Echo for %u s: input to output, both sides mixed\n", seconds);
+    printf("Echo for %u s: left input to the output\n", seconds);
     h.echo = true;
     vTaskDelay(pdMS_TO_TICKS(seconds * 1000));
     h.echo = false;
     vTaskDelay(pdMS_TO_TICKS(30));
     test_end();
     return ESP_OK;
+}
+
+esp_err_t digits_handset_test_input(int r44, int r45, int r47)
+{
+    if (!h.codec) return ESP_ERR_INVALID_STATE;
+    if (r44 < 0) return apply_input(); // Back to the selected input.
+    esp_err_t err = reg(44, (uint16_t)(r44 & 0x1FF));
+    if (err == ESP_OK) err = reg(45, (uint16_t)(r45 & 0x0FF));
+    if (err == ESP_OK) err = reg(46, (uint16_t)(0x100 | (r45 & 0x0FF)));
+    if (err == ESP_OK) err = reg(47, (uint16_t)(r47 & 0x1FF));
+    if (err == ESP_OK) err = reg(48, (uint16_t)(r47 & 0x1FF));
+    return err;
+}
+
+esp_err_t digits_handset_capture_raw(unsigned seconds, bool gain, int16_t **out, size_t *out_samples)
+{
+    if (!h.running) return ESP_ERR_INVALID_STATE;
+    if (h.record) return ESP_ERR_INVALID_STATE; // One recording at a time.
+    const size_t samples = (size_t)seconds * RATE;
+    int16_t *record = heap_caps_malloc(samples * 2 * sizeof(int16_t), PSRAM);
+    if (!record) return ESP_ERR_NO_MEM;
+    h.record = record;
+    h.record_at = 0;
+    h.record_samples = samples;
+    while (h.record_at < samples) vTaskDelay(pdMS_TO_TICKS(50));
+    h.record_samples = 0;
+    vTaskDelay(pdMS_TO_TICKS(20)); // The reader is past its copy.
+    h.record = NULL;
+    if (gain) { // As a caller hears it: click filter and gain, on both sides.
+        declick_t clicks = {.typical_x256 = 20 * 256};
+        for (size_t i = 0; i < samples; ++i)
+            record[2 * i] = record[2 * i + 1] = test_gain(declick(&clicks, record[2 * i]));
+    }
+    *out = record;
+    *out_samples = samples;
+    return ESP_OK;
+}
+
+esp_err_t digits_handset_record(unsigned seconds)
+{
+    static int16_t out[FRAMES * 2];
+    esp_err_t err = test_begin(false);
+    if (err != ESP_OK) return err;
+    printf("Recording %u s from the %s input...\n", seconds, h.input == HANDSET_INPUT_MIC ? "mic" : "line");
+    int16_t *record;
+    size_t samples;
+    err = digits_handset_capture_raw(seconds, true, &record, &samples);
+    if (err != ESP_OK) return err;
+    // Through the speaker functions: the board speaker with the handset
+    // down, the earpiece while it is lifted.
+    if (!digits_audio_speaker_acquire(0)) err = ESP_ERR_INVALID_STATE;
+    else {
+        printf("Playing it back on the %s...\n", digits_audio_handset_route() ? "earpiece" : "speaker");
+        err = digits_audio_speaker_start();
+        for (size_t at = 0; at < samples && err == ESP_OK; at += FRAMES) {
+            for (size_t i = 0; i < FRAMES; ++i)
+                out[2 * i] = out[2 * i + 1] = at + i < samples ? record[2 * (at + i)] : 0;
+            size_t written = 0;
+            err = digits_audio_speaker_write(out, sizeof(out), &written, 100);
+        }
+        digits_audio_speaker_silence();
+        digits_audio_speaker_release();
+    }
+    heap_caps_free(record);
+    return err;
 }
 
 void digits_handset_status(void)
@@ -475,7 +626,7 @@ void digits_handset_status(void)
     portEXIT_CRITICAL(&mux);
     printf("WM8978 ready: microphone data on GPIO%d, input %s, test volume %d dB\n", h.adc_gpio,
            h.input == HANDSET_INPUT_MIC ? "mic" : "line", h.test_db);
-    printf("Route: %s; input gaps %u, microphone task underruns %u; I2C writes retried %u, failed %u\n",
-           digits_audio_handset_route() ? "handset" : "speaker", overflows, h.underruns,
+    printf("Route: %s; input gaps %u, microphone task underruns %u, drops %u; I2C writes retried %u, failed %u\n",
+           digits_audio_handset_route() ? "handset" : "speaker", overflows, h.underruns, h.drops,
            h.retried_writes, h.failed_writes);
 }

@@ -217,6 +217,16 @@ menu "Digits development configuration"
                 this input of an ADS1115 at I2C 0x48 (33k pull-up; 10k, 20k,
                 33k to GND). Ring A and B work like call buttons A and B,
                 next to the board keys. Without the chip it stays off.
+        config DIGITS_HANDSET_HOOK_GPIO
+            int "Handset cradle sense GPIO (-1: none)"
+            range -1 48
+            default -1
+            help
+                The cradle's hook contact through the earpiece wire: high
+                while the handset is lifted, low in the cradle (100k pull-up
+                and filter outside, no internal pull). GPIO8 is header pin
+                10. Works next to the board keys; KEY1 still toggles the
+                handset until the cradle next changes.
         config DIGITS_SPEAKER_BUTTON_LATCHING
             bool "Speaker button latches (stays pressed)"
             default n

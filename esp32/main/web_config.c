@@ -13,6 +13,7 @@
 #include "tx_voice.h"
 #include "voicemail.h"
 #include "greeting_record.h"
+#include "handset.h"
 #include "knobs.h"
 #include "webrtc.h"
 #include "wifi_setup_form.h"
@@ -635,6 +636,49 @@ static esp_err_t greeting_action_post(httpd_req_t *req)
 
 // ---- Registration ---------------------------------------------------------
 
+// Diagnostic: records the handset input and returns it as a WAV file
+// (48 kHz stereo, 16-bit). Blocks this server for the recording time.
+static esp_err_t handset_record_get(httpd_req_t *req)
+{
+    if (!digits_status_authorized(req)) return digits_status_challenge(req);
+    char query[64], text[8];
+    unsigned seconds = 5;
+    int regs[3] = {-1, 0, 0};
+    bool raw = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "s", text, sizeof(text)) == ESP_OK) seconds = (unsigned)atoi(text);
+        raw = httpd_query_key_value(query, "raw", text, sizeof(text)) == ESP_OK && text[0] == '1';
+        static const char *const names[] = {"r44", "r45", "r47"};
+        for (int i = 0; i < 3; ++i)
+            if (httpd_query_key_value(query, names[i], text, sizeof(text)) == ESP_OK)
+                regs[i] = (int)strtol(text, NULL, 16);
+    }
+    if (seconds < 1 || seconds > 20) seconds = 5;
+    int16_t *pcm;
+    size_t samples;
+    if (regs[0] >= 0) {
+        digits_handset_test_input(regs[0], regs[1], regs[2]);
+        vTaskDelay(pdMS_TO_TICKS(300)); // The input settles.
+    }
+    esp_err_t captured = digits_handset_capture_raw(seconds, !raw, &pcm, &samples);
+    if (regs[0] >= 0) digits_handset_test_input(-1, 0, 0);
+    if (captured != ESP_OK)
+        return reply(req, "503 Service Unavailable", "Handset codec not running or busy.");
+    const uint32_t bytes = (uint32_t)(samples * 2 * sizeof(int16_t)), rate = 48000;
+    uint8_t header[44] = "RIFF";
+    const uint32_t fields[] = {36 + bytes, 0, 0, 16, 0x00020001, rate, rate * 4, 0x00100004, 0, bytes};
+    memcpy(header + 4, fields, sizeof(fields));
+    memcpy(header + 8, "WAVEfmt ", 8);
+    memcpy(header + 36, "data", 4);
+    httpd_resp_set_type(req, "audio/wav");
+    esp_err_t err = httpd_resp_send_chunk(req, (const char *)header, sizeof(header));
+    for (uint32_t at = 0; at < bytes && err == ESP_OK; at += 4096)
+        err = httpd_resp_send_chunk(req, (const char *)pcm + at, bytes - at < 4096 ? bytes - at : 4096);
+    heap_caps_free(pcm);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0);
+    return err;
+}
+
 void digits_web_config_register(httpd_handle_t server)
 {
     if (!job.start) {
@@ -645,6 +689,7 @@ void digits_web_config_register(httpd_handle_t server)
             ESP_LOGE(TAG, "Settings worker unavailable: changes from the web page will fail");
     }
     static const httpd_uri_t handlers[] = {
+        {.uri = "/api/handset-record", .method = HTTP_GET, .handler = handset_record_get},
         {.uri = "/api/config", .method = HTTP_GET, .handler = config_get},
         {.uri = "/api/button", .method = HTTP_POST, .handler = button_post},
         {.uri = "/api/position", .method = HTTP_POST, .handler = position_post},
